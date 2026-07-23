@@ -1,0 +1,67 @@
+{
+  "uns": {
+    "graphql": "http://localhost:3200/graphql",
+    "rest": "http://localhost:3200/api",
+    "processName": "uns-api-global",
+    "supervisor": {
+      "enabled": false,
+      "restartOnExit": false,
+      "maxMemoryMb": 512,
+      "restartOnUnhealthy": false,
+      "unhealthyAfterMs": 60000,
+      "restartCooldownMs": 300000
+    },
+    "instanceMode": "wait",
+    "handover": true,
+    "jwksWellKnownUrl": "http://localhost:3200/api/.well-known/jwks.json",
+    "kidWellKnownUrl": "http://localhost:3200/api/.well-known/kid",
+    "email": "user@example.com",
+    "password": {
+      "provider": "env",
+      "key": "UNS_PASSWORD"
+    }
+  },
+  "infra": {
+    "host": "localhost"
+  },
+  "output": {
+    "host": "localhost"
+  },
+  "input": {
+    "host": "localhost"
+  },
+  "questdb": {
+    "url": "http://localhost:9000",
+    "username": "admin",
+    "password": {
+      "provider": "env",
+      "key": "QUESTDB_PASSWORD"
+    },
+    "defaultLimit": 500,
+    "maxLimit": 2000,
+    "defaultLookbackHours": 24,
+    "maxLookbackHours": 168,
+    "maxSampleLookbackHours": 744,
+    "statementTimeoutMs": 20000,
+    "maxScanRows": 200000,
+    "maxResponseBytes": 1048576
+  },
+  "dataSources": [
+    {
+      "topic": "enterprise/#",
+      "history": true,
+      "cache": true
+    }
+  ],
+  "catchAll": {
+    "apiBasePath": "/api/catchall",
+    "swaggerPath": "/uns-api-global/general-api/catchall-swagger.json",
+    "description": "Catch-all UNS data API",
+    "swaggerTag": "CatchAll"
+  },
+  "lastValueCache": {
+    "enabled": true,
+    "topicRefreshIntervalMs": 30000,
+    "staleTtlMs": 86400000
+  }
+}

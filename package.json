@@ -1,0 +1,62 @@
+{
+  "name": "uns-api-global",
+  "version": "4.1.0",
+  "private": true,
+  "description": "Authenticated REST API for current and historical Unified Namespace data",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/uns-datahub/uns-api-global.git"
+  },
+  "homepage": "https://github.com/uns-datahub/uns-api-global#readme",
+  "bugs": {
+    "url": "https://github.com/uns-datahub/uns-api-global/issues"
+  },
+  "unsDatahub": {
+    "schemaVersion": 1,
+    "kind": "addon",
+    "controllerCompatibility": ">=7.1 <8"
+  },
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "packageManager": "pnpm@10.30.3",
+  "files": ["dist"],
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" }
+  },
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "verify": "pnpm test && pnpm run typecheck && pnpm run build",
+    "check-release-version": "node scripts/check-release-version.mjs",
+    "clean": "rimraf dist tsconfig.tsbuildinfo",
+    "typecheck": "tsc --noEmit",
+    "build": "pnpm run clean && tsc -p tsconfig.json",
+    "dev": "node --env-file-if-exists=.env ./node_modules/tsx/dist/cli.mjs watch src/index.ts",
+    "start": "node --env-file-if-exists=.env dist/index.js",
+    "generate-config-schema": "node ./node_modules/@uns-kit/core/dist/tools/generate-config-schema.js",
+    "generate-codegen": "graphql-code-generator --require dotenv/config --config codegen.ts",
+    "sync-uns-schema": "node ./node_modules/@uns-kit/core/dist/tools/sync-uns-schema.js",
+    "sync-uns-metadata": "node ./node_modules/@uns-kit/core/dist/tools/sync-uns-metadata.js",
+    "test:catchall:local": "node scripts/test-catchall-local.mjs"
+  },
+  "dependencies": {
+    "@uns-kit/api": "^3.0.5",
+    "@uns-kit/core": "^3.0.5",
+    "jsonwebtoken": "^9.0.3",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@graphql-codegen/cli": "^5.0.7",
+    "@graphql-codegen/typescript": "^4.1.6",
+    "@graphql-codegen/typescript-operations": "^4.6.1",
+    "@graphql-codegen/typescript-resolvers": "^4.3.1",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.19.1",
+    "graphql": "^16.11.0",
+    "graphql-request": "^7.2.0",
+    "prettier": "^3.5.3",
+    "rimraf": "^6.1.2",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
