@@ -51,6 +51,7 @@ import {
   parseUnsPath,
   quoteIdentifier,
   resolveMetricColumn,
+  resolvePointTimeColumn,
   resolveRequestId,
   resolveTemporalStrategy,
   resolveTrend,
@@ -85,6 +86,25 @@ const rawSchema = makeSchema([
   ["interval", "LONG"],
   ["deleted", "BOOLEAN"],
   ["lastSeen", "TIMESTAMP"],
+]);
+
+const archiverSchema = makeSchema([
+  ["time", "TIMESTAMP"],
+  ["topic", "SYMBOL"],
+  ["attribute", "SYMBOL"],
+  ["asset", "SYMBOL"],
+  ["objectType", "SYMBOL"],
+  ["objectId", "SYMBOL"],
+  ["eventId", "SYMBOL"],
+  ["valueType", "SYMBOL"],
+  ["deleted", "BOOLEAN"],
+  ["lastSeen", "TIMESTAMP"],
+  ["intervalStart", "TIMESTAMP"],
+  ["intervalEnd", "TIMESTAMP"],
+  ["interval", "LONG"],
+  ["value", "DOUBLE"],
+  ["numberValue", "DOUBLE"],
+  ["uom", "VARCHAR"],
 ]);
 
 test("path and query helpers normalize controller-style requests", () => {
@@ -265,6 +285,63 @@ test("temporal strategy uses timestamp by default and interval only when request
     () => resolveTemporalStrategy(rawSchema, "interval"),
     (error: unknown) => error instanceof HttpError && error.status === 400,
   );
+});
+
+test("temporal strategy prefers the archiver designated time column and keeps timestamp compatibility", () => {
+  assert.equal(resolvePointTimeColumn(archiverSchema), "time");
+  assert.deepEqual(resolveTemporalStrategy(archiverSchema, "auto"), {
+    mode: "timestamp",
+    fromColumn: "time",
+    toColumn: "time",
+    orderBy: '"time" DESC',
+  });
+  assert.deepEqual(resolveTemporalStrategy(archiverSchema, "timestamp"), {
+    mode: "timestamp",
+    fromColumn: "time",
+    toColumn: "time",
+    orderBy: '"time" DESC',
+  });
+  assert.deepEqual(resolveTemporalStrategy(archiverSchema, "interval"), {
+    mode: "interval",
+    fromColumn: "intervalStart",
+    toColumn: "intervalEnd",
+    orderBy: '"intervalStart" DESC, "time" DESC',
+  });
+
+  const schemaWithBothNames = makeSchema([
+    ["time", "TIMESTAMP"],
+    ["timestamp", "TIMESTAMP"],
+    ["topic", "SYMBOL"],
+  ]);
+  assert.equal(resolvePointTimeColumn(schemaWithBothNames), "time");
+  assert.equal(resolvePointTimeColumn(rawSchema), "timestamp");
+});
+
+test("archiver schema history SQL filters, orders, and deduplicates on time", () => {
+  const parsed = parseUnsPath(
+    "forge-group/novasteel/hot-rolling/hrm-descaling/equipment/pump-1/current",
+  );
+  const temporal = resolveTemporalStrategy(archiverSchema, "auto");
+  const range = {
+    from: "2026-07-27T12:43:14.839Z",
+    to: "2026-07-27T12:48:14.839Z",
+  };
+  const sql = buildDataSql(
+    "forge_group_hrm_descaling_data",
+    parsed,
+    range,
+    200,
+    true,
+    archiverSchema,
+    temporal,
+  ).replace(/\s+/g, " ").trim();
+
+  assert.match(sql, /"time" >= '2026-07-27T12:43:14.839Z'/);
+  assert.match(sql, /"time" <= '2026-07-27T12:48:14.839Z'/);
+  assert.match(sql, /LATEST ON "time" PARTITION BY/);
+  assert.match(sql, /ORDER BY "time" DESC LIMIT 200$/);
+  assert.equal(canApplyDedupe(true, archiverSchema), true);
+  assert.equal(resolveMetricColumn(archiverSchema, parsed), "numberValue");
 });
 
 test("raw mode SQL covers the simplest latest 3 records from/to use case", () => {
