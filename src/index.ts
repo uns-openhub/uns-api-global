@@ -24,6 +24,7 @@ import {
   computeCounterDeltaValue,
   counterBoundarySourceRange,
   isTopicAllowedByAccessRules,
+  resolvePointTimeColumn as resolvePointTimeColumnFromSchema,
 } from "./catchall-helpers.js";
 
 type TimeRange = { from?: string; to?: string; note?: string };
@@ -94,6 +95,7 @@ const NON_VALUE_COLUMNS = new Set([
   "valueType",
   "uom",
   "unit",
+  "time",
   "timestamp",
   "intervalStart",
   "intervalEnd",
@@ -1371,7 +1373,8 @@ async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
       const columns = await getTableColumns(questdb, table);
       const selectCols = buildDataColumnList(columns).map(quoteIdentifier).join(", ");
       const partitionCols = buildDedupePartitionColumns(columns).map(quoteIdentifier).join(", ");
-      if (!columns.has("timestamp") || !partitionCols) continue;
+      const pointTimeColumn = resolvePointTimeColumn(columns);
+      if (!pointTimeColumn || !partitionCols) continue;
 
       // Build WHERE clause to limit to only our topics
       const topicParts = tableTopics.map(t => {
@@ -1391,7 +1394,7 @@ async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
         SELECT ${selectCols}
         FROM ${quoteIdentifier(table)}
         WHERE ${topicParts.join(" OR ")}
-        LATEST ON "timestamp" PARTITION BY ${partitionCols}
+        LATEST ON ${quoteIdentifier(pointTimeColumn)} PARTITION BY ${partitionCols}
       `;
       const result = await queryQuestDb(questdb, sql);
       if (!result.data?.length) continue;
@@ -1399,7 +1402,7 @@ async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
       // Parse rows back into cache entries
       const rawCols = (result.raw as any)?.columns as Array<{ name: string; type: string }> | undefined;
       const colNames = rawCols?.map((c: any) => c.name) ?? [];
-      const tsIdx = colNames.indexOf("timestamp");
+      const tsIdx = colNames.indexOf(pointTimeColumn);
       const topicIdx = colNames.indexOf("topic");
       const attrIdx = colNames.indexOf("attribute");
       const assetIdx = colNames.indexOf("asset");
@@ -1457,7 +1460,7 @@ async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
           const standardCols = new Set([
             "topic", "attribute", "asset", "objectType", "objectId",
             "valueType", "value", "numberValue", "stringValue", "uom",
-            "timestamp", "interval", "intervalStart", "intervalEnd",
+            "time", "timestamp", "interval", "intervalStart", "intervalEnd",
             "lastSeen", "deleted",
           ]);
           const customValues: Record<string, unknown> = {};
@@ -1671,7 +1674,7 @@ async function tryQuestDbLastRowFallback(
       : [];
     const colIdx = (name: string): number => rawColumns.indexOf(name);
 
-    const tsIdx = colIdx("timestamp");
+    const tsIdx = colIdx(temporal.fromColumn);
     const valueTypeIdx = colIdx("valueType");
     const numValueIdx = colIdx("numberValue");
     const valueIdx = colIdx("value");
@@ -1716,7 +1719,7 @@ async function tryQuestDbLastRowFallback(
     const standardCols = new Set([
       "topic", "attribute", "asset", "objectType", "objectId",
       "valueType", "value", "numberValue", "stringValue", "uom",
-      "timestamp", "interval", "intervalStart", "intervalEnd",
+      "time", "timestamp", "interval", "intervalStart", "intervalEnd",
       "lastSeen", "deleted",
     ]);
     const customValues: Record<string, unknown> = {};
@@ -2400,18 +2403,18 @@ function deriveBucketMs(range: TimeRange, maxPoints: number): number {
 }
 
 function resolveTemporalStrategy(columns: Set<string>, preference: TimeFieldPreference): TemporalStrategy {
-  const hasTimestamp = columns.has("timestamp");
+  const pointTimeColumn = resolvePointTimeColumn(columns);
   const hasInterval = columns.has("intervalStart") && columns.has("intervalEnd");
 
   if (preference === "interval" && !hasInterval) {
     throw new HttpError(400, "Requested timeField=interval, but table does not contain intervalStart and intervalEnd columns.");
   }
-  if (preference === "timestamp" && !hasTimestamp) {
-    throw new HttpError(400, "Requested timeField=timestamp, but table does not contain timestamp column.");
+  if (preference === "timestamp" && !pointTimeColumn) {
+    throw new HttpError(400, "Requested timeField=timestamp, but table does not contain a time or timestamp column.");
   }
 
   if (preference === "interval" && hasInterval) {
-    if (!hasTimestamp) {
+    if (!pointTimeColumn) {
       return {
         mode: "interval",
         fromColumn: "intervalStart",
@@ -2423,19 +2426,27 @@ function resolveTemporalStrategy(columns: Set<string>, preference: TimeFieldPref
       mode: "interval",
       fromColumn: "intervalStart",
       toColumn: "intervalEnd",
-      orderBy: `"intervalStart" DESC, "timestamp" DESC`,
+      orderBy: `"intervalStart" DESC, ${quoteIdentifier(pointTimeColumn)} DESC`,
     };
   }
 
-  if (!hasTimestamp) {
-    throw new HttpError(400, "Table does not contain timestamp column required for time filtering.");
+  if (!pointTimeColumn) {
+    throw new HttpError(400, "Table does not contain a time or timestamp column required for time filtering.");
   }
   return {
     mode: "timestamp",
-    fromColumn: "timestamp",
-    toColumn: "timestamp",
-    orderBy: `"timestamp" DESC`,
+    fromColumn: pointTimeColumn,
+    toColumn: pointTimeColumn,
+    orderBy: `${quoteIdentifier(pointTimeColumn)} DESC`,
   };
+}
+
+function resolvePointTimeColumn(columns: Set<string>): "time" | "timestamp" | null {
+  return resolvePointTimeColumnFromSchema({
+    columns,
+    orderedColumns: [],
+    columnTypes: new Map(),
+  });
 }
 
 function normalizeRange(from: unknown, to: unknown, cfg: QuestDbConfig, maxLookbackHoursOverride?: number): TimeRange {
@@ -2515,6 +2526,7 @@ function buildDataColumnList(columns: Set<string>): string[] {
     "uom",
     "intervalStart",
     "intervalEnd",
+    "time",
     "timestamp",
     "interval",
   ];
@@ -2537,7 +2549,7 @@ function buildDedupePartitionColumns(columns: Set<string>): string[] {
 
 function canApplyDedupe(dedupeRequested: boolean, columns: Set<string>): boolean {
   if (!dedupeRequested) return false;
-  if (!columns.has("timestamp")) return false;
+  if (!resolvePointTimeColumn(columns)) return false;
   return buildDedupePartitionColumns(columns).length > 0;
 }
 
@@ -2646,13 +2658,14 @@ function buildDataSql(
   const partitionColumns = buildDedupePartitionColumns(columns).map(quoteIdentifier).join(", ");
   const tableId = quoteIdentifier(table);
   const canDedupe = canApplyDedupe(dedupe, columns);
+  const pointTimeColumn = resolvePointTimeColumn(columns);
   if (canDedupe) {
     return `
       SELECT * FROM (
         SELECT ${selectColumns}
         FROM ${tableId}
         WHERE ${where}
-        LATEST ON "timestamp" PARTITION BY ${partitionColumns}
+        LATEST ON ${quoteIdentifier(pointTimeColumn!)} PARTITION BY ${partitionColumns}
       )
       ORDER BY ${temporal.orderBy}
       LIMIT ${limit}
@@ -2679,11 +2692,12 @@ function buildSourceSql(
   const where = buildWhere(parsed, range, temporal, columns);
   const tableId = quoteIdentifier(table);
   const canDedupe = canApplyDedupe(dedupe, columns);
+  const pointTimeColumn = resolvePointTimeColumn(columns);
   const selectedColumns = Array.from(
     new Set(
       requestedColumns
         .concat([temporal.fromColumn, temporal.toColumn])
-        .concat(canDedupe ? ["timestamp", ...buildDedupePartitionColumns(columns)] : [])
+        .concat(canDedupe && pointTimeColumn ? [pointTimeColumn, ...buildDedupePartitionColumns(columns)] : [])
         .filter(column => columns.has(column)),
     ),
   );
@@ -2694,7 +2708,7 @@ function buildSourceSql(
       SELECT ${selectColumns}
       FROM ${tableId}
       WHERE ${where}
-      LATEST ON "timestamp" PARTITION BY ${partitionColumns}
+      LATEST ON ${quoteIdentifier(pointTimeColumn!)} PARTITION BY ${partitionColumns}
     `;
   }
   return `

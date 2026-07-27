@@ -91,6 +91,7 @@ const NON_VALUE_COLUMNS = new Set([
   "valueType",
   "uom",
   "unit",
+  "time",
   "timestamp",
   "intervalStart",
   "intervalEnd",
@@ -284,18 +285,18 @@ export function deriveBucketMs(range: TimeRange, maxPoints: number): number {
 }
 
 export function resolveTemporalStrategy(schema: TableSchema, preference: TimeFieldPreference): TemporalStrategy {
-  const hasTimestamp = schema.columns.has("timestamp");
+  const pointTimeColumn = resolvePointTimeColumn(schema);
   const hasInterval = schema.columns.has("intervalStart") && schema.columns.has("intervalEnd");
 
   if (preference === "interval" && !hasInterval) {
     throw new HttpError(400, "Requested timeField=interval, but table does not contain intervalStart and intervalEnd columns.");
   }
-  if (preference === "timestamp" && !hasTimestamp) {
-    throw new HttpError(400, "Requested timeField=timestamp, but table does not contain timestamp column.");
+  if (preference === "timestamp" && !pointTimeColumn) {
+    throw new HttpError(400, "Requested timeField=timestamp, but table does not contain a time or timestamp column.");
   }
 
   if (preference === "interval" && hasInterval) {
-    if (!hasTimestamp) {
+    if (!pointTimeColumn) {
       return {
         mode: "interval",
         fromColumn: "intervalStart",
@@ -307,19 +308,25 @@ export function resolveTemporalStrategy(schema: TableSchema, preference: TimeFie
       mode: "interval",
       fromColumn: "intervalStart",
       toColumn: "intervalEnd",
-      orderBy: `"intervalStart" DESC, "timestamp" DESC`,
+      orderBy: `"intervalStart" DESC, ${quoteIdentifier(pointTimeColumn)} DESC`,
     };
   }
 
-  if (!hasTimestamp) {
-    throw new HttpError(400, "Table does not contain timestamp column required for time filtering.");
+  if (!pointTimeColumn) {
+    throw new HttpError(400, "Table does not contain a time or timestamp column required for time filtering.");
   }
   return {
     mode: "timestamp",
-    fromColumn: "timestamp",
-    toColumn: "timestamp",
-    orderBy: `"timestamp" DESC`,
+    fromColumn: pointTimeColumn,
+    toColumn: pointTimeColumn,
+    orderBy: `${quoteIdentifier(pointTimeColumn)} DESC`,
   };
+}
+
+export function resolvePointTimeColumn(schema: TableSchema): "time" | "timestamp" | null {
+  if (schema.columns.has("time")) return "time";
+  if (schema.columns.has("timestamp")) return "timestamp";
+  return null;
 }
 
 export function normalizeRange(from: unknown, to: unknown, cfg: QuestDbRangeConfig): TimeRange {
@@ -392,6 +399,7 @@ export function buildDataColumnList(schema: TableSchema): string[] {
     "uom",
     "intervalStart",
     "intervalEnd",
+    "time",
     "timestamp",
     "interval",
   ];
@@ -412,7 +420,7 @@ export function buildDedupePartitionColumns(schema: TableSchema): string[] {
 
 export function canApplyDedupe(dedupeRequested: boolean, schema: TableSchema): boolean {
   if (!dedupeRequested) return false;
-  if (!schema.columns.has("timestamp")) return false;
+  if (!resolvePointTimeColumn(schema)) return false;
   return buildDedupePartitionColumns(schema).length > 0;
 }
 
@@ -457,11 +465,12 @@ export function buildSourceSql(
   const where = buildWhere(parsed, range, temporal, schema);
   const tableId = quoteIdentifier(table);
   const canDedupe = canApplyDedupe(dedupe, schema);
+  const pointTimeColumn = resolvePointTimeColumn(schema);
   const selectedColumns = Array.from(
     new Set(
       requestedColumns
         .concat([temporal.fromColumn, temporal.toColumn])
-        .concat(canDedupe ? ["timestamp", ...buildDedupePartitionColumns(schema)] : [])
+        .concat(canDedupe && pointTimeColumn ? [pointTimeColumn, ...buildDedupePartitionColumns(schema)] : [])
         .filter(column => schema.columns.has(column)),
     ),
   );
@@ -472,7 +481,7 @@ export function buildSourceSql(
       SELECT ${selectColumns}
       FROM ${tableId}
       WHERE ${where}
-      LATEST ON "timestamp" PARTITION BY ${partitionColumns}
+      LATEST ON ${quoteIdentifier(pointTimeColumn!)} PARTITION BY ${partitionColumns}
     `;
   }
   return `
