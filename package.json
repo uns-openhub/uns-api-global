@@ -6,11 +6,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/uns-datahub/uns-api-global.git"
+    "url": "git+https://github.com/uns-openhub/uns-api-global.git"
   },
-  "homepage": "https://github.com/uns-datahub/uns-api-global#readme",
+  "homepage": "https://github.com/uns-openhub/uns-api-global#readme",
   "bugs": {
-    "url": "https://github.com/uns-datahub/uns-api-global/issues"
+    "url": "https://github.com/uns-openhub/uns-api-global/issues"
   },
   "unsDatahub": {
     "schemaVersion": 1,
