@@ -1,7 +1,7 @@
 # uns-api-global
 
 `uns-api-global` exposes authenticated REST endpoints for current and historical
-Unified Namespace (UNS) data. It runs as an UNS DataHub add-on, resolves topic
+Unified Namespace (UNS) data. It runs as an UNS OpenHub add-on, resolves topic
 paths to QuestDB tables, and can combine persisted history with an MQTT-backed
 last-value cache.
 
@@ -22,7 +22,7 @@ at `/uns-api-global/general-api/catchall-swagger.json`.
 
 - Node.js 22 or newer
 - pnpm 10
-- An UNS DataHub controller and MQTT broker
+- An UNS OpenHub controller and MQTT broker
 - QuestDB containing archived UNS data
 
 ## Local setup
