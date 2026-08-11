@@ -1,6 +1,6 @@
 {
   "name": "uns-api-global",
-  "version": "4.1.1",
+  "version": "4.1.2",
   "private": true,
   "description": "Authenticated REST API for current and historical Unified Namespace data",
   "license": "MIT",
@@ -15,7 +15,7 @@
   "unsDatahub": {
     "schemaVersion": 1,
     "kind": "addon",
-    "controllerCompatibility": ">=7.1 <8"
+    "controllerCompatibility": ">=2 <3"
   },
   "type": "module",
   "engines": { "node": ">=22" },
