@@ -30,18 +30,28 @@ at `/uns-api-global/general-api/catchall-swagger.json`.
 ```bash
 corepack enable
 pnpm install
-cp config-example.json config.json
+cp config-local.json config.json
 pnpm run dev
 ```
 
-`config.json` and `.env` are intentionally ignored. The example configuration
-uses environment-backed secret placeholders; set the corresponding variables
-locally:
+`config-local.json` is for the local OpenHub container layout: the child process
+uses `localhost:3200` for the controller and Compose DNS names `mosquitto` and
+`questdb` for its sibling containers. `input` and `output` inherit all broker
+settings from `infra`; add either section only to override a specific channel.
+
+`config.json` and `.env` are intentionally ignored. A directly started development
+process uses a dedicated machine token:
 
 ```bash
-UNS_PASSWORD=change-me
+UNS_SERVICE_TOKEN=your-development-machine-token
 QUESTDB_PASSWORD=quest
 ```
+
+Controller authentication resolves the controller-managed `UNS_SERVICE_TOKEN_FILE`
+first, then `UNS_SERVICE_TOKEN`, `uns.token`, and only then legacy
+`uns.email`/`uns.password`. The legacy credentials are retained solely for bootstrap
+or replacement of a development machine token; they are not part of either committed
+configuration profile.
 
 For API authentication, configure `uns.jwksWellKnownUrl` (recommended). A local
 standalone setup can alternatively provide `UNS_API_JWT_SECRET`.

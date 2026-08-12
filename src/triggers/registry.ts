@@ -42,10 +42,9 @@ export type TriggerRegistryDeps = {
    *  "http://localhost:3200/api").  Trailing slash optional —
    *  normalised here. */
   controllerRestUrl: string;
-  /** Returns a Bearer token to attach to controller requests.
-   *  Same auth client uns-api-global uses elsewhere
-   *  (config.uns.authClient).  Null when uns-api-global is
-   *  unauthenticated — registry then disables itself with a warn. */
+  /** Returns a Bearer token to attach to controller requests. The service token
+   *  provider resolves controller files, direct-development environment tokens,
+   *  configured secrets, and legacy login only as a final fallback. */
   getAccessToken: () => Promise<string | null>;
   /** How often to refresh.  Mirror the existing topic-refresh
    *  cadence so admins only have to think about one knob. */
