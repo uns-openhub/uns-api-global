@@ -10,7 +10,7 @@ const repoRoot = process.cwd();
 const configPath = path.join(repoRoot, "config.json");
 const configTemplatePath = path.resolve(
   repoRoot,
-  process.env["CATCHALL_TEST_CONFIG"] ?? "config-example.json",
+  process.env["CATCHALL_TEST_CONFIG"] ?? "config-development-host.json",
 );
 const logPath = path.join(os.tmpdir(), `uns-api-global-catchall-smoke-${Date.now()}.log`);
 

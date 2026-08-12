@@ -1,6 +1,6 @@
 {
   "name": "uns-api-global",
-  "version": "4.1.4",
+  "version": "4.1.5",
   "private": true,
   "description": "Authenticated REST API for current and historical Unified Namespace data",
   "license": "MIT",
