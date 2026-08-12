@@ -1,6 +1,6 @@
 {
   "name": "uns-api-global",
-  "version": "4.1.2",
+  "version": "4.1.4",
   "private": true,
   "description": "Authenticated REST API for current and historical Unified Namespace data",
   "license": "MIT",
@@ -40,10 +40,10 @@
     "test:catchall:local": "node scripts/test-catchall-local.mjs"
   },
   "dependencies": {
-    "@uns-kit/api": "^3.0.5",
-    "@uns-kit/core": "^3.0.5",
+    "@uns-kit/api": "^3.0.10",
+    "@uns-kit/core": "^3.0.10",
     "jsonwebtoken": "^9.0.3",
-    "zod": "^3.23.8"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@graphql-codegen/cli": "^5.0.7",

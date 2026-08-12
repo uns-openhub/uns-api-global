@@ -17,10 +17,10 @@
     "kidWellKnownUrl": "http://localhost:3200/api/.well-known/kid"
   },
   "infra": {
-    "host": "localhost"
+    "host": "mosquitto"
   },
   "questdb": {
-    "url": "http://localhost:9000",
+    "url": "http://questdb:9000",
     "username": "admin",
     "password": {
       "provider": "env",

@@ -109,7 +109,12 @@ export const projectExtrasSchema = z.object({
         .default("CatchAll")
         .describe("Swagger tag shown for the catch-all endpoint"),
     })
-    .default({}),
+    .default({
+      apiBasePath: "/api/catchall",
+      swaggerPath: "/uns-api-global/general-api/catchall-swagger.json",
+      description: "Catch-all UNS data API",
+      swaggerTag: "CatchAll",
+    }),
   lastValueCache: z
     .object({
       enabled: z
@@ -129,7 +134,11 @@ export const projectExtrasSchema = z.object({
         .default(86400000)
         .describe("Evict cache entries not updated within this TTL (ms, default 24h)"),
     })
-    .default({}),
+    .default({
+      enabled: false,
+      topicRefreshIntervalMs: 30000,
+      staleTtlMs: 86400000,
+    }),
 });
 
 export type ProjectExtras = z.infer<typeof projectExtrasSchema>;

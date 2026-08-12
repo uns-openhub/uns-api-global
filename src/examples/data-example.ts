@@ -1,7 +1,7 @@
 /**
  * Change this file according to your specifications and rename it to index.ts
  */
-import { UnsProxyProcess, ConfigFile, logger } from "@uns-kit/core";
+import { UnsProxyProcess, ConfigFile, logger, mqttChannelParameters, resolveMqttChannel, type MqttChannelConfig } from "@uns-kit/core";
 import { registerAttributeDescriptions, registerObjectTypeDescriptions } from "@uns-kit/core/uns/uns-dictionary-registry.js";
 import { GeneratedPhysicalMeasurements } from "../uns/uns-measurements.generated.js";
 import { UnsPacket } from "@uns-kit/core/uns/uns-packet.js";
@@ -23,13 +23,24 @@ const config = await ConfigFile.loadConfig();
 registerObjectTypeDescriptions(GeneratedObjectTypeDescriptions);
 
 /**
- * Connect to input and output brokers
+ * Input and output inherit the full MQTT connection from infra unless they
+ * intentionally override individual channel settings.
  */
-const unsProxyProcess = new UnsProxyProcess(config.infra.host!, {processName: config.uns.processName!});
-const mqttInput = await unsProxyProcess.createUnsMqttProxy((config.input?.host)!, "templateUnsRttInput", config.uns.instanceMode!, config.uns.handover!, {
+const infraChannel = resolveMqttChannel(config.infra as MqttChannelConfig);
+const inputChannel = resolveMqttChannel(config.infra as MqttChannelConfig, config.input as MqttChannelConfig | undefined);
+const outputChannel = resolveMqttChannel(config.infra as MqttChannelConfig, config.output as MqttChannelConfig | undefined);
+const unsProxyProcess = new UnsProxyProcess(infraChannel.host, {
+  processName: config.uns.processName!,
+  ...mqttChannelParameters(infraChannel),
+});
+const mqttInput = await unsProxyProcess.createUnsMqttProxy(inputChannel.host, "templateUnsRttInput", config.uns.instanceMode!, config.uns.handover!, {
+  ...mqttChannelParameters(inputChannel),
   mqttSubToTopics: ["raw/#"],
 });
-const mqttOutput = await unsProxyProcess.createUnsMqttProxy((config.output?.host)!, "templateUnsRttOutput", config.uns.instanceMode!, config.uns.handover!, { publishThrottlingDelay: 1000});
+const mqttOutput = await unsProxyProcess.createUnsMqttProxy(outputChannel.host, "templateUnsRttOutput", config.uns.instanceMode!, config.uns.handover!, {
+  ...mqttChannelParameters(outputChannel),
+  publishThrottlingDelay: 1000,
+});
 
 
 /**

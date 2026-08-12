@@ -1,5 +1,17 @@
-import { UnsProxyProcess, ConfigFile, logger } from "@uns-kit/core";
-import { IApiProxyOptions } from "@uns-kit/core";
+import {
+  AuthClient,
+  UnsProxyProcess,
+  ConfigFile,
+  logger,
+  mqttChannelParameters,
+  registerService,
+  resolveMqttChannel,
+  ServiceTokenProvider,
+  UnsClient,
+  type AccessTokenProvider,
+  type IApiProxyOptions,
+  type MqttChannelConfig,
+} from "@uns-kit/core";
 import type { UnsEvents } from "@uns-kit/core";
 import UnsMqttProxy from "@uns-kit/core/uns-mqtt/uns-mqtt-proxy.js";
 import { UnsPacket } from "@uns-kit/core/uns/uns-packet.js";
@@ -8,7 +20,6 @@ import "@uns-kit/api";
 import { type UnsProxyProcessWithApi } from "@uns-kit/api";
 import { projectExtrasSchema, type ProjectExtras, type DataSourceConfig } from "./config/project.config.extension.js";
 import { isHistoryAllowed, isCacheAllowed, resolveTablePrefix, getCacheTopicFilters, matchesTopic } from "./topic-matcher.js";
-import { AuthClient } from "@uns-kit/core/tools/auth/auth-client.js";
 import { TriggerRegistry } from "./triggers/registry.js";
 import { TriggerPublisher } from "./triggers/publisher.js";
 import { TriggerService } from "./triggers/service.js";
@@ -108,7 +119,25 @@ const apiBasePath = normalizeBasePath(catchAll.apiBasePath ?? "/api/catchall");
 const catchAllSwaggerPath = catchAll.swaggerPath ?? "/uns-api-global/general-api/catchall-swagger.json";
 const controllerGraphqlUrl = typeof config.uns?.graphql === "string" ? config.uns.graphql.replace(/\/+$/, "") : null;
 const controllerRestUrl = typeof config.uns?.rest === "string" ? config.uns.rest.replace(/\/+$/, "") : null;
-const authClient = await AuthClient.create().catch(() => null);
+let legacyAuthClient: Promise<AuthClient | null> | undefined;
+const legacyAuthFallback: AccessTokenProvider = {
+  async getAccessToken(): Promise<string | undefined> {
+    legacyAuthClient ??= AuthClient.create().catch(() => null);
+    const client = await legacyAuthClient;
+    return client?.getAccessToken();
+  },
+};
+const configuredServiceToken = typeof config.uns?.token === "string" ? config.uns.token : undefined;
+const controllerTokenProvider = new ServiceTokenProvider({
+  ...(configuredServiceToken ? { configToken: configuredServiceToken } : {}),
+  fallback: legacyAuthFallback,
+});
+const controllerClient = controllerRestUrl
+  ? new UnsClient(controllerRestUrl, { tokenProvider: controllerTokenProvider })
+  : null;
+const infraChannel = resolveMqttChannel(config.infra as MqttChannelConfig);
+const inputChannel = resolveMqttChannel(config.infra as MqttChannelConfig, config.input as MqttChannelConfig | undefined);
+const outputChannel = resolveMqttChannel(config.infra as MqttChannelConfig, config.output as MqttChannelConfig | undefined);
 const envJwtSecret = process.env["UNS_API_JWT_SECRET"]?.trim();
 
 if (!config.uns?.jwksWellKnownUrl && !envJwtSecret) {
@@ -127,8 +156,9 @@ const catchAllAuth: CatchAllAuthConfig = config.uns?.jwksWellKnownUrl
     }
   : { jwtSecret: envJwtSecret };
 
-const unsProxyProcess = new UnsProxyProcess(config.infra.host!, {
+const unsProxyProcess = new UnsProxyProcess(infraChannel.host, {
   processName: config.uns.processName,
+  ...mqttChannelParameters(infraChannel),
 }) as UnsProxyProcessWithApi;
 
 const apiOptions: IApiProxyOptions = config.uns?.jwksWellKnownUrl
@@ -205,6 +235,28 @@ async function publishApiGlobalServiceMetadata() {
       questdbHealth: health,
     },
   });
+}
+
+async function registerApiGlobalService(): Promise<void> {
+  const rttNode = process.env["RTT_NODE"]?.trim();
+  const instanceId = process.env["RTT_INSTANCE_ID"]?.trim();
+  if (!rttNode || !instanceId) return;
+  if (!controllerClient) {
+    throw new Error("Controller-managed UNS API Global requires config.uns.rest for service registration.");
+  }
+
+  const registration = await registerService({
+    client: controllerClient,
+    service: {
+      id: "uns-api-global",
+      capabilities: ["catchall-api", "assistant-data", "graphs", "trigger-runtime", "capture-runtime"],
+      healthContract: "service-metadata-v1",
+      processName: config.uns.processName,
+    },
+  });
+  if (registration) {
+    logger.info(`Registered controller-managed service ${registration.service.rttNode}/${registration.service.instanceId}.`);
+  }
 }
 
 async function refreshAndPublishQuestDbHealth() {
@@ -640,6 +692,7 @@ for (const topicFilter of catchAllTopicFilters.length ? catchAllTopicFilters : [
 }
 
 await publishApiGlobalServiceMetadata();
+await registerApiGlobalService();
 
 setInterval(() => {
   refreshAndPublishQuestDbHealth().catch((error) => {
@@ -729,7 +782,7 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
       tableFromDataSource ||
       (await resolveTableFromController(topic, {
         controllerGraphqlUrl,
-        authClient,
+        tokenProvider: controllerTokenProvider,
       }));
     if (!table) {
       throw new HttpError(
@@ -984,9 +1037,9 @@ function buildSeedCounterState(value: unknown): LastValueEntry["counter"] | unde
 }
 
 async function fetchActiveTopicsFromController(): Promise<string[]> {
-  if (!controllerGraphqlUrl || !authClient) return [];
+  if (!controllerGraphqlUrl) return [];
   try {
-    const token = await authClient.getAccessToken();
+    const token = await controllerTokenProvider.getAccessToken();
     const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
     const document = gql`
       query GetUnsNodes {
@@ -1056,12 +1109,6 @@ async function initLastValueCache(): Promise<void> {
     return;
   }
 
-  const inputHost = config.input?.host ?? config.infra?.host;
-  if (!inputHost) {
-    logger.warn("[last-value-cache] No input.host or infra.host configured — skipping MQTT subscription.");
-    return;
-  }
-
   // Initial topic fetch
   lvActiveTopics = await fetchActiveTopicsFromController();
   if (lvActiveTopics.length === 0) {
@@ -1071,17 +1118,17 @@ async function initLastValueCache(): Promise<void> {
   }
 
   // Create MQTT input proxy
-  const lvProcess = new UnsProxyProcess(config.infra.host!, {
+  const lvProcess = new UnsProxyProcess(infraChannel.host, {
     processName: `${config.uns.processName}-lvc`,
+    ...mqttChannelParameters(infraChannel),
   });
   lvMqttInput = await lvProcess.createUnsMqttProxy(
-    inputHost,
+    inputChannel.host,
     "lastValueCacheInput",
     config.uns.instanceMode ?? "wait",
     false, // no handover — passive listener
     {
-      username: (config.input as any)?.username,
-      password: (config.input as any)?.password,
+      ...mqttChannelParameters(inputChannel),
       mqttSubToTopics: lvActiveTopics.length > 0 ? lvActiveTopics : ["$none"],
       subscribeThrottlingDelay: 0,
     },
@@ -1175,28 +1222,18 @@ async function initTriggerService(): Promise<void> {
     logger.info("[triggers] No uns.rest configured — trigger service disabled.");
     return;
   }
-  if (!authClient) {
-    logger.warn("[triggers] No auth client available — trigger service disabled.");
-    return;
-  }
-  const outputHost = config.output?.host ?? config.infra?.host;
-  if (!outputHost) {
-    logger.warn("[triggers] No output.host or infra.host configured — trigger service disabled.");
-    return;
-  }
-
   // Dedicated proxy (handover off — passive publisher only).
-  const trProcess = new UnsProxyProcess(config.infra.host!, {
+  const trProcess = new UnsProxyProcess(infraChannel.host, {
     processName: `${config.uns.processName}-triggers`,
+    ...mqttChannelParameters(infraChannel),
   });
   triggerOutputProxy = await trProcess.createUnsMqttProxy(
-    outputHost,
+    outputChannel.host,
     "triggerOutput",
     config.uns.instanceMode ?? "wait",
     false, // no handover — fires never need cluster handoff
     {
-      username: (config.output as any)?.username,
-      password: (config.output as any)?.password,
+      ...mqttChannelParameters(outputChannel),
       // No subscriptions — this proxy only publishes.
       mqttSubToTopics: ["$none"],
       subscribeThrottlingDelay: 0,
@@ -1207,7 +1244,7 @@ async function initTriggerService(): Promise<void> {
     controllerRestUrl,
     getAccessToken: async () => {
       try {
-        return (await authClient.getAccessToken()) ?? null;
+        return (await controllerTokenProvider.getAccessToken()) ?? null;
       } catch {
         return null;
       }
@@ -1260,28 +1297,18 @@ async function initCaptureService(): Promise<void> {
     logger.info("[captures] No uns.rest configured — capture service disabled.");
     return;
   }
-  if (!authClient) {
-    logger.warn("[captures] No auth client available — capture service disabled.");
-    return;
-  }
-  const outputHost = config.output?.host ?? config.infra?.host;
-  if (!outputHost) {
-    logger.warn("[captures] No output.host or infra.host configured — capture service disabled.");
-    return;
-  }
-
   const captureProcessName = `${config.uns.processName}-captures`;
-  const captureProcess = new UnsProxyProcess(config.infra.host!, {
+  const captureProcess = new UnsProxyProcess(infraChannel.host, {
     processName: captureProcessName,
+    ...mqttChannelParameters(infraChannel),
   });
   captureOutputProxy = await captureProcess.createUnsMqttProxy(
-    outputHost,
+    outputChannel.host,
     "captureOutput",
     config.uns.instanceMode ?? "wait",
     false,
     {
-      username: (config.output as any)?.username,
-      password: (config.output as any)?.password,
+      ...mqttChannelParameters(outputChannel),
       mqttSubToTopics: ["$none"],
       subscribeThrottlingDelay: 0,
     },
@@ -1291,7 +1318,7 @@ async function initCaptureService(): Promise<void> {
     controllerRestUrl,
     getAccessToken: async () => {
       try {
-        return (await authClient.getAccessToken()) ?? null;
+        return (await controllerTokenProvider.getAccessToken()) ?? null;
       } catch {
         return null;
       }
@@ -1313,7 +1340,7 @@ async function initCaptureService(): Promise<void> {
     registry,
     publisher,
     auditSession: async (event: CaptureSessionAuditEvent) => {
-      const token = await authClient.getAccessToken();
+      const token = await controllerTokenProvider.getAccessToken();
       if (!token) {
         logger.warn("[captures] no access token available; skipping session audit");
         return;
@@ -1354,7 +1381,7 @@ async function initCaptureService(): Promise<void> {
 
 async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
   if (!topics.length) return;
-  const resolverCfg: MappingResolverConfig = { controllerGraphqlUrl, authClient };
+  const resolverCfg: MappingResolverConfig = { controllerGraphqlUrl, tokenProvider: controllerTokenProvider };
 
   // Group topics by resolved table
   const topicsByTable = new Map<string, string[]>();
@@ -1649,7 +1676,7 @@ async function tryQuestDbLastRowFallback(
     const tableFromDataSource = resolveTablePrefix(dataSources, topic);
     const table =
       tableFromDataSource ||
-      (await resolveTableFromController(topic, { controllerGraphqlUrl, authClient }));
+      (await resolveTableFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider }));
     if (!table) return null;
 
     const parsedPath = parseUnsPath(topic);
@@ -1865,7 +1892,7 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
         const tableFromDataSource = resolveTablePrefix(dataSources, topic);
         const table =
           tableFromDataSource ||
-          (await resolveTableFromController(topic, { controllerGraphqlUrl, authClient }));
+          (await resolveTableFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider }));
         if (!table) {
           return { topic, error: "No QuestDB table mapping found.", data: null, sql: null, stats: null };
         }
@@ -2035,7 +2062,7 @@ initCaptureService().catch(err => {
 
 type MappingResolverConfig = {
   controllerGraphqlUrl: string | null;
-  authClient: AuthClient | null;
+  tokenProvider: AccessTokenProvider;
 };
 
 type QuestDbMappingEntry = {
@@ -2124,11 +2151,9 @@ async function getQuestDbMappings(cfg: MappingResolverConfig): Promise<QuestDbMa
     return mappingCache.entries;
   }
   if (!cfg.controllerGraphqlUrl) return [];
-  if (!cfg.authClient) return [];
-
   let token: string | null = null;
   try {
-    token = await cfg.authClient.getAccessToken();
+    token = await cfg.tokenProvider.getAccessToken() ?? null;
   } catch (error) {
     logger.warn(`QuestDBMappings auth error: ${error instanceof Error ? error.message : String(error)}`);
     return [];

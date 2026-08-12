@@ -4,7 +4,7 @@
  * In the development environment, you are responsible for creating and maintaining this file and its contents.
  */
 import readline from "readline";
-import { ConfigFile, logger } from "@uns-kit/core";
+import { ConfigFile, logger, mqttChannelParameters, resolveMqttChannel, type MqttChannelConfig } from "@uns-kit/core";
 import UnsMqttProxy from "@uns-kit/core/uns-mqtt/uns-mqtt-proxy.js";
 
 /**
@@ -31,13 +31,17 @@ function simulateSensorValue(step: number): number {
 async function main() {
   try {
     const config = await ConfigFile.loadConfig();
-    const outputHost = (config.output?.host)!;
+    const outputChannel = resolveMqttChannel(
+      config.infra as MqttChannelConfig,
+      config.output as MqttChannelConfig | undefined,
+    );
+    const outputHost = outputChannel.host;
 
     const mqttOutput = new UnsMqttProxy(
       outputHost,
       "loadTest",
       "templateUnsRttLoadTest",
-      { publishThrottlingDelay: 0 },
+      { ...mqttChannelParameters(outputChannel), publishThrottlingDelay: 0 },
       true
     );
 

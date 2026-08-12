@@ -2,7 +2,7 @@
 //
 // Constructs the UNS packet a fired trigger emits and hands it to an injected
 // publish function. The actual MQTT publish wiring lives in src/index.ts (where
-// the existing UnsProxyProcess + authClient are scoped) — this module is a pure
+// the existing UnsProxyProcess + controller token provider are scoped) — this module is a pure
 // adapter so it stays unit-testable.
 //
 // Output shape mirrors what `updateLastValue` parses on the SUBSCRIBE side (see
