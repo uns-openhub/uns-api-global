@@ -4,8 +4,10 @@ import {
   ConfigFile,
   logger,
   mqttChannelParameters,
+  registerService,
   resolveMqttChannel,
   ServiceTokenProvider,
+  UnsClient,
   type AccessTokenProvider,
   type IApiProxyOptions,
   type MqttChannelConfig,
@@ -130,6 +132,9 @@ const controllerTokenProvider = new ServiceTokenProvider({
   ...(configuredServiceToken ? { configToken: configuredServiceToken } : {}),
   fallback: legacyAuthFallback,
 });
+const controllerClient = controllerRestUrl
+  ? new UnsClient(controllerRestUrl, { tokenProvider: controllerTokenProvider })
+  : null;
 const infraChannel = resolveMqttChannel(config.infra as MqttChannelConfig);
 const inputChannel = resolveMqttChannel(config.infra as MqttChannelConfig, config.input as MqttChannelConfig | undefined);
 const outputChannel = resolveMqttChannel(config.infra as MqttChannelConfig, config.output as MqttChannelConfig | undefined);
@@ -230,6 +235,28 @@ async function publishApiGlobalServiceMetadata() {
       questdbHealth: health,
     },
   });
+}
+
+async function registerApiGlobalService(): Promise<void> {
+  const rttNode = process.env["RTT_NODE"]?.trim();
+  const instanceId = process.env["RTT_INSTANCE_ID"]?.trim();
+  if (!rttNode || !instanceId) return;
+  if (!controllerClient) {
+    throw new Error("Controller-managed UNS API Global requires config.uns.rest for service registration.");
+  }
+
+  const registration = await registerService({
+    client: controllerClient,
+    service: {
+      id: "uns-api-global",
+      capabilities: ["catchall-api", "assistant-data", "graphs", "trigger-runtime", "capture-runtime"],
+      healthContract: "service-metadata-v1",
+      processName: config.uns.processName,
+    },
+  });
+  if (registration) {
+    logger.info(`Registered controller-managed service ${registration.service.rttNode}/${registration.service.instanceId}.`);
+  }
 }
 
 async function refreshAndPublishQuestDbHealth() {
@@ -665,6 +692,7 @@ for (const topicFilter of catchAllTopicFilters.length ? catchAllTopicFilters : [
 }
 
 await publishApiGlobalServiceMetadata();
+await registerApiGlobalService();
 
 setInterval(() => {
   refreshAndPublishQuestDbHealth().catch((error) => {
