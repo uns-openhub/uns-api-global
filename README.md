@@ -25,19 +25,43 @@ at `/uns-api-global/general-api/catchall-swagger.json`.
 - An UNS OpenHub controller and MQTT broker
 - QuestDB containing archived UNS data
 
-## Local setup
+## Configuration profiles
+
+The service ships three topology-specific profiles. They contain no deployment
+credentials or customer endpoints.
+
+| Profile | Use it when | MQTT and QuestDB | Service credential |
+| --- | --- | --- | --- |
+| `config-development-host.json` | Running the service directly with `pnpm run dev` on the host | `localhost` | `UNS_SERVICE_TOKEN` from untracked `.env` |
+| `config-development-podman.json` | Deploying through a local Podman OpenHub controller | Compose DNS: `mosquitto`, `questdb` | Controller-managed `UNS_SERVICE_TOKEN_FILE` |
+| `config-production.json` | Creating a production controller instance | Compose/Runtime DNS: `mosquitto`, `questdb` | Controller-managed `/run` token file |
+
+The Podman and production profiles intentionally share their internal network
+names: in both cases the RTT process runs alongside the controller. The
+production profile sets `uns.env` to `prod` and is only a safe starting point;
+the controller copies it into a per-instance configuration that is retained
+across add-on releases.
+
+## Direct host development
 
 ```bash
 corepack enable
 pnpm install
-cp config-local.json config.json
+cp config-development-host.json config.json
+cp .env.example .env
+# Set UNS_SERVICE_TOKEN in .env to a development machine token.
 pnpm run dev
 ```
 
-`config-local.json` is for the local OpenHub container layout: the child process
-uses `localhost:3200` for the controller and Compose DNS names `mosquitto` and
-`questdb` for its sibling containers. `input` and `output` inherit all broker
+For a controller-managed local Podman or production installation, deploy the
+add-on from **Micro services** and select the matching profile. Do not copy the
+repository `.env` into that instance. `input` and `output` inherit all broker
 settings from `infra`; add either section only to override a specific channel.
+
+The QuestDB password has a separate lifecycle from the service credential: set
+`QUESTDB_PASSWORD` in `.env` only for direct host development. A controller-managed
+Podman or production process must receive it from the controller environment or its
+approved secret provider, never from the profile or an instance `config.json`.
 
 `config.json` and `.env` are intentionally ignored. A directly started development
 process uses a dedicated machine token:
@@ -51,7 +75,7 @@ Controller authentication resolves the controller-managed `UNS_SERVICE_TOKEN_FIL
 first, then `UNS_SERVICE_TOKEN`, `uns.token`, and only then legacy
 `uns.email`/`uns.password`. The legacy credentials are retained solely for bootstrap
 or replacement of a development machine token; they are not part of either committed
-configuration profile.
+configuration profile. None of the committed profiles requires an email or password.
 
 For API authentication, configure `uns.jwksWellKnownUrl` (recommended). A local
 standalone setup can alternatively provide `UNS_API_JWT_SECRET`.

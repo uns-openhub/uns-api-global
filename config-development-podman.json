@@ -14,7 +14,8 @@
     "instanceMode": "wait",
     "handover": true,
     "jwksWellKnownUrl": "http://localhost:3200/api/.well-known/jwks.json",
-    "kidWellKnownUrl": "http://localhost:3200/api/.well-known/kid"
+    "kidWellKnownUrl": "http://localhost:3200/api/.well-known/kid",
+    "env": "dev"
   },
   "infra": {
     "host": "mosquitto"
