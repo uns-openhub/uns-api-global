@@ -18,14 +18,27 @@ import { UnsPacket } from "@uns-kit/core/uns/uns-packet.js";
 import { tableColumnsToLastValues } from "./table-packet.js";
 import "@uns-kit/api";
 import { type UnsProxyProcessWithApi } from "@uns-kit/api";
-import { projectExtrasSchema, type ProjectExtras, type DataSourceConfig } from "./config/project.config.extension.js";
-import { isHistoryAllowed, isCacheAllowed, resolveTablePrefix, getCacheTopicFilters, matchesTopic } from "./topic-matcher.js";
+import {
+  projectExtrasSchema,
+  type ProjectExtras,
+  type DataSourceConfig,
+} from "./config/project.config.extension.js";
+import {
+  isHistoryAllowed,
+  isCacheAllowed,
+  resolveTablePrefix,
+  getCacheTopicFilters,
+  matchesTopic,
+} from "./topic-matcher.js";
 import { TriggerRegistry } from "./triggers/registry.js";
 import { TriggerPublisher } from "./triggers/publisher.js";
 import { TriggerService } from "./triggers/service.js";
 import { CaptureRegistry } from "./captures/registry.js";
 import { CapturePublisher } from "./captures/publisher.js";
-import { CaptureService, type CaptureSessionAuditEvent } from "./captures/service.js";
+import {
+  CaptureService,
+  type CaptureSessionAuditEvent,
+} from "./captures/service.js";
 import jwt from "jsonwebtoken";
 import type { Algorithm } from "jsonwebtoken";
 import { createPublicKey, randomUUID } from "node:crypto";
@@ -40,7 +53,14 @@ import {
 
 type TimeRange = { from?: string; to?: string; note?: string };
 type TimeFieldPreference = "auto" | "timestamp" | "interval";
-type QuestDbConfig = ProjectExtras["questdb"];
+type QuestDbConfig = Omit<
+  ProjectExtras["questdb"],
+  "url" | "username" | "password"
+> & {
+  url: string;
+  username: string;
+  password: string;
+};
 type CatchAllConfig = ProjectExtras["catchAll"];
 type AggregateMode = "avg" | "min" | "max" | "last" | "sum" | "count";
 type HistoryTransformMode = "raw" | "delta";
@@ -91,12 +111,25 @@ type CatchAllAuthConfig = {
   algorithms?: Algorithm[] | undefined;
   jwtSecret?: string | undefined;
 };
-type JwkKey = { kid?: string; kty?: string; n?: string; e?: string; x5c?: string[] };
+type JwkKey = {
+  kid?: string;
+  kty?: string;
+  n?: string;
+  e?: string;
+  x5c?: string[];
+};
 const QUESTDB_HEALTHCHECK_INTERVAL = 30000;
 const DEFAULT_BUCKET_AGGREGATE: AggregateMode = "last";
 const DEFAULT_HISTORY_TRANSFORM: HistoryTransformMode = "raw";
 const DEFAULT_COUNTER_RESET_POLICY: CounterResetPolicy = "new-value";
-const NUMERIC_QUESTDB_TYPES = new Set(["BYTE", "SHORT", "INT", "LONG", "FLOAT", "DOUBLE"]);
+const NUMERIC_QUESTDB_TYPES = new Set([
+  "BYTE",
+  "SHORT",
+  "INT",
+  "LONG",
+  "FLOAT",
+  "DOUBLE",
+]);
 const NON_VALUE_COLUMNS = new Set([
   "topic",
   "asset",
@@ -114,11 +147,23 @@ const NON_VALUE_COLUMNS = new Set([
 ]);
 
 const config = await ConfigFile.loadConfig();
-const { questdb, catchAll, lastValueCache: lastValueCacheConfig, dataSources } = parseProjectExtras(config);
+const {
+  questdb,
+  catchAll,
+  lastValueCache: lastValueCacheConfig,
+  dataSources,
+} = parseProjectExtras(config);
 const apiBasePath = normalizeBasePath(catchAll.apiBasePath ?? "/api/catchall");
-const catchAllSwaggerPath = catchAll.swaggerPath ?? "/uns-api-global/general-api/catchall-swagger.json";
-const controllerGraphqlUrl = typeof config.uns?.graphql === "string" ? config.uns.graphql.replace(/\/+$/, "") : null;
-const controllerRestUrl = typeof config.uns?.rest === "string" ? config.uns.rest.replace(/\/+$/, "") : null;
+const catchAllSwaggerPath =
+  catchAll.swaggerPath ?? "/uns-api-global/general-api/catchall-swagger.json";
+const controllerGraphqlUrl =
+  typeof config.uns?.graphql === "string"
+    ? config.uns.graphql.replace(/\/+$/, "")
+    : null;
+const controllerRestUrl =
+  typeof config.uns?.rest === "string"
+    ? config.uns.rest.replace(/\/+$/, "")
+    : null;
 let legacyAuthClient: Promise<AuthClient | null> | undefined;
 const legacyAuthFallback: AccessTokenProvider = {
   async getAccessToken(): Promise<string | undefined> {
@@ -127,7 +172,8 @@ const legacyAuthFallback: AccessTokenProvider = {
     return client?.getAccessToken();
   },
 };
-const configuredServiceToken = typeof config.uns?.token === "string" ? config.uns.token : undefined;
+const configuredServiceToken =
+  typeof config.uns?.token === "string" ? config.uns.token : undefined;
 const controllerTokenProvider = new ServiceTokenProvider({
   ...(configuredServiceToken ? { configToken: configuredServiceToken } : {}),
   fallback: legacyAuthFallback,
@@ -136,8 +182,14 @@ const controllerClient = controllerRestUrl
   ? new UnsClient(controllerRestUrl, { tokenProvider: controllerTokenProvider })
   : null;
 const infraChannel = resolveMqttChannel(config.infra as MqttChannelConfig);
-const inputChannel = resolveMqttChannel(config.infra as MqttChannelConfig, config.input as MqttChannelConfig | undefined);
-const outputChannel = resolveMqttChannel(config.infra as MqttChannelConfig, config.output as MqttChannelConfig | undefined);
+const inputChannel = resolveMqttChannel(
+  config.infra as MqttChannelConfig,
+  config.input as MqttChannelConfig | undefined,
+);
+const outputChannel = resolveMqttChannel(
+  config.infra as MqttChannelConfig,
+  config.output as MqttChannelConfig | undefined,
+);
 const envJwtSecret = process.env["UNS_API_JWT_SECRET"]?.trim();
 
 if (!config.uns?.jwksWellKnownUrl && !envJwtSecret) {
@@ -165,14 +217,19 @@ const apiOptions: IApiProxyOptions = config.uns?.jwksWellKnownUrl
   ? {
       jwks: {
         wellKnownJwksUrl: config.uns.jwksWellKnownUrl,
-        ...(config.uns.kidWellKnownUrl !== undefined ? { activeKidUrl: config.uns.kidWellKnownUrl } : {}),
+        ...(config.uns.kidWellKnownUrl !== undefined
+          ? { activeKidUrl: config.uns.kidWellKnownUrl }
+          : {}),
       },
     }
   : {
       jwtSecret: envJwtSecret!,
     };
 
-const apiInput = await unsProxyProcess.createApiProxy("general-api", apiOptions);
+const apiInput = await unsProxyProcess.createApiProxy(
+  "general-api",
+  apiOptions,
+);
 let latestQuestDbHealth: QuestDbDependencyHealth | null = null;
 
 async function refreshQuestDbHealth(): Promise<QuestDbDependencyHealth> {
@@ -205,8 +262,15 @@ async function publishApiGlobalServiceMetadata() {
     serviceId: "uns-api-global",
     kind: "core",
     label: "UNS API Global",
-    description: "Serves catch-all data APIs, assistant data views, graphing, trigger runtime inspection, and capture runtime.",
-    capabilities: ["catchall-api", "assistant-data", "graphs", "trigger-runtime", "capture-runtime"],
+    description:
+      "Serves catch-all data APIs, assistant data views, graphing, trigger runtime inspection, and capture runtime.",
+    capabilities: [
+      "catchall-api",
+      "assistant-data",
+      "graphs",
+      "trigger-runtime",
+      "capture-runtime",
+    ],
     apiRoutes: [
       {
         path: apiBasePath,
@@ -242,20 +306,30 @@ async function registerApiGlobalService(): Promise<void> {
   const instanceId = process.env["RTT_INSTANCE_ID"]?.trim();
   if (!rttNode || !instanceId) return;
   if (!controllerClient) {
-    throw new Error("Controller-managed UNS API Global requires config.uns.rest for service registration.");
+    throw new Error(
+      "Controller-managed UNS API Global requires config.uns.rest for service registration.",
+    );
   }
 
   const registration = await registerService({
     client: controllerClient,
     service: {
       id: "uns-api-global",
-      capabilities: ["catchall-api", "assistant-data", "graphs", "trigger-runtime", "capture-runtime"],
+      capabilities: [
+        "catchall-api",
+        "assistant-data",
+        "graphs",
+        "trigger-runtime",
+        "capture-runtime",
+      ],
       healthContract: "service-metadata-v1",
       processName: config.uns.processName,
     },
   });
   if (registration) {
-    logger.info(`Registered controller-managed service ${registration.service.rttNode}/${registration.service.instanceId}.`);
+    logger.info(
+      `Registered controller-managed service ${registration.service.rttNode}/${registration.service.instanceId}.`,
+    );
   }
 }
 
@@ -294,7 +368,8 @@ const swaggerDoc = {
             in: "query",
             required: false,
             schema: { type: "string" },
-            description: "QuestDB table name (optional if controller mappings are available)",
+            description:
+              "QuestDB table name (optional if controller mappings are available)",
           },
           {
             name: "from",
@@ -315,7 +390,8 @@ const swaggerDoc = {
             in: "query",
             required: false,
             schema: { type: "string", enum: ["auto", "timestamp", "interval"] },
-            description: "Time filter mode: auto (default), timestamp, or interval",
+            description:
+              "Time filter mode: auto (default), timestamp, or interval",
           },
           {
             name: "limit",
@@ -329,42 +405,51 @@ const swaggerDoc = {
             in: "query",
             required: false,
             schema: { type: "integer" },
-            description: "Return sampled buckets capped to this number of points. Requires explicit from and to.",
+            description:
+              "Return sampled buckets capped to this number of points. Requires explicit from and to.",
           },
           {
             name: "bucketMs",
             in: "query",
             required: false,
             schema: { type: "integer" },
-            description: "Return sampled buckets with this bucket width in milliseconds.",
+            description:
+              "Return sampled buckets with this bucket width in milliseconds.",
           },
           {
             name: "aggregate",
             in: "query",
             required: false,
-            schema: { type: "string", enum: ["avg", "min", "max", "last", "sum", "count"] },
-            description: "Bucket aggregate for sampled responses (default: last).",
+            schema: {
+              type: "string",
+              enum: ["avg", "min", "max", "last", "sum", "count"],
+            },
+            description:
+              "Bucket aggregate for sampled responses (default: last).",
           },
           {
             name: "transform",
             in: "query",
             required: false,
             schema: { type: "string", enum: ["raw", "delta"] },
-            description: "History transform: raw rows (default) or query-time counter delta.",
+            description:
+              "History transform: raw rows (default) or query-time counter delta.",
           },
           {
             name: "counterResetPolicy",
             in: "query",
             required: false,
             schema: { type: "string", enum: ["new-value", "null"] },
-            description: "Counter reset handling for transform=delta. new-value treats a negative step as the new counter value; null skips reset rows.",
+            description:
+              "Counter reset handling for transform=delta. new-value treats a negative step as the new counter value; null skips reset rows.",
           },
           {
             name: "column",
             in: "query",
             required: false,
             schema: { type: "string" },
-            description: "Numeric QuestDB column to sample when the table contains multiple numeric columns.",
+            description:
+              "Numeric QuestDB column to sample when the table contains multiple numeric columns.",
           },
           {
             name: "summaryOnly",
@@ -378,7 +463,8 @@ const swaggerDoc = {
             in: "query",
             required: false,
             schema: { type: "boolean" },
-            description: "Return only latest row per interval (default true, default false for transform=delta)",
+            description:
+              "Return only latest row per interval (default true, default false for transform=delta)",
           },
         ],
         responses: {
@@ -392,7 +478,8 @@ const swaggerDoc = {
     },
     [`${apiBasePath}/batch/last`]: {
       post: {
-        summary: "Batch last values — current/latest value for multiple topics from in-memory cache",
+        summary:
+          "Batch last values — current/latest value for multiple topics from in-memory cache",
         description:
           "Returns the most recent known value per topic from the MQTT last-value cache " +
           "(seeded from QuestDB on startup), with bounded QuestDB latest-row fallback on cache misses. " +
@@ -415,7 +502,8 @@ const swaggerDoc = {
                   transform: {
                     type: "string",
                     enum: ["raw", "delta"],
-                    description: "Optional last-value transform. delta returns the latest adjacent counter delta while preserving counter metadata.",
+                    description:
+                      "Optional last-value transform. delta returns the latest adjacent counter delta while preserving counter metadata.",
                   },
                   counterResetPolicy: {
                     type: "string",
@@ -447,27 +535,52 @@ const swaggerDoc = {
                         type: "object",
                         properties: {
                           topic: { type: "string" },
-                          value: { description: "Scalar value for data attributes (number or string), null for table attributes" },
+                          value: {
+                            description:
+                              "Scalar value for data attributes (number or string), null for table attributes",
+                          },
                           values: {
                             type: "object",
-                            description: "Unified values map — data: { value: 900.2 }, table: { batchId: '...', event: 'ENTERED', ... }",
+                            description:
+                              "Unified values map — data: { value: 900.2 }, table: { batchId: '...', event: 'ENTERED', ... }",
                           },
                           uom: { type: "string", nullable: true },
-                          timestamp: { type: "string", nullable: true, description: "ISO timestamp of the last known value" },
+                          timestamp: {
+                            type: "string",
+                            nullable: true,
+                            description:
+                              "ISO timestamp of the last known value",
+                          },
                           dataGroup: { type: "string", nullable: true },
-                          ageMs: { type: "number", nullable: true, description: "Milliseconds since last MQTT update" },
-                          source: { type: "string", enum: ["cache", "questdb", "miss"], description: "cache = value available, questdb = lazy latest-row fallback, miss = no data yet" },
+                          ageMs: {
+                            type: "number",
+                            nullable: true,
+                            description: "Milliseconds since last MQTT update",
+                          },
+                          source: {
+                            type: "string",
+                            enum: ["cache", "questdb", "miss"],
+                            description:
+                              "cache = value available, questdb = lazy latest-row fallback, miss = no data yet",
+                          },
                           counter: {
                             type: "object",
                             nullable: true,
-                            description: "Derived adjacent counter metadata for numeric data attributes. absoluteValue remains the source-of-truth counter state; delta is null until a previous state is known.",
+                            description:
+                              "Derived adjacent counter metadata for numeric data attributes. absoluteValue remains the source-of-truth counter state; delta is null until a previous state is known.",
                             properties: {
                               absoluteValue: { type: "number" },
                               previousValue: { type: "number", nullable: true },
-                              previousTimestamp: { type: "string", nullable: true },
+                              previousTimestamp: {
+                                type: "string",
+                                nullable: true,
+                              },
                               delta: { type: "number", nullable: true },
                               reset: { type: "boolean" },
-                              resetPolicy: { type: "string", enum: ["new-value", "null"] },
+                              resetPolicy: {
+                                type: "string",
+                                enum: ["new-value", "null"],
+                              },
                             },
                           },
                         },
@@ -479,7 +592,10 @@ const swaggerDoc = {
                         requested: { type: "integer" },
                         hits: { type: "integer" },
                         misses: { type: "integer" },
-                        cacheSize: { type: "integer", description: "Total entries in the last-value cache" },
+                        cacheSize: {
+                          type: "integer",
+                          description: "Total entries in the last-value cache",
+                        },
                       },
                     },
                   },
@@ -494,7 +610,8 @@ const swaggerDoc = {
     },
     [`${apiBasePath}/batch/range`]: {
       post: {
-        summary: "Batch history — historical time-series data for multiple topics from QuestDB",
+        summary:
+          "Batch history — historical time-series data for multiple topics from QuestDB",
         description:
           "Runs parallel QuestDB queries for each requested topic and returns per-topic " +
           "result rows. Supports all the same parameters as the single-topic GET endpoint " +
@@ -515,29 +632,59 @@ const swaggerDoc = {
                     items: { type: "string" },
                     description: "Full attribute topic paths (max 500)",
                   },
-                  from: { type: "string", description: `ISO start time (default: last ${questdb.defaultLookbackHours}h)` },
-                  to: { type: "string", description: "ISO end time (default: now)" },
-                  limit: { type: "integer", description: `Raw row limit per topic (default ${questdb.defaultLimit}, max ${questdb.maxLimit})` },
-                  maxPoints: { type: "integer", description: "Return sampled buckets capped to this number of points. Requires explicit from and to." },
-                  bucketMs: { type: "integer", description: "Return sampled buckets with this bucket width in milliseconds." },
+                  from: {
+                    type: "string",
+                    description: `ISO start time (default: last ${questdb.defaultLookbackHours}h)`,
+                  },
+                  to: {
+                    type: "string",
+                    description: "ISO end time (default: now)",
+                  },
+                  limit: {
+                    type: "integer",
+                    description: `Raw row limit per topic (default ${questdb.defaultLimit}, max ${questdb.maxLimit})`,
+                  },
+                  maxPoints: {
+                    type: "integer",
+                    description:
+                      "Return sampled buckets capped to this number of points. Requires explicit from and to.",
+                  },
+                  bucketMs: {
+                    type: "integer",
+                    description:
+                      "Return sampled buckets with this bucket width in milliseconds.",
+                  },
                   aggregate: {
                     type: "string",
                     enum: ["avg", "min", "max", "last", "sum", "count"],
-                    description: "Bucket aggregate for sampled responses (default: last)",
+                    description:
+                      "Bucket aggregate for sampled responses (default: last)",
                   },
                   transform: {
                     type: "string",
                     enum: ["raw", "delta"],
-                    description: "History transform: raw rows (default) or query-time counter delta",
+                    description:
+                      "History transform: raw rows (default) or query-time counter delta",
                   },
                   counterResetPolicy: {
                     type: "string",
                     enum: ["new-value", "null"],
                     description: "Counter reset handling for transform=delta",
                   },
-                  column: { type: "string", description: "Numeric QuestDB column to sample when the table contains multiple numeric columns" },
-                  dedupe: { type: "boolean", description: "Deduplicate rows per interval (default true, default false for transform=delta)" },
-                  summaryOnly: { type: "boolean", description: "Return aggregates instead of rows" },
+                  column: {
+                    type: "string",
+                    description:
+                      "Numeric QuestDB column to sample when the table contains multiple numeric columns",
+                  },
+                  dedupe: {
+                    type: "boolean",
+                    description:
+                      "Deduplicate rows per interval (default true, default false for transform=delta)",
+                  },
+                  summaryOnly: {
+                    type: "boolean",
+                    description: "Return aggregates instead of rows",
+                  },
                 },
               },
               example: {
@@ -566,8 +713,17 @@ const swaggerDoc = {
                         type: "object",
                         properties: {
                           topic: { type: "string" },
-                          error: { type: "string", nullable: true, description: "Error message if this topic's query failed" },
-                          data: { type: "array", description: "QuestDB result rows (array-of-arrays matching column order)" },
+                          error: {
+                            type: "string",
+                            nullable: true,
+                            description:
+                              "Error message if this topic's query failed",
+                          },
+                          data: {
+                            type: "array",
+                            description:
+                              "QuestDB result rows (array-of-arrays matching column order)",
+                          },
                           stats: {
                             type: "object",
                             properties: {
@@ -605,7 +761,9 @@ const swaggerDoc = {
   },
 };
 
-const catchAllRegistrationOptions: Parameters<typeof apiInput.registerCatchAll>[1] = {
+const catchAllRegistrationOptions: Parameters<
+  typeof apiInput.registerCatchAll
+>[1] = {
   apiDescription: catchAll.description ?? "Catch-all UNS data API",
   apiBasePath,
   swaggerPath: catchAllSwaggerPath,
@@ -616,7 +774,8 @@ const catchAllRegistrationOptions: Parameters<typeof apiInput.registerCatchAll>[
       name: "table",
       type: "string",
       required: false,
-      description: "QuestDB table name (optional if controller mappings are available)",
+      description:
+        "QuestDB table name (optional if controller mappings are available)",
     },
     {
       name: "from",
@@ -624,7 +783,12 @@ const catchAllRegistrationOptions: Parameters<typeof apiInput.registerCatchAll>[
       required: false,
       description: `ISO start time (default: last ${questdb.defaultLookbackHours}h)`,
     },
-    { name: "to", type: "string", required: false, description: "ISO end time (default: now)" },
+    {
+      name: "to",
+      type: "string",
+      required: false,
+      description: "ISO end time (default: now)",
+    },
     {
       name: "timeField",
       type: "string",
@@ -641,40 +805,57 @@ const catchAllRegistrationOptions: Parameters<typeof apiInput.registerCatchAll>[
       name: "maxPoints",
       type: "number",
       required: false,
-      description: "Return sampled buckets capped to this number of points. Requires explicit from and to.",
+      description:
+        "Return sampled buckets capped to this number of points. Requires explicit from and to.",
     },
     {
       name: "bucketMs",
       type: "number",
       required: false,
-      description: "Return sampled buckets with this bucket width in milliseconds.",
+      description:
+        "Return sampled buckets with this bucket width in milliseconds.",
     },
     {
       name: "aggregate",
       type: "string",
       required: false,
-      description: "Bucket aggregate for sampled responses: avg, min, max, last, sum, or count.",
+      description:
+        "Bucket aggregate for sampled responses: avg, min, max, last, sum, or count.",
     },
     {
       name: "transform",
       type: "string",
       required: false,
-      description: "History transform: raw rows (default) or query-time counter delta.",
+      description:
+        "History transform: raw rows (default) or query-time counter delta.",
     },
     {
       name: "counterResetPolicy",
       type: "string",
       required: false,
-      description: "Counter reset handling for transform=delta: new-value or null.",
+      description:
+        "Counter reset handling for transform=delta: new-value or null.",
     },
     {
       name: "column",
       type: "string",
       required: false,
-      description: "Numeric QuestDB column to sample when the table contains multiple numeric columns.",
+      description:
+        "Numeric QuestDB column to sample when the table contains multiple numeric columns.",
     },
-    { name: "summaryOnly", type: "boolean", required: false, description: "Return aggregates instead of rows" },
-    { name: "dedupe", type: "boolean", required: false, description: "Return only latest row per interval (default true, default false for transform=delta)" },
+    {
+      name: "summaryOnly",
+      type: "boolean",
+      required: false,
+      description: "Return aggregates instead of rows",
+    },
+    {
+      name: "dedupe",
+      type: "boolean",
+      required: false,
+      description:
+        "Return only latest row per interval (default true, default false for transform=delta)",
+    },
   ],
 };
 
@@ -687,7 +868,9 @@ const catchAllTopicFilters = Array.from(
   ),
 );
 
-for (const topicFilter of catchAllTopicFilters.length ? catchAllTopicFilters : ["#"]) {
+for (const topicFilter of catchAllTopicFilters.length
+  ? catchAllTopicFilters
+  : ["#"]) {
   await apiInput.registerCatchAll(topicFilter, catchAllRegistrationOptions);
 }
 
@@ -696,7 +879,9 @@ await registerApiGlobalService();
 
 setInterval(() => {
   refreshAndPublishQuestDbHealth().catch((error) => {
-    logger.warn(`Failed to publish QuestDB dependency health: ${error instanceof Error ? error.message : String(error)}`);
+    logger.warn(
+      `Failed to publish QuestDB dependency health: ${error instanceof Error ? error.message : String(error)}`,
+    );
   });
 }, QUESTDB_HEALTHCHECK_INTERVAL);
 
@@ -771,7 +956,10 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
       throw new HttpError(400, "Missing required query param: topic");
     }
     if (!isHistoryAllowed(dataSources, topic)) {
-      throw new HttpError(403, `Topic '${topic}' is not configured for history queries in dataSources.`);
+      throw new HttpError(
+        403,
+        `Topic '${topic}' is not configured for history queries in dataSources.`,
+      );
     }
     await validateCatchAllAccess(req, topic, catchAllAuth);
 
@@ -792,26 +980,53 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
     }
 
     const summaryOnly = toBoolean(query?.["summaryOnly"] ?? query?.["summary"]);
-    const limit = clampLimit(query?.["limit"], questdb.defaultLimit, questdb.maxLimit);
+    const limit = clampLimit(
+      query?.["limit"],
+      questdb.defaultLimit,
+      questdb.maxLimit,
+    );
     const transform = parseHistoryTransformMode(query?.["transform"]);
-    const counterResetPolicy = parseCounterResetPolicy(query?.["counterResetPolicy"] ?? query?.["resetPolicy"]);
+    const counterResetPolicy = parseCounterResetPolicy(
+      query?.["counterResetPolicy"] ?? query?.["resetPolicy"],
+    );
     if (summaryOnly && transform !== "raw") {
-      throw new HttpError(400, "summaryOnly cannot be combined with transform=delta.");
+      throw new HttpError(
+        400,
+        "summaryOnly cannot be combined with transform=delta.",
+      );
     }
-    const dedupeRequested = query?.["dedupe"] === undefined ? transform !== "delta" : toBoolean(query?.["dedupe"]);
+    const dedupeRequested =
+      query?.["dedupe"] === undefined
+        ? transform !== "delta"
+        : toBoolean(query?.["dedupe"]);
     const timeField = parseTimeFieldPreference(query?.["timeField"]);
-    const requestedMaxPoints = parsePositiveIntegerParam(query?.["maxPoints"], "maxPoints");
-    const requestedBucketMs = parsePositiveIntegerParam(query?.["bucketMs"], "bucketMs");
-    const aggregate = parseAggregateMode(query?.["aggregate"]) ?? DEFAULT_BUCKET_AGGREGATE;
-    const requestedMetricColumn = parseOptionalColumnParam(query?.["column"] ?? query?.["metricColumn"], "column");
-    const sampledRequested = !summaryOnly && (requestedMaxPoints !== null || requestedBucketMs !== null);
+    const requestedMaxPoints = parsePositiveIntegerParam(
+      query?.["maxPoints"],
+      "maxPoints",
+    );
+    const requestedBucketMs = parsePositiveIntegerParam(
+      query?.["bucketMs"],
+      "bucketMs",
+    );
+    const aggregate =
+      parseAggregateMode(query?.["aggregate"]) ?? DEFAULT_BUCKET_AGGREGATE;
+    const requestedMetricColumn = parseOptionalColumnParam(
+      query?.["column"] ?? query?.["metricColumn"],
+      "column",
+    );
+    const sampledRequested =
+      !summaryOnly &&
+      (requestedMaxPoints !== null || requestedBucketMs !== null);
     if (
       sampledRequested &&
       requestedMaxPoints !== null &&
       requestedBucketMs === null &&
       (!hasQueryValue(query?.["from"]) || !hasQueryValue(query?.["to"]))
     ) {
-      throw new HttpError(400, "Query param maxPoints requires explicit from and to timestamps.");
+      throw new HttpError(
+        400,
+        "Query param maxPoints requires explicit from and to timestamps.",
+      );
     }
     const range = normalizeRange(
       query?.["from"],
@@ -831,10 +1046,16 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
       sampling = { mode: "summary" };
       sql = buildSummarySql(table, parsedPath, range, temporal, tableColumns);
     } else if (sampledRequested) {
-      const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
+      const metricColumn = resolveMetricColumn(
+        tableSchema,
+        parsedPath,
+        requestedMetricColumn,
+      );
       const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
-      const bucketMs = requestedBucketMs ?? deriveBucketMs(range, requestedMaxPoints!);
-      const bucketAggregate: AggregateMode = transform === "delta" ? "sum" : aggregate;
+      const bucketMs =
+        requestedBucketMs ?? deriveBucketMs(range, requestedMaxPoints!);
+      const bucketAggregate: AggregateMode =
+        transform === "delta" ? "sum" : aggregate;
       sampling = {
         mode: "bucketed",
         requestedMaxPoints,
@@ -844,7 +1065,9 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
         ...(transform === "delta" ? { counterResetPolicy } : {}),
         metricColumn,
         unitColumn,
-        ...(transform === "delta" ? { boundaryMode: "interpolated" as const } : {}),
+        ...(transform === "delta"
+          ? { boundaryMode: "interpolated" as const }
+          : {}),
       };
       if (transform === "delta") {
         sql = buildSourceSql(
@@ -866,11 +1089,23 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
           temporal,
           [metricColumn, ...(unitColumn ? [unitColumn] : [])],
         );
-        sql = buildBucketSql(sourceSql, temporal, metricColumn, unitColumn, aggregate, bucketMs, requestedMetricColumn);
+        sql = buildBucketSql(
+          sourceSql,
+          temporal,
+          metricColumn,
+          unitColumn,
+          aggregate,
+          bucketMs,
+          requestedMetricColumn,
+        );
       }
     } else {
       if (transform === "delta") {
-        const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
+        const metricColumn = resolveMetricColumn(
+          tableSchema,
+          parsedPath,
+          requestedMetricColumn,
+        );
         const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
         const sourceSql = buildSourceSql(
           table,
@@ -889,28 +1124,43 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
           counterResetPolicy,
           requestedMetricColumn,
         );
-        sampling = { mode: "raw", transform, counterResetPolicy, metricColumn, unitColumn };
+        sampling = {
+          mode: "raw",
+          transform,
+          counterResetPolicy,
+          metricColumn,
+          unitColumn,
+        };
         sql = buildCounterDeltaRawSql(deltaSourceSql, limit);
       } else {
         sampling = { mode: "raw", transform };
-        sql = buildDataSql(table, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
+        sql = buildDataSql(
+          table,
+          parsedPath,
+          range,
+          limit,
+          dedupeRequested,
+          tableColumns,
+          temporal,
+        );
       }
     }
 
     const rawResult = await queryQuestDb(questdb, sql);
-    const result = sampling.mode === "bucketed" && sampling.transform === "delta"
-      ? buildBoundaryCounterDeltaResponse(
-          rawResult,
-          sql,
-          range,
-          temporal,
-          sampling.metricColumn,
-          sampling.unitColumn,
-          sampling.bucketMs,
-          sampling.counterResetPolicy ?? DEFAULT_COUNTER_RESET_POLICY,
-          requestedMetricColumn,
-        )
-      : rawResult;
+    const result =
+      sampling.mode === "bucketed" && sampling.transform === "delta"
+        ? buildBoundaryCounterDeltaResponse(
+            rawResult,
+            sql,
+            range,
+            temporal,
+            sampling.metricColumn,
+            sampling.unitColumn,
+            sampling.bucketMs,
+            sampling.counterResetPolicy ?? DEFAULT_COUNTER_RESET_POLICY,
+            requestedMetricColumn,
+          )
+        : rawResult;
     const scanRowCount = extractScanRowCount(result.raw);
     if (scanRowCount !== null && scanRowCount > questdb.maxScanRows) {
       throw new HttpError(
@@ -926,7 +1176,8 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
       to: range.to,
       summaryOnly,
       transform,
-      counterResetPolicy: transform === "delta" ? counterResetPolicy : undefined,
+      counterResetPolicy:
+        transform === "delta" ? counterResetPolicy : undefined,
       timeFieldRequested: timeField,
       timeFieldResolved: temporal.mode,
       timeFromColumn: temporal.fromColumn,
@@ -936,9 +1187,10 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
       note: range.note,
       rowCount: result.data?.length ?? 0,
       scanRowCount,
-      sampling: sampling.mode === "bucketed"
-        ? { ...sampling, returnedPoints: result.data?.length ?? 0 }
-        : sampling,
+      sampling:
+        sampling.mode === "bucketed"
+          ? { ...sampling, returnedPoints: result.data?.length ?? 0 }
+          : sampling,
     };
 
     const payload = summaryOnly
@@ -948,7 +1200,12 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
         }
       : {
           data: result.data,
-          stats: { ...stats, raw: result.raw, truncated: sampling.mode === "raw" && (result.data?.length ?? 0) >= limit },
+          stats: {
+            ...stats,
+            raw: result.raw,
+            truncated:
+              sampling.mode === "raw" && (result.data?.length ?? 0) >= limit,
+          },
         };
     const payloadBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
     if (payloadBytes > questdb.maxResponseBytes) {
@@ -979,11 +1236,13 @@ type LastValueEntry = {
   timestamp: string;
   receivedAt: number;
   dataGroup: string | null;
-  counter?: {
-    absoluteValue: number;
-    previousValue: number | null;
-    previousTimestamp: string | null;
-  } | undefined;
+  counter?:
+    | {
+        absoluteValue: number;
+        previousValue: number | null;
+        previousTimestamp: string | null;
+      }
+    | undefined;
 };
 
 const lastValueMap = new Map<string, LastValueEntry>();
@@ -995,7 +1254,9 @@ let captureService: CaptureService | undefined;
 let captureOutputProxy: UnsMqttProxy | undefined;
 
 function sanitizeTopic(topic: string): string {
-  return typeof topic === "string" && topic.endsWith("/") ? topic.slice(0, -1) : topic;
+  return typeof topic === "string" && topic.endsWith("/")
+    ? topic.slice(0, -1)
+    : topic;
 }
 
 function timestampMs(value: unknown): number | null {
@@ -1013,20 +1274,26 @@ function buildCounterCacheState(
   if (absoluteValue === null) return undefined;
 
   const previousEntry = lastValueMap.get(topic);
-  const previousEntryValue = previousEntry ? toNumber(previousEntry.values["value"]) : null;
+  const previousEntryValue = previousEntry
+    ? toNumber(previousEntry.values["value"])
+    : null;
   const currentMs = timestampMs(timestamp);
   const previousMs = timestampMs(previousEntry?.timestamp);
-  const hasLaterTimestamp = currentMs === null || previousMs === null || currentMs > previousMs;
+  const hasLaterTimestamp =
+    currentMs === null || previousMs === null || currentMs > previousMs;
   const previousValue = hasLaterTimestamp ? previousEntryValue : null;
 
   return {
     absoluteValue,
     previousValue,
-    previousTimestamp: previousValue === null ? null : previousEntry?.timestamp ?? null,
+    previousTimestamp:
+      previousValue === null ? null : (previousEntry?.timestamp ?? null),
   };
 }
 
-function buildSeedCounterState(value: unknown): LastValueEntry["counter"] | undefined {
+function buildSeedCounterState(
+  value: unknown,
+): LastValueEntry["counter"] | undefined {
   const absoluteValue = toNumber(value);
   if (absoluteValue === null) return undefined;
   return {
@@ -1050,14 +1317,23 @@ async function fetchActiveTopicsFromController(): Promise<string[]> {
         }
       }
     `;
-    const result: any = await request(controllerGraphqlUrl, document, undefined, headers);
+    const result: any = await request(
+      controllerGraphqlUrl,
+      document,
+      undefined,
+      headers,
+    );
     const nodes: any[] = result?.GetUnsNodes ?? [];
     return nodes
-      .filter((n: any) => n.type === "Attribute" && typeof n.fullTopic === "string")
+      .filter(
+        (n: any) => n.type === "Attribute" && typeof n.fullTopic === "string",
+      )
       .map((n: any) => sanitizeTopic(n.fullTopic))
       .filter((topic: string) => isCacheAllowed(dataSources, topic));
   } catch (err) {
-    logger.warn(`[last-value-cache] Failed to fetch topics from controller: ${err instanceof Error ? err.message : err}`);
+    logger.warn(
+      `[last-value-cache] Failed to fetch topics from controller: ${err instanceof Error ? err.message : err}`,
+    );
     return lvActiveTopics; // keep previous set on failure
   }
 }
@@ -1112,9 +1388,13 @@ async function initLastValueCache(): Promise<void> {
   // Initial topic fetch
   lvActiveTopics = await fetchActiveTopicsFromController();
   if (lvActiveTopics.length === 0) {
-    logger.warn("[last-value-cache] No active topics found — will retry on next refresh.");
+    logger.warn(
+      "[last-value-cache] No active topics found — will retry on next refresh.",
+    );
   } else {
-    logger.info(`[last-value-cache] Subscribing to ${lvActiveTopics.length} data topics.`);
+    logger.info(
+      `[last-value-cache] Subscribing to ${lvActiveTopics.length} data topics.`,
+    );
   }
 
   // Create MQTT input proxy
@@ -1155,12 +1435,16 @@ async function initLastValueCache(): Promise<void> {
     if (captureService) {
       const entry = lastValueMap.get(topic);
       if (entry) {
-        void captureService.onMessage({
-          topic,
-          sourceTimestamp: entry.timestamp,
-        }).catch((err) => {
-          logger.warn(`[captures] onMessage failed: ${err instanceof Error ? err.message : err}`);
-        });
+        void captureService
+          .onMessage({
+            topic,
+            sourceTimestamp: entry.timestamp,
+          })
+          .catch((err) => {
+            logger.warn(
+              `[captures] onMessage failed: ${err instanceof Error ? err.message : err}`,
+            );
+          });
       }
     }
   });
@@ -1179,11 +1463,16 @@ async function initLastValueCache(): Promise<void> {
       if (newTopics.length > 0) lvMqttInput.subscribeAsync(newTopics);
     }
 
-    logger.info(`[last-value-cache] Topic refresh: ${oldTopics.length} → ${newTopics.length} topics.`);
+    logger.info(
+      `[last-value-cache] Topic refresh: ${oldTopics.length} → ${newTopics.length} topics.`,
+    );
   }, lastValueCacheConfig.topicRefreshIntervalMs);
 
   // Periodic stale eviction
-  const evictionInterval = Math.max(lastValueCacheConfig.staleTtlMs / 4, 60_000);
+  const evictionInterval = Math.max(
+    lastValueCacheConfig.staleTtlMs / 4,
+    60_000,
+  );
   setInterval(() => {
     const cutoff = Date.now() - lastValueCacheConfig.staleTtlMs;
     let evicted = 0;
@@ -1194,14 +1483,18 @@ async function initLastValueCache(): Promise<void> {
       }
     }
     if (evicted > 0) {
-      logger.info(`[last-value-cache] Evicted ${evicted} stale entries (${lastValueMap.size} remaining).`);
+      logger.info(
+        `[last-value-cache] Evicted ${evicted} stale entries (${lastValueMap.size} remaining).`,
+      );
     }
   }, evictionInterval);
 
   // Seed cache from QuestDB — fetch last known value for each topic so the
   // cache is warm even after a restart (before MQTT delivers new messages).
-  seedCacheFromQuestDb(lvActiveTopics).catch(err => {
-    logger.warn(`[last-value-cache] QuestDB seed failed: ${err instanceof Error ? err.message : err}`);
+  seedCacheFromQuestDb(lvActiveTopics).catch((err) => {
+    logger.warn(
+      `[last-value-cache] QuestDB seed failed: ${err instanceof Error ? err.message : err}`,
+    );
   });
 
   logger.info("[last-value-cache] Initialized.");
@@ -1219,7 +1512,9 @@ async function initLastValueCache(): Promise<void> {
 
 async function initTriggerService(): Promise<void> {
   if (!controllerRestUrl) {
-    logger.info("[triggers] No uns.rest configured — trigger service disabled.");
+    logger.info(
+      "[triggers] No uns.rest configured — trigger service disabled.",
+    );
     return;
   }
   // Dedicated proxy (handover off — passive publisher only).
@@ -1294,7 +1589,9 @@ async function initTriggerService(): Promise<void> {
 
 async function initCaptureService(): Promise<void> {
   if (!controllerRestUrl) {
-    logger.info("[captures] No uns.rest configured — capture service disabled.");
+    logger.info(
+      "[captures] No uns.rest configured — capture service disabled.",
+    );
     return;
   }
   const captureProcessName = `${config.uns.processName}-captures`;
@@ -1342,21 +1639,26 @@ async function initCaptureService(): Promise<void> {
     auditSession: async (event: CaptureSessionAuditEvent) => {
       const token = await controllerTokenProvider.getAccessToken();
       if (!token) {
-        logger.warn("[captures] no access token available; skipping session audit");
+        logger.warn(
+          "[captures] no access token available; skipping session audit",
+        );
         return;
       }
-      const response = await fetch(`${controllerRestUrl.replace(/\/+$/, "")}/captures/sessions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-          Accept: "application/json",
+      const response = await fetch(
+        `${controllerRestUrl.replace(/\/+$/, "")}/captures/sessions`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify({
+            ...event,
+            runtimeProcess: captureProcessName,
+          }),
         },
-        body: JSON.stringify({
-          ...event,
-          runtimeProcess: captureProcessName,
-        }),
-      });
+      );
       if (!response.ok) {
         logger.warn(
           `[captures] controller responded ${response.status} for POST /api/captures/sessions`,
@@ -1381,16 +1683,23 @@ async function initCaptureService(): Promise<void> {
 
 async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
   if (!topics.length) return;
-  const resolverCfg: MappingResolverConfig = { controllerGraphqlUrl, tokenProvider: controllerTokenProvider };
+  const resolverCfg: MappingResolverConfig = {
+    controllerGraphqlUrl,
+    tokenProvider: controllerTokenProvider,
+  };
 
   // Group topics by resolved table
   const topicsByTable = new Map<string, string[]>();
   for (const topic of topics) {
     const tableFromDs = resolveTablePrefix(dataSources, topic);
-    const table = tableFromDs || (await resolveTableFromController(topic, resolverCfg));
+    const table =
+      tableFromDs || (await resolveTableFromController(topic, resolverCfg));
     if (!table) continue;
     let list = topicsByTable.get(table);
-    if (!list) { list = []; topicsByTable.set(table, list); }
+    if (!list) {
+      list = [];
+      topicsByTable.set(table, list);
+    }
     list.push(topic);
   }
 
@@ -1398,22 +1707,43 @@ async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
   for (const [table, tableTopics] of topicsByTable) {
     try {
       const columns = await getTableColumns(questdb, table);
-      const selectCols = buildDataColumnList(columns).map(quoteIdentifier).join(", ");
-      const partitionCols = buildDedupePartitionColumns(columns).map(quoteIdentifier).join(", ");
+      const selectCols = buildDataColumnList(columns)
+        .map(quoteIdentifier)
+        .join(", ");
+      const partitionCols = buildDedupePartitionColumns(columns)
+        .map(quoteIdentifier)
+        .join(", ");
       const pointTimeColumn = resolvePointTimeColumn(columns);
       if (!pointTimeColumn || !partitionCols) continue;
 
       // Build WHERE clause to limit to only our topics
-      const topicParts = tableTopics.map(t => {
-        const parsed = parseUnsPath(t);
-        const conditions: string[] = [];
-        if (parsed.topic && columns.has("topic")) conditions.push(`${quoteIdentifier("topic")} = ${escapeLiteral(parsed.topic)}`);
-        if (parsed.asset && columns.has("asset")) conditions.push(`${quoteIdentifier("asset")} = ${escapeLiteral(parsed.asset)}`);
-        if (parsed.objectType && columns.has("objectType")) conditions.push(`${quoteIdentifier("objectType")} = ${escapeLiteral(parsed.objectType)}`);
-        if (parsed.objectId && columns.has("objectId")) conditions.push(`${quoteIdentifier("objectId")} = ${escapeLiteral(parsed.objectId)}`);
-        if (parsed.attribute && columns.has("attribute")) conditions.push(`${quoteIdentifier("attribute")} = ${escapeLiteral(parsed.attribute)}`);
-        return conditions.length ? `(${conditions.join(" AND ")})` : null;
-      }).filter(Boolean);
+      const topicParts = tableTopics
+        .map((t) => {
+          const parsed = parseUnsPath(t);
+          const conditions: string[] = [];
+          if (parsed.topic && columns.has("topic"))
+            conditions.push(
+              `${quoteIdentifier("topic")} = ${escapeLiteral(parsed.topic)}`,
+            );
+          if (parsed.asset && columns.has("asset"))
+            conditions.push(
+              `${quoteIdentifier("asset")} = ${escapeLiteral(parsed.asset)}`,
+            );
+          if (parsed.objectType && columns.has("objectType"))
+            conditions.push(
+              `${quoteIdentifier("objectType")} = ${escapeLiteral(parsed.objectType)}`,
+            );
+          if (parsed.objectId && columns.has("objectId"))
+            conditions.push(
+              `${quoteIdentifier("objectId")} = ${escapeLiteral(parsed.objectId)}`,
+            );
+          if (parsed.attribute && columns.has("attribute"))
+            conditions.push(
+              `${quoteIdentifier("attribute")} = ${escapeLiteral(parsed.attribute)}`,
+            );
+          return conditions.length ? `(${conditions.join(" AND ")})` : null;
+        })
+        .filter(Boolean);
 
       if (!topicParts.length) continue;
 
@@ -1427,7 +1757,9 @@ async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
       if (!result.data?.length) continue;
 
       // Parse rows back into cache entries
-      const rawCols = (result.raw as any)?.columns as Array<{ name: string; type: string }> | undefined;
+      const rawCols = (result.raw as any)?.columns as
+        | Array<{ name: string; type: string }>
+        | undefined;
       const colNames = rawCols?.map((c: any) => c.name) ?? [];
       const tsIdx = colNames.indexOf(pointTimeColumn);
       const topicIdx = colNames.indexOf("topic");
@@ -1448,25 +1780,35 @@ async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
         const objType = objTypeIdx >= 0 ? String(row[objTypeIdx] ?? "") : "";
         const objId = objIdIdx >= 0 ? String(row[objIdIdx] ?? "") : "";
         const attr = attrIdx >= 0 ? String(row[attrIdx] ?? "") : "";
-        const fullTopic = [topicBase, asset, objType, objId, attr].filter(Boolean).join("/");
+        const fullTopic = [topicBase, asset, objType, objId, attr]
+          .filter(Boolean)
+          .join("/");
         if (!fullTopic) continue;
 
         const ts = tsIdx >= 0 ? String(row[tsIdx] ?? "") : "";
         if (!ts) continue;
 
         const valueType = valueTypeIdx >= 0 ? row[valueTypeIdx] : null;
-        const numVal = numValueIdx >= 0 ? row[numValueIdx] : (valueIdx >= 0 ? row[valueIdx] : null);
+        const numVal =
+          numValueIdx >= 0
+            ? row[numValueIdx]
+            : valueIdx >= 0
+              ? row[valueIdx]
+              : null;
         const strVal = strValueIdx >= 0 ? row[strValueIdx] : null;
 
         // For seeded entries, set receivedAt to the actual data timestamp so
         // ageMs reflects real staleness, not time since restart.
         const seedReceivedAt = new Date(ts).getTime() || Date.now();
 
-        if (valueType === "number" || (typeof numVal === "number" && numVal !== null)) {
+        if (
+          valueType === "number" ||
+          (typeof numVal === "number" && numVal !== null)
+        ) {
           const seedCounter = buildSeedCounterState(numVal);
           lastValueMap.set(fullTopic, {
             values: { value: numVal },
-            uom: uomIdx >= 0 ? (row[uomIdx] as string ?? null) : null,
+            uom: uomIdx >= 0 ? ((row[uomIdx] as string) ?? null) : null,
             timestamp: ts,
             receivedAt: seedReceivedAt,
             dataGroup: null,
@@ -1485,10 +1827,23 @@ async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
         } else {
           // Table attribute fallback: collect all non-standard columns into values map
           const standardCols = new Set([
-            "topic", "attribute", "asset", "objectType", "objectId",
-            "valueType", "value", "numberValue", "stringValue", "uom",
-            "time", "timestamp", "interval", "intervalStart", "intervalEnd",
-            "lastSeen", "deleted",
+            "topic",
+            "attribute",
+            "asset",
+            "objectType",
+            "objectId",
+            "valueType",
+            "value",
+            "numberValue",
+            "stringValue",
+            "uom",
+            "time",
+            "timestamp",
+            "interval",
+            "intervalStart",
+            "intervalEnd",
+            "lastSeen",
+            "deleted",
           ]);
           const customValues: Record<string, unknown> = {};
           for (let ci = 0; ci < colNames.length; ci++) {
@@ -1510,12 +1865,16 @@ async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
         }
       }
     } catch (err) {
-      logger.warn(`[last-value-cache] QuestDB seed error for table ${table}: ${err instanceof Error ? err.message : err}`);
+      logger.warn(
+        `[last-value-cache] QuestDB seed error for table ${table}: ${err instanceof Error ? err.message : err}`,
+      );
     }
   }
 
   if (seeded > 0) {
-    logger.info(`[last-value-cache] Seeded ${seeded} entries from QuestDB (${lastValueMap.size} total in cache).`);
+    logger.info(
+      `[last-value-cache] Seeded ${seeded} entries from QuestDB (${lastValueMap.size} total in cache).`,
+    );
   }
 }
 
@@ -1529,7 +1888,8 @@ function isBatchRequest(req: any): boolean {
   // and the real HTTP method from the underlying request.
   const method = String(req?.method ?? "").toUpperCase();
   if (method !== "POST") return false;
-  const originalUrl = String(req?.originalUrl ?? req?.url ?? "").split("?")[0] ?? "";
+  const originalUrl =
+    String(req?.originalUrl ?? req?.url ?? "").split("?")[0] ?? "";
   const normalizedUrl = normalizeRequestPath(originalUrl);
   // Accept /batch, /batch/last, and /batch/range
   return (
@@ -1541,7 +1901,8 @@ function isBatchRequest(req: any): boolean {
 
 function resolveBatchMode(req: any, body: any): string {
   // URL-based mode takes priority: /batch/last → "last", /batch/range → "range"
-  const originalUrl = String(req?.originalUrl ?? req?.url ?? "").split("?")[0] ?? "";
+  const originalUrl =
+    String(req?.originalUrl ?? req?.url ?? "").split("?")[0] ?? "";
   const normalizedUrl = normalizeRequestPath(originalUrl);
   if (normalizedUrl.endsWith("/last")) return "last";
   if (normalizedUrl.endsWith("/range")) return "range";
@@ -1549,13 +1910,22 @@ function resolveBatchMode(req: any, body: any): string {
   return String(body?.mode ?? "last").toLowerCase();
 }
 
-async function handleBatchRequest(req: any, res: any, requestId: string): Promise<void> {
+async function handleBatchRequest(
+  req: any,
+  res: any,
+  requestId: string,
+): Promise<void> {
   // Parse body
   const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-  const topics: string[] = Array.isArray(body?.topics) ? body.topics.map((t: unknown) => String(t).trim()).filter(Boolean) : [];
+  const topics: string[] = Array.isArray(body?.topics)
+    ? body.topics.map((t: unknown) => String(t).trim()).filter(Boolean)
+    : [];
 
   if (topics.length === 0) {
-    throw new HttpError(400, "Request body must contain a non-empty 'topics' array.");
+    throw new HttpError(
+      400,
+      "Request body must contain a non-empty 'topics' array.",
+    );
   }
   if (topics.length > 500) {
     throw new HttpError(400, "Maximum 500 topics per batch request.");
@@ -1565,12 +1935,17 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
 
   const mode = resolveBatchMode(req, body);
   if (mode !== "last" && mode !== "range") {
-    throw new HttpError(400, `Unsupported mode: '${mode}'. Supported: 'last', 'range'.`);
+    throw new HttpError(
+      400,
+      `Unsupported mode: '${mode}'. Supported: 'last', 'range'.`,
+    );
   }
 
   if (mode === "last") {
     const transform = parseHistoryTransformMode(body?.transform);
-    const counterResetPolicy = parseCounterResetPolicy(body?.counterResetPolicy ?? body?.resetPolicy);
+    const counterResetPolicy = parseCounterResetPolicy(
+      body?.counterResetPolicy ?? body?.resetPolicy,
+    );
     await handleBatchLast(topics, res, { transform, counterResetPolicy });
   } else {
     await handleBatchRange(topics, body, res);
@@ -1631,7 +2006,10 @@ function buildBatchLastCounterResult(
   return {
     absoluteValue: computed.absoluteValue,
     previousValue: computed.previousValue,
-    previousTimestamp: computed.previousValue === null ? null : entry.counter?.previousTimestamp ?? null,
+    previousTimestamp:
+      computed.previousValue === null
+        ? null
+        : (entry.counter?.previousTimestamp ?? null),
     delta: computed.delta,
     reset: computed.reset,
     resetPolicy,
@@ -1646,7 +2024,10 @@ function buildBatchLastResult(
   now: number,
   options: BatchLastOptions,
 ): BatchLastResult {
-  const counter = buildBatchLastCounterResult(entry, options.counterResetPolicy);
+  const counter = buildBatchLastCounterResult(
+    entry,
+    options.counterResetPolicy,
+  );
   const deltaValues: Record<string, unknown> | null = counter
     ? {
         value: counter.delta,
@@ -1657,7 +2038,10 @@ function buildBatchLastResult(
     : null;
   return {
     topic,
-    value: options.transform === "delta" ? counter?.delta ?? null : entry.values["value"] ?? null,
+    value:
+      options.transform === "delta"
+        ? (counter?.delta ?? null)
+        : (entry.values["value"] ?? null),
     values: options.transform === "delta" ? deltaValues : entry.values,
     uom: entry.uom,
     timestamp: entry.timestamp,
@@ -1676,7 +2060,10 @@ async function tryQuestDbLastRowFallback(
     const tableFromDataSource = resolveTablePrefix(dataSources, topic);
     const table =
       tableFromDataSource ||
-      (await resolveTableFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider }));
+      (await resolveTableFromController(topic, {
+        controllerGraphqlUrl,
+        tokenProvider: controllerTokenProvider,
+      }));
     if (!table) return null;
 
     const parsedPath = parseUnsPath(topic);
@@ -1685,7 +2072,15 @@ async function tryQuestDbLastRowFallback(
     // A latest-value lookup is not a history query. Sparse ObjectId attributes
     // can be months old, so do not apply the raw-query lookback cap here.
     const range: TimeRange = {};
-    const sql = buildDataSql(table, parsedPath, range, 1, true, tableColumns, temporal);
+    const sql = buildDataSql(
+      table,
+      parsedPath,
+      range,
+      1,
+      true,
+      tableColumns,
+      temporal,
+    );
     const result = await queryQuestDb(questdb, sql);
     const rows = (result.data ?? []) as unknown[][];
     if (!rows.length) return null;
@@ -1697,7 +2092,9 @@ async function tryQuestDbLastRowFallback(
     // returns `dataset`, so we need the column list from the raw response.
     const rawAny = result.raw as Record<string, unknown>;
     const rawColumns = Array.isArray(rawAny?.["columns"])
-      ? (rawAny["columns"] as Array<{ name?: string }>).map(c => c?.name ?? "")
+      ? (rawAny["columns"] as Array<{ name?: string }>).map(
+          (c) => c?.name ?? "",
+        )
       : [];
     const colIdx = (name: string): number => rawColumns.indexOf(name);
 
@@ -1712,15 +2109,23 @@ async function tryQuestDbLastRowFallback(
     if (!ts) return null;
 
     const valueType = valueTypeIdx >= 0 ? row[valueTypeIdx] : null;
-    const numVal = numValueIdx >= 0 ? row[numValueIdx] : (valueIdx >= 0 ? row[valueIdx] : null);
+    const numVal =
+      numValueIdx >= 0
+        ? row[numValueIdx]
+        : valueIdx >= 0
+          ? row[valueIdx]
+          : null;
     const strVal = strValueIdx >= 0 ? row[strValueIdx] : null;
     const seedReceivedAt = new Date(ts).getTime() || Date.now();
 
-    if (valueType === "number" || (typeof numVal === "number" && numVal !== null)) {
+    if (
+      valueType === "number" ||
+      (typeof numVal === "number" && numVal !== null)
+    ) {
       return {
         entry: {
           values: { value: numVal },
-          uom: uomIdx >= 0 ? (row[uomIdx] as string ?? null) : null,
+          uom: uomIdx >= 0 ? ((row[uomIdx] as string) ?? null) : null,
           timestamp: ts,
           receivedAt: seedReceivedAt,
           dataGroup: null,
@@ -1744,10 +2149,23 @@ async function tryQuestDbLastRowFallback(
 
     // Table-attribute fallback: collect all non-standard columns into values map
     const standardCols = new Set([
-      "topic", "attribute", "asset", "objectType", "objectId",
-      "valueType", "value", "numberValue", "stringValue", "uom",
-      "time", "timestamp", "interval", "intervalStart", "intervalEnd",
-      "lastSeen", "deleted",
+      "topic",
+      "attribute",
+      "asset",
+      "objectType",
+      "objectId",
+      "valueType",
+      "value",
+      "numberValue",
+      "stringValue",
+      "uom",
+      "time",
+      "timestamp",
+      "interval",
+      "intervalStart",
+      "intervalEnd",
+      "lastSeen",
+      "deleted",
     ]);
     const customValues: Record<string, unknown> = {};
     for (let ci = 0; ci < rawColumns.length; ci++) {
@@ -1768,12 +2186,18 @@ async function tryQuestDbLastRowFallback(
       sql,
     };
   } catch (err) {
-    logger.debug(`[batch/last] QuestDB fallback failed for ${topic}: ${err instanceof Error ? err.message : err}`);
+    logger.debug(
+      `[batch/last] QuestDB fallback failed for ${topic}: ${err instanceof Error ? err.message : err}`,
+    );
     return null;
   }
 }
 
-async function handleBatchLast(topics: string[], res: any, options: BatchLastOptions): Promise<void> {
+async function handleBatchLast(
+  topics: string[],
+  res: any,
+  options: BatchLastOptions,
+): Promise<void> {
   const now = Date.now();
 
   // First pass: serve everything from the in-memory cache and collect misses.
@@ -1788,7 +2212,14 @@ async function handleBatchLast(topics: string[], res: any, options: BatchLastOpt
     const topic = topics[i]!;
     const entry = lastValueMap.get(topic);
     if (entry) {
-      results[i] = buildBatchLastResult(topic, entry, "cache", null, now, options);
+      results[i] = buildBatchLastResult(
+        topic,
+        entry,
+        "cache",
+        null,
+        now,
+        options,
+      );
       continue;
     }
     results[i] = {
@@ -1811,59 +2242,94 @@ async function handleBatchLast(topics: string[], res: any, options: BatchLastOpt
   // topics. Successful lookups are inserted into lastValueMap so the next
   // batch call hits the fast path.
   const eligible = misses
-    .filter(m => {
+    .filter((m) => {
       const lastAttempt = batchLastFallbackAttemptAt.get(m.topic);
-      return !lastAttempt || now - lastAttempt >= BATCH_LAST_FALLBACK_THROTTLE_MS;
+      return (
+        !lastAttempt || now - lastAttempt >= BATCH_LAST_FALLBACK_THROTTLE_MS
+      );
     })
     .slice(0, BATCH_LAST_FALLBACK_LIMIT);
 
   if (eligible.length > 0) {
-    await Promise.all(eligible.map(async ({ topic, idx }) => {
-      batchLastFallbackAttemptAt.set(topic, now);
-      const fallback = await tryQuestDbLastRowFallback(topic);
-      if (!fallback) return;
-      const { entry, sql } = fallback;
-      lastValueMap.set(topic, entry);
-      const hitNow = Date.now();
-      results[idx] = buildBatchLastResult(topic, entry, "questdb", sql, hitNow, options);
-    }));
+    await Promise.all(
+      eligible.map(async ({ topic, idx }) => {
+        batchLastFallbackAttemptAt.set(topic, now);
+        const fallback = await tryQuestDbLastRowFallback(topic);
+        if (!fallback) return;
+        const { entry, sql } = fallback;
+        lastValueMap.set(topic, entry);
+        const hitNow = Date.now();
+        results[idx] = buildBatchLastResult(
+          topic,
+          entry,
+          "questdb",
+          sql,
+          hitNow,
+          options,
+        );
+      }),
+    );
   }
 
   res.status(200).json({
     results,
     stats: {
       requested: topics.length,
-      hits: results.filter(r => r.source === "cache").length,
-      questdbHits: results.filter(r => r.source === "questdb").length,
-      misses: results.filter(r => r.source === "miss").length,
+      hits: results.filter((r) => r.source === "cache").length,
+      questdbHits: results.filter((r) => r.source === "questdb").length,
+      misses: results.filter((r) => r.source === "miss").length,
       cacheSize: lastValueMap.size,
       transform: options.transform,
     },
   });
 }
 
-async function handleBatchRange(topics: string[], body: any, res: any): Promise<void> {
+async function handleBatchRange(
+  topics: string[],
+  body: any,
+  res: any,
+): Promise<void> {
   const limit = clampLimit(body?.limit, questdb.defaultLimit, questdb.maxLimit);
   const summaryOnly = toBoolean(body?.summaryOnly ?? false);
   const transform = parseHistoryTransformMode(body?.transform);
-  const counterResetPolicy = parseCounterResetPolicy(body?.counterResetPolicy ?? body?.resetPolicy);
+  const counterResetPolicy = parseCounterResetPolicy(
+    body?.counterResetPolicy ?? body?.resetPolicy,
+  );
   if (summaryOnly && transform !== "raw") {
-    throw new HttpError(400, "summaryOnly cannot be combined with transform=delta.");
+    throw new HttpError(
+      400,
+      "summaryOnly cannot be combined with transform=delta.",
+    );
   }
-  const dedupeRequested = body?.dedupe === undefined ? transform !== "delta" : toBoolean(body.dedupe);
+  const dedupeRequested =
+    body?.dedupe === undefined ? transform !== "delta" : toBoolean(body.dedupe);
   const timeField = parseTimeFieldPreference(body?.timeField);
-  const requestedMaxPoints = parsePositiveIntegerParam(body?.maxPoints, "maxPoints");
-  const requestedBucketMs = parsePositiveIntegerParam(body?.bucketMs, "bucketMs");
-  const aggregate = parseAggregateMode(body?.aggregate) ?? DEFAULT_BUCKET_AGGREGATE;
-  const requestedMetricColumn = parseOptionalColumnParam(body?.column ?? body?.metricColumn, "column");
-  const sampledRequested = !summaryOnly && (requestedMaxPoints !== null || requestedBucketMs !== null);
+  const requestedMaxPoints = parsePositiveIntegerParam(
+    body?.maxPoints,
+    "maxPoints",
+  );
+  const requestedBucketMs = parsePositiveIntegerParam(
+    body?.bucketMs,
+    "bucketMs",
+  );
+  const aggregate =
+    parseAggregateMode(body?.aggregate) ?? DEFAULT_BUCKET_AGGREGATE;
+  const requestedMetricColumn = parseOptionalColumnParam(
+    body?.column ?? body?.metricColumn,
+    "column",
+  );
+  const sampledRequested =
+    !summaryOnly && (requestedMaxPoints !== null || requestedBucketMs !== null);
   if (
     sampledRequested &&
     requestedMaxPoints !== null &&
     requestedBucketMs === null &&
     (!hasQueryValue(body?.from) || !hasQueryValue(body?.to))
   ) {
-    throw new HttpError(400, "Body field maxPoints requires explicit from and to timestamps.");
+    throw new HttpError(
+      400,
+      "Body field maxPoints requires explicit from and to timestamps.",
+    );
   }
   const range = normalizeRange(
     body?.from,
@@ -1875,7 +2341,10 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
   // Check topic filtering
   for (const topic of topics) {
     if (!isHistoryAllowed(dataSources, topic)) {
-      throw new HttpError(403, `Topic '${topic}' is not configured for history queries in dataSources.`);
+      throw new HttpError(
+        403,
+        `Topic '${topic}' is not configured for history queries in dataSources.`,
+      );
     }
   }
 
@@ -1892,9 +2361,18 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
         const tableFromDataSource = resolveTablePrefix(dataSources, topic);
         const table =
           tableFromDataSource ||
-          (await resolveTableFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider }));
+          (await resolveTableFromController(topic, {
+            controllerGraphqlUrl,
+            tokenProvider: controllerTokenProvider,
+          }));
         if (!table) {
-          return { topic, error: "No QuestDB table mapping found.", data: null, sql: null, stats: null };
+          return {
+            topic,
+            error: "No QuestDB table mapping found.",
+            data: null,
+            sql: null,
+            stats: null,
+          };
         }
 
         const parsedPath = parseUnsPath(topic);
@@ -1905,12 +2383,24 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
         let sql: string;
         if (summaryOnly) {
           sampling = { mode: "summary" };
-          sql = buildSummarySql(table, parsedPath, range, temporal, tableColumns);
+          sql = buildSummarySql(
+            table,
+            parsedPath,
+            range,
+            temporal,
+            tableColumns,
+          );
         } else if (sampledRequested) {
-          const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
+          const metricColumn = resolveMetricColumn(
+            tableSchema,
+            parsedPath,
+            requestedMetricColumn,
+          );
           const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
-          const bucketMs = requestedBucketMs ?? deriveBucketMs(range, requestedMaxPoints!);
-          const bucketAggregate: AggregateMode = transform === "delta" ? "sum" : aggregate;
+          const bucketMs =
+            requestedBucketMs ?? deriveBucketMs(range, requestedMaxPoints!);
+          const bucketAggregate: AggregateMode =
+            transform === "delta" ? "sum" : aggregate;
           sampling = {
             mode: "bucketed",
             requestedMaxPoints,
@@ -1920,7 +2410,9 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
             ...(transform === "delta" ? { counterResetPolicy } : {}),
             metricColumn,
             unitColumn,
-            ...(transform === "delta" ? { boundaryMode: "interpolated" as const } : {}),
+            ...(transform === "delta"
+              ? { boundaryMode: "interpolated" as const }
+              : {}),
           };
           if (transform === "delta") {
             sql = buildSourceSql(
@@ -1942,11 +2434,23 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
               temporal,
               [metricColumn, ...(unitColumn ? [unitColumn] : [])],
             );
-            sql = buildBucketSql(sourceSql, temporal, metricColumn, unitColumn, aggregate, bucketMs, requestedMetricColumn);
+            sql = buildBucketSql(
+              sourceSql,
+              temporal,
+              metricColumn,
+              unitColumn,
+              aggregate,
+              bucketMs,
+              requestedMetricColumn,
+            );
           }
         } else {
           if (transform === "delta") {
-            const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
+            const metricColumn = resolveMetricColumn(
+              tableSchema,
+              parsedPath,
+              requestedMetricColumn,
+            );
             const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
             const sourceSql = buildSourceSql(
               table,
@@ -1965,35 +2469,51 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
               counterResetPolicy,
               requestedMetricColumn,
             );
-            sampling = { mode: "raw", transform, counterResetPolicy, metricColumn, unitColumn };
+            sampling = {
+              mode: "raw",
+              transform,
+              counterResetPolicy,
+              metricColumn,
+              unitColumn,
+            };
             sql = buildCounterDeltaRawSql(deltaSourceSql, limit);
           } else {
             sampling = { mode: "raw", transform };
-            sql = buildDataSql(table, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
+            sql = buildDataSql(
+              table,
+              parsedPath,
+              range,
+              limit,
+              dedupeRequested,
+              tableColumns,
+              temporal,
+            );
           }
         }
 
         const rawResult = await queryQuestDb(questdb, sql);
-        const result = sampling.mode === "bucketed" && sampling.transform === "delta"
-          ? buildBoundaryCounterDeltaResponse(
-              rawResult,
-              sql,
-              range,
-              temporal,
-              sampling.metricColumn,
-              sampling.unitColumn,
-              sampling.bucketMs,
-              sampling.counterResetPolicy ?? DEFAULT_COUNTER_RESET_POLICY,
-              requestedMetricColumn,
-            )
-          : rawResult;
+        const result =
+          sampling.mode === "bucketed" && sampling.transform === "delta"
+            ? buildBoundaryCounterDeltaResponse(
+                rawResult,
+                sql,
+                range,
+                temporal,
+                sampling.metricColumn,
+                sampling.unitColumn,
+                sampling.bucketMs,
+                sampling.counterResetPolicy ?? DEFAULT_COUNTER_RESET_POLICY,
+                requestedMetricColumn,
+              )
+            : rawResult;
         const scanRowCount = extractScanRowCount(result.raw);
 
         return {
           topic,
           error: null,
           data: result.data,
-          columns: sampling.mode === "raw" ? buildDataColumnList(tableColumns) : null,
+          columns:
+            sampling.mode === "raw" ? buildDataColumnList(tableColumns) : null,
           sql,
           stats: {
             table,
@@ -2002,13 +2522,16 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
             to: range.to,
             summaryOnly,
             transform,
-            counterResetPolicy: transform === "delta" ? counterResetPolicy : undefined,
+            counterResetPolicy:
+              transform === "delta" ? counterResetPolicy : undefined,
             rowCount: result.data?.length ?? 0,
             scanRowCount,
-            sampling: sampling.mode === "bucketed"
-              ? { ...sampling, returnedPoints: result.data?.length ?? 0 }
-              : sampling,
-            truncated: sampling.mode === "raw" && (result.data?.length ?? 0) >= limit,
+            sampling:
+              sampling.mode === "bucketed"
+                ? { ...sampling, returnedPoints: result.data?.length ?? 0 }
+                : sampling,
+            truncated:
+              sampling.mode === "raw" && (result.data?.length ?? 0) >= limit,
             // Keep the QuestDB column names so batch clients can map row arrays.
             raw: {
               columns: Array.isArray(result.raw["columns"])
@@ -2018,7 +2541,12 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
           },
         };
       } catch (err) {
-        const message = err instanceof HttpError ? err.message : (err instanceof Error ? err.message : String(err));
+        const message =
+          err instanceof HttpError
+            ? err.message
+            : err instanceof Error
+              ? err.message
+              : String(err);
         return { topic, error: message, data: null, sql: null, stats: null };
       }
     }),
@@ -2028,34 +2556,41 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
     results,
     stats: {
       requested: topics.length,
-      succeeded: results.filter(r => r.error === null).length,
-      failed: results.filter(r => r.error !== null).length,
+      succeeded: results.filter((r) => r.error === null).length,
+      failed: results.filter((r) => r.error !== null).length,
       from: range.from,
       to: range.to,
       transform,
-      counterResetPolicy: transform === "delta" ? counterResetPolicy : undefined,
+      counterResetPolicy:
+        transform === "delta" ? counterResetPolicy : undefined,
     },
   });
 }
 
 // Start last-value cache (non-blocking — errors logged, not thrown)
-initLastValueCache().catch(err => {
-  logger.error(`[last-value-cache] Init failed: ${err instanceof Error ? err.message : err}`);
+initLastValueCache().catch((err) => {
+  logger.error(
+    `[last-value-cache] Init failed: ${err instanceof Error ? err.message : err}`,
+  );
 });
 
 // Start trigger service (non-blocking — errors logged, not thrown).
 // Independent of the last-value cache init; safe even when cache is
 // disabled, since the input handler already sets up correctly.
-initTriggerService().catch(err => {
-  logger.error(`[triggers] Init failed: ${err instanceof Error ? err.message : err}`);
+initTriggerService().catch((err) => {
+  logger.error(
+    `[triggers] Init failed: ${err instanceof Error ? err.message : err}`,
+  );
 });
 
 // Start capture service (non-blocking — errors logged, not thrown).
 // It depends on the same last-value cache path as triggers; if the
 // cache is disabled, runtime registration still works but no MQTT
 // messages will drive sessions.
-initCaptureService().catch(err => {
-  logger.error(`[captures] Init failed: ${err instanceof Error ? err.message : err}`);
+initCaptureService().catch((err) => {
+  logger.error(
+    `[captures] Init failed: ${err instanceof Error ? err.message : err}`,
+  );
 });
 
 // ─── End Last-Value Cache ───────────────────────────────────────────────────
@@ -2082,9 +2617,15 @@ type TemporalStrategy = {
   orderBy: string;
 };
 
-const mappingCache: { entries: QuestDbMappingEntry[]; fetchedAt: number } = { entries: [], fetchedAt: 0 };
+const mappingCache: { entries: QuestDbMappingEntry[]; fetchedAt: number } = {
+  entries: [],
+  fetchedAt: 0,
+};
 const MAPPINGS_TTL_MS = 60_000;
-const jwksCache: { keys: JwkKey[]; fetchedAt: number } = { keys: [], fetchedAt: 0 };
+const jwksCache: { keys: JwkKey[]; fetchedAt: number } = {
+  keys: [],
+  fetchedAt: 0,
+};
 const JWKS_TTL_MS = 5 * 60_000;
 const tableSchemaCache = new Map<string, TableSchemaCacheEntry>();
 const TABLE_COLUMNS_TTL_MS = 60_000;
@@ -2098,7 +2639,10 @@ class HttpError extends Error {
   }
 }
 
-async function resolveTableFromController(topic: string, cfg: MappingResolverConfig): Promise<string | null> {
+async function resolveTableFromController(
+  topic: string,
+  cfg: MappingResolverConfig,
+): Promise<string | null> {
   try {
     const mappings = await getQuestDbMappings(cfg);
     if (!mappings.length) return null;
@@ -2107,7 +2651,9 @@ async function resolveTableFromController(topic: string, cfg: MappingResolverCon
 
     for (const entry of mappings) {
       const prefix = (entry.topicPrefix ?? "").replace(/^\/+|\/+$/g, "");
-      const tableCandidate = sanitizeTable((entry.tableName ?? entry.tablePrefix ?? "").trim() || "");
+      const tableCandidate = sanitizeTable(
+        (entry.tableName ?? entry.tablePrefix ?? "").trim() || "",
+      );
       if (!prefix || !tableCandidate) continue;
       if (normalizedTopic.startsWith(prefix)) {
         if (!best || prefix.length > best.prefix.length) {
@@ -2128,11 +2674,18 @@ async function resolveTableFromController(topic: string, cfg: MappingResolverCon
       const parentPrefix = segments.slice(0, -2).join("/");
       for (const entry of mappings) {
         const prefix = (entry.topicPrefix ?? "").replace(/^\/+|\/+$/g, "");
-        const tableCandidate = sanitizeTable((entry.tableName ?? entry.tablePrefix ?? "").trim() || "");
+        const tableCandidate = sanitizeTable(
+          (entry.tableName ?? entry.tablePrefix ?? "").trim() || "",
+        );
         if (!prefix || !tableCandidate) continue;
         // Check if this mapping has the same parent prefix and attribute name
-        if (prefix.startsWith(parentPrefix + "/") && prefix.endsWith("/" + attributeName)) {
-          logger.debug(`resolveTableFromController sibling fallback: ${normalizedTopic} → ${tableCandidate} (via ${prefix})`);
+        if (
+          prefix.startsWith(parentPrefix + "/") &&
+          prefix.endsWith("/" + attributeName)
+        ) {
+          logger.debug(
+            `resolveTableFromController sibling fallback: ${normalizedTopic} → ${tableCandidate} (via ${prefix})`,
+          );
           return tableCandidate;
         }
       }
@@ -2140,22 +2693,31 @@ async function resolveTableFromController(topic: string, cfg: MappingResolverCon
 
     return null;
   } catch (error) {
-    logger.warn(`resolveTableFromController failed: ${error instanceof Error ? error.message : String(error)}`);
+    logger.warn(
+      `resolveTableFromController failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
     return null;
   }
 }
 
-async function getQuestDbMappings(cfg: MappingResolverConfig): Promise<QuestDbMappingEntry[]> {
+async function getQuestDbMappings(
+  cfg: MappingResolverConfig,
+): Promise<QuestDbMappingEntry[]> {
   const now = Date.now();
-  if (mappingCache.entries.length && now - mappingCache.fetchedAt < MAPPINGS_TTL_MS) {
+  if (
+    mappingCache.entries.length &&
+    now - mappingCache.fetchedAt < MAPPINGS_TTL_MS
+  ) {
     return mappingCache.entries;
   }
   if (!cfg.controllerGraphqlUrl) return [];
   let token: string | null = null;
   try {
-    token = await cfg.tokenProvider.getAccessToken() ?? null;
+    token = (await cfg.tokenProvider.getAccessToken()) ?? null;
   } catch (error) {
-    logger.warn(`QuestDBMappings auth error: ${error instanceof Error ? error.message : String(error)}`);
+    logger.warn(
+      `QuestDBMappings auth error: ${error instanceof Error ? error.message : String(error)}`,
+    );
     return [];
   }
   if (!token) return [];
@@ -2184,7 +2746,8 @@ async function getQuestDbMappings(cfg: MappingResolverConfig): Promise<QuestDbMa
       errors?: Array<{ message?: string }>;
     };
     if (!response.ok) {
-      const message = payload?.errors?.[0]?.message ?? `status ${response.status}`;
+      const message =
+        payload?.errors?.[0]?.message ?? `status ${response.status}`;
       logger.warn(`QuestDBMappings query failed: ${message}`);
       return [];
     }
@@ -2195,28 +2758,59 @@ async function getQuestDbMappings(cfg: MappingResolverConfig): Promise<QuestDbMa
     mappingCache.fetchedAt = now;
     return entries;
   } catch (error) {
-    logger.warn(`QuestDBMappings fetch error: ${error instanceof Error ? error.message : String(error)}`);
+    logger.warn(
+      `QuestDBMappings fetch error: ${error instanceof Error ? error.message : String(error)}`,
+    );
     return [];
   }
 }
 
-function parseProjectExtras(config: { questdb?: unknown; catchAll?: unknown; lastValueCache?: unknown; dataSources?: unknown }): {
+function parseProjectExtras(config: {
+  questdb?: unknown;
+  catchAll?: unknown;
+  lastValueCache?: unknown;
+  dataSources?: unknown;
+}): {
   questdb: QuestDbConfig;
   catchAll: CatchAllConfig;
   lastValueCache: ProjectExtras["lastValueCache"];
   dataSources: DataSourceConfig[];
 } {
-  const parsed = projectExtrasSchema.safeParse({ questdb: config.questdb, catchAll: config.catchAll, lastValueCache: config.lastValueCache, dataSources: config.dataSources });
+  const parsed = projectExtrasSchema.safeParse({
+    questdb: config.questdb,
+    catchAll: config.catchAll,
+    lastValueCache: config.lastValueCache,
+    dataSources: config.dataSources,
+  });
   if (!parsed.success) {
     const details = parsed.error.issues
-      .map(issue => `${issue.path.join(".") || "config"}: ${issue.message}`)
+      .map((issue) => `${issue.path.join(".") || "config"}: ${issue.message}`)
       .join("; ");
     const message = `Invalid questdb/catchAll configuration: ${details}`;
     logger.error(message);
     throw new Error(message);
   }
 
-  return parsed.data;
+  const { questdb } = parsed.data;
+  if (
+    typeof questdb.url !== "string" ||
+    typeof questdb.username !== "string" ||
+    typeof questdb.password !== "string"
+  ) {
+    throw new Error(
+      "QuestDB configuration secret references must be resolved before the service starts.",
+    );
+  }
+
+  return {
+    ...parsed.data,
+    questdb: {
+      ...questdb,
+      url: questdb.url,
+      username: questdb.username,
+      password: questdb.password,
+    },
+  };
 }
 
 function normalizeBasePath(pathValue: string): string {
@@ -2242,7 +2836,9 @@ function normalizeTopicPath(rawPath: string, basePath: string): string {
   }
 }
 
-function extractQueryParams(req: UnsEvents["apiGetEvent"]["req"]): Record<string, unknown> {
+function extractQueryParams(
+  req: UnsEvents["apiGetEvent"]["req"],
+): Record<string, unknown> {
   const merged: Record<string, unknown> = {};
 
   const addValue = (key: string, value: unknown) => {
@@ -2255,7 +2851,9 @@ function extractQueryParams(req: UnsEvents["apiGetEvent"]["req"]): Record<string
   };
 
   if (req?.query && typeof req.query === "object") {
-    for (const [key, value] of Object.entries(req.query as Record<string, unknown>)) {
+    for (const [key, value] of Object.entries(
+      req.query as Record<string, unknown>,
+    )) {
       addValue(key, value);
     }
   }
@@ -2335,23 +2933,42 @@ function hasQueryValue(value: unknown): boolean {
   return true;
 }
 
-function parsePositiveIntegerParam(value: unknown, paramName: string): number | null {
+function parsePositiveIntegerParam(
+  value: unknown,
+  paramName: string,
+): number | null {
   if (!hasQueryValue(value)) return null;
   const numericValue = toNumber(value);
-  if (numericValue === null || !Number.isInteger(numericValue) || numericValue <= 0) {
-    throw new HttpError(400, `Invalid query param: ${paramName} (must be a positive integer)`);
+  if (
+    numericValue === null ||
+    !Number.isInteger(numericValue) ||
+    numericValue <= 0
+  ) {
+    throw new HttpError(
+      400,
+      `Invalid query param: ${paramName} (must be a positive integer)`,
+    );
   }
   return numericValue;
 }
 
-function parseOptionalColumnParam(value: unknown, paramName: string): string | null {
+function parseOptionalColumnParam(
+  value: unknown,
+  paramName: string,
+): string | null {
   if (!hasQueryValue(value)) return null;
   if (typeof value !== "string") {
-    throw new HttpError(400, `Invalid query param: ${paramName} (must be a column name)`);
+    throw new HttpError(
+      400,
+      `Invalid query param: ${paramName} (must be a column name)`,
+    );
   }
   const trimmed = value.trim();
   if (!trimmed || !/^[a-zA-Z0-9_]+$/.test(trimmed)) {
-    throw new HttpError(400, `Invalid query param: ${paramName} (must be a column name)`);
+    throw new HttpError(
+      400,
+      `Invalid query param: ${paramName} (must be a column name)`,
+    );
   }
   return trimmed;
 }
@@ -2359,19 +2976,29 @@ function parseOptionalColumnParam(value: unknown, paramName: string): string | n
 function parseTimeFieldPreference(value: unknown): TimeFieldPreference {
   if (value === undefined || value === null) return "auto";
   if (typeof value !== "string") {
-    throw new HttpError(400, "Invalid query param: timeField (allowed: auto|timestamp|interval)");
+    throw new HttpError(
+      400,
+      "Invalid query param: timeField (allowed: auto|timestamp|interval)",
+    );
   }
   const normalized = value.trim().toLowerCase();
   if (!normalized) return "auto";
   if (normalized === "auto") return "auto";
-  if (normalized === "timestamp" || normalized === "interval") return normalized;
-  throw new HttpError(400, "Invalid query param: timeField (allowed: auto|timestamp|interval)");
+  if (normalized === "timestamp" || normalized === "interval")
+    return normalized;
+  throw new HttpError(
+    400,
+    "Invalid query param: timeField (allowed: auto|timestamp|interval)",
+  );
 }
 
 function parseAggregateMode(value: unknown): AggregateMode | null {
   if (value === undefined || value === null) return null;
   if (typeof value !== "string") {
-    throw new HttpError(400, "Invalid query param: aggregate (allowed: avg|min|max|last|sum|count)");
+    throw new HttpError(
+      400,
+      "Invalid query param: aggregate (allowed: avg|min|max|last|sum|count)",
+    );
   }
   const normalized = value.trim().toLowerCase();
   if (!normalized) return null;
@@ -2385,35 +3012,58 @@ function parseAggregateMode(value: unknown): AggregateMode | null {
   ) {
     return normalized;
   }
-  throw new HttpError(400, "Invalid query param: aggregate (allowed: avg|min|max|last|sum|count)");
+  throw new HttpError(
+    400,
+    "Invalid query param: aggregate (allowed: avg|min|max|last|sum|count)",
+  );
 }
 
 function parseHistoryTransformMode(value: unknown): HistoryTransformMode {
   if (value === undefined || value === null) return DEFAULT_HISTORY_TRANSFORM;
   if (typeof value !== "string") {
-    throw new HttpError(400, "Invalid query param: transform (allowed: raw|delta)");
+    throw new HttpError(
+      400,
+      "Invalid query param: transform (allowed: raw|delta)",
+    );
   }
   const normalized = value.trim().toLowerCase();
   if (!normalized || normalized === "raw") return "raw";
   if (normalized === "delta") return "delta";
-  throw new HttpError(400, "Invalid query param: transform (allowed: raw|delta)");
+  throw new HttpError(
+    400,
+    "Invalid query param: transform (allowed: raw|delta)",
+  );
 }
 
 function parseCounterResetPolicy(value: unknown): CounterResetPolicy {
-  if (value === undefined || value === null) return DEFAULT_COUNTER_RESET_POLICY;
+  if (value === undefined || value === null)
+    return DEFAULT_COUNTER_RESET_POLICY;
   if (typeof value !== "string") {
-    throw new HttpError(400, "Invalid query param: counterResetPolicy (allowed: new-value|null)");
+    throw new HttpError(
+      400,
+      "Invalid query param: counterResetPolicy (allowed: new-value|null)",
+    );
   }
   const normalized = value.trim().toLowerCase();
   if (!normalized || normalized === "new-value") return "new-value";
   if (normalized === "null") return "null";
   if (normalized === "rollover") {
-    throw new HttpError(400, "counterResetPolicy=rollover is not supported yet; use new-value or null.");
+    throw new HttpError(
+      400,
+      "counterResetPolicy=rollover is not supported yet; use new-value or null.",
+    );
   }
-  throw new HttpError(400, "Invalid query param: counterResetPolicy (allowed: new-value|null)");
+  throw new HttpError(
+    400,
+    "Invalid query param: counterResetPolicy (allowed: new-value|null)",
+  );
 }
 
-function estimateBucketCount(fromMs: number, toMs: number, bucketMs: number): number {
+function estimateBucketCount(
+  fromMs: number,
+  toMs: number,
+  bucketMs: number,
+): number {
   return Math.floor(toMs / bucketMs) - Math.floor(fromMs / bucketMs) + 1;
 }
 
@@ -2427,15 +3077,25 @@ function deriveBucketMs(range: TimeRange, maxPoints: number): number {
   return bucketMs;
 }
 
-function resolveTemporalStrategy(columns: Set<string>, preference: TimeFieldPreference): TemporalStrategy {
+function resolveTemporalStrategy(
+  columns: Set<string>,
+  preference: TimeFieldPreference,
+): TemporalStrategy {
   const pointTimeColumn = resolvePointTimeColumn(columns);
-  const hasInterval = columns.has("intervalStart") && columns.has("intervalEnd");
+  const hasInterval =
+    columns.has("intervalStart") && columns.has("intervalEnd");
 
   if (preference === "interval" && !hasInterval) {
-    throw new HttpError(400, "Requested timeField=interval, but table does not contain intervalStart and intervalEnd columns.");
+    throw new HttpError(
+      400,
+      "Requested timeField=interval, but table does not contain intervalStart and intervalEnd columns.",
+    );
   }
   if (preference === "timestamp" && !pointTimeColumn) {
-    throw new HttpError(400, "Requested timeField=timestamp, but table does not contain a time or timestamp column.");
+    throw new HttpError(
+      400,
+      "Requested timeField=timestamp, but table does not contain a time or timestamp column.",
+    );
   }
 
   if (preference === "interval" && hasInterval) {
@@ -2456,7 +3116,10 @@ function resolveTemporalStrategy(columns: Set<string>, preference: TimeFieldPref
   }
 
   if (!pointTimeColumn) {
-    throw new HttpError(400, "Table does not contain a time or timestamp column required for time filtering.");
+    throw new HttpError(
+      400,
+      "Table does not contain a time or timestamp column required for time filtering.",
+    );
   }
   return {
     mode: "timestamp",
@@ -2466,7 +3129,9 @@ function resolveTemporalStrategy(columns: Set<string>, preference: TimeFieldPref
   };
 }
 
-function resolvePointTimeColumn(columns: Set<string>): "time" | "timestamp" | null {
+function resolvePointTimeColumn(
+  columns: Set<string>,
+): "time" | "timestamp" | null {
   return resolvePointTimeColumnFromSchema({
     columns,
     orderedColumns: [],
@@ -2474,7 +3139,12 @@ function resolvePointTimeColumn(columns: Set<string>): "time" | "timestamp" | nu
   });
 }
 
-function normalizeRange(from: unknown, to: unknown, cfg: QuestDbConfig, maxLookbackHoursOverride?: number): TimeRange {
+function normalizeRange(
+  from: unknown,
+  to: unknown,
+  cfg: QuestDbConfig,
+  maxLookbackHoursOverride?: number,
+): TimeRange {
   const maxLookbackHours = maxLookbackHoursOverride ?? cfg.maxLookbackHours;
   const maxWindowMs = maxLookbackHours * 60 * 60 * 1000;
   const defaultWindowMs = cfg.defaultLookbackHours * 60 * 60 * 1000;
@@ -2494,10 +3164,16 @@ function normalizeRange(from: unknown, to: unknown, cfg: QuestDbConfig, maxLookb
   let fromDate = parse(from);
   let toDate = parse(to);
   if (fromProvided && !fromDate) {
-    throw new HttpError(400, "Invalid query param: from (must be ISO timestamp/date)");
+    throw new HttpError(
+      400,
+      "Invalid query param: from (must be ISO timestamp/date)",
+    );
   }
   if (toProvided && !toDate) {
-    throw new HttpError(400, "Invalid query param: to (must be ISO timestamp/date)");
+    throw new HttpError(
+      400,
+      "Invalid query param: to (must be ISO timestamp/date)",
+    );
   }
 
   if (!toDate) toDate = new Date();
@@ -2508,7 +3184,10 @@ function normalizeRange(from: unknown, to: unknown, cfg: QuestDbConfig, maxLookb
   }
 
   const span = toDate.getTime() - fromDate.getTime();
-  const range: TimeRange = { from: fromDate.toISOString(), to: toDate.toISOString() };
+  const range: TimeRange = {
+    from: fromDate.toISOString(),
+    to: toDate.toISOString(),
+  };
   if (span > maxWindowMs) {
     if (fromProvided || toProvided) {
       throw new HttpError(
@@ -2556,23 +3235,38 @@ function buildDataColumnList(columns: Set<string>): string[] {
     "interval",
   ];
   const knownSet = new Set(preferredOrder);
-  const selected = preferredOrder.filter(column => columns.has(column));
+  const selected = preferredOrder.filter((column) => columns.has(column));
   // Append any custom/dynamic columns not in the known list (e.g. batchId,
   // materialId, recipeId, event, quantity — from table-type attributes).
-  const custom = Array.from(columns).filter(col => !knownSet.has(col)).sort();
+  const custom = Array.from(columns)
+    .filter((col) => !knownSet.has(col))
+    .sort();
   const result = [...selected, ...custom];
   if (result.length) return result;
   return ["timestamp"];
 }
 
 function buildDedupePartitionColumns(columns: Set<string>): string[] {
-  const preferredPartition = ["topic", "asset", "objectType", "objectId", "attribute", "intervalStart", "intervalEnd"];
-  const selected = preferredPartition.filter(column => columns.has(column));
+  const preferredPartition = [
+    "topic",
+    "asset",
+    "objectType",
+    "objectId",
+    "attribute",
+    "intervalStart",
+    "intervalEnd",
+  ];
+  const selected = preferredPartition.filter((column) => columns.has(column));
   if (selected.length) return selected;
-  return ["topic", "asset", "objectType", "objectId", "attribute"].filter(column => columns.has(column));
+  return ["topic", "asset", "objectType", "objectId", "attribute"].filter(
+    (column) => columns.has(column),
+  );
 }
 
-function canApplyDedupe(dedupeRequested: boolean, columns: Set<string>): boolean {
+function canApplyDedupe(
+  dedupeRequested: boolean,
+  columns: Set<string>,
+): boolean {
   if (!dedupeRequested) return false;
   if (!resolvePointTimeColumn(columns)) return false;
   return buildDedupePartitionColumns(columns).length > 0;
@@ -2583,13 +3277,23 @@ function isNumericQuestDbType(typeName: string | undefined): boolean {
   return NUMERIC_QUESTDB_TYPES.has(typeName.trim().toUpperCase());
 }
 
-function resolveMetricColumn(schema: TableSchema, parsed: ParsedPath, requestedColumn: string | null = null): string {
+function resolveMetricColumn(
+  schema: TableSchema,
+  parsed: ParsedPath,
+  requestedColumn: string | null = null,
+): string {
   if (requestedColumn) {
     if (!schema.columns.has(requestedColumn)) {
-      throw new HttpError(400, `Requested metric column '${requestedColumn}' does not exist in this QuestDB table.`);
+      throw new HttpError(
+        400,
+        `Requested metric column '${requestedColumn}' does not exist in this QuestDB table.`,
+      );
     }
     if (!isNumericQuestDbType(schema.columnTypes.get(requestedColumn))) {
-      throw new HttpError(400, `Requested metric column '${requestedColumn}' is not numeric.`);
+      throw new HttpError(
+        400,
+        `Requested metric column '${requestedColumn}' is not numeric.`,
+      );
     }
     return requestedColumn;
   }
@@ -2602,15 +3306,23 @@ function resolveMetricColumn(schema: TableSchema, parsed: ParsedPath, requestedC
   ) {
     return attributeCandidate;
   }
-  if (schema.columns.has("numberValue") && isNumericQuestDbType(schema.columnTypes.get("numberValue"))) {
+  if (
+    schema.columns.has("numberValue") &&
+    isNumericQuestDbType(schema.columnTypes.get("numberValue"))
+  ) {
     return "numberValue";
   }
-  if (schema.columns.has("value") && isNumericQuestDbType(schema.columnTypes.get("value"))) {
+  if (
+    schema.columns.has("value") &&
+    isNumericQuestDbType(schema.columnTypes.get("value"))
+  ) {
     return "value";
   }
 
   const numericCandidates = schema.orderedColumns.filter(
-    column => !NON_VALUE_COLUMNS.has(column) && isNumericQuestDbType(schema.columnTypes.get(column)),
+    (column) =>
+      !NON_VALUE_COLUMNS.has(column) &&
+      isNumericQuestDbType(schema.columnTypes.get(column)),
   );
   if (numericCandidates.length === 1) {
     return numericCandidates[0]!;
@@ -2627,7 +3339,10 @@ function resolveMetricColumn(schema: TableSchema, parsed: ParsedPath, requestedC
   );
 }
 
-function resolveUnitColumn(schema: TableSchema, metricColumn: string | null = null): string | null {
+function resolveUnitColumn(
+  schema: TableSchema,
+  metricColumn: string | null = null,
+): string | null {
   if (metricColumn) {
     const lowerCompanion = `${metricColumn}_uom`;
     const upperCompanion = `${metricColumn}_UOM`;
@@ -2639,7 +3354,12 @@ function resolveUnitColumn(schema: TableSchema, metricColumn: string | null = nu
   return null;
 }
 
-function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: TemporalStrategy, columns: Set<string>): string {
+function buildWhere(
+  parsed: ParsedPath,
+  range: TimeRange,
+  temporal: TemporalStrategy,
+  columns: Set<string>,
+): string {
   const parts: string[] = [];
   const addIfPresent = (column: string, value: string | undefined) => {
     if (!value || !columns.has(column)) return;
@@ -2652,7 +3372,9 @@ function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: TemporalStra
   addIfPresent("attribute", parsed.attribute);
   // Fallback if nothing else matched and table has plain topic column only
   if (!parts.length && parsed.fullPath && columns.has("topic")) {
-    parts.push(`${quoteIdentifier("topic")} = ${escapeLiteral(parsed.fullPath)}`);
+    parts.push(
+      `${quoteIdentifier("topic")} = ${escapeLiteral(parsed.fullPath)}`,
+    );
   }
   if (!parts.length && parsed.fullPath) {
     throw new HttpError(
@@ -2661,10 +3383,14 @@ function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: TemporalStra
     );
   }
   if (range.from) {
-    parts.push(`${quoteIdentifier(temporal.toColumn)} >= ${escapeLiteral(range.from)}`);
+    parts.push(
+      `${quoteIdentifier(temporal.toColumn)} >= ${escapeLiteral(range.from)}`,
+    );
   }
   if (range.to) {
-    parts.push(`${quoteIdentifier(temporal.fromColumn)} <= ${escapeLiteral(range.to)}`);
+    parts.push(
+      `${quoteIdentifier(temporal.fromColumn)} <= ${escapeLiteral(range.to)}`,
+    );
   }
   return parts.join(" AND ");
 }
@@ -2679,8 +3405,12 @@ function buildDataSql(
   temporal: TemporalStrategy,
 ): string {
   const where = buildWhere(parsed, range, temporal, columns);
-  const selectColumns = buildDataColumnList(columns).map(quoteIdentifier).join(", ");
-  const partitionColumns = buildDedupePartitionColumns(columns).map(quoteIdentifier).join(", ");
+  const selectColumns = buildDataColumnList(columns)
+    .map(quoteIdentifier)
+    .join(", ");
+  const partitionColumns = buildDedupePartitionColumns(columns)
+    .map(quoteIdentifier)
+    .join(", ");
   const tableId = quoteIdentifier(table);
   const canDedupe = canApplyDedupe(dedupe, columns);
   const pointTimeColumn = resolvePointTimeColumn(columns);
@@ -2722,13 +3452,19 @@ function buildSourceSql(
     new Set(
       requestedColumns
         .concat([temporal.fromColumn, temporal.toColumn])
-        .concat(canDedupe && pointTimeColumn ? [pointTimeColumn, ...buildDedupePartitionColumns(columns)] : [])
-        .filter(column => columns.has(column)),
+        .concat(
+          canDedupe && pointTimeColumn
+            ? [pointTimeColumn, ...buildDedupePartitionColumns(columns)]
+            : [],
+        )
+        .filter((column) => columns.has(column)),
     ),
   );
   const selectColumns = selectedColumns.map(quoteIdentifier).join(", ");
   if (canDedupe) {
-    const partitionColumns = buildDedupePartitionColumns(columns).map(quoteIdentifier).join(", ");
+    const partitionColumns = buildDedupePartitionColumns(columns)
+      .map(quoteIdentifier)
+      .join(", ");
     return `
       SELECT ${selectColumns}
       FROM ${tableId}
@@ -2753,7 +3489,9 @@ function buildSummarySql(
   const where = buildWhere(parsed, range, temporal, columns);
   const startColumn = quoteIdentifier(temporal.fromColumn);
   const endColumn = quoteIdentifier(temporal.toColumn);
-  const numberValueColumn = columns.has("numberValue") ? quoteIdentifier("numberValue") : null;
+  const numberValueColumn = columns.has("numberValue")
+    ? quoteIdentifier("numberValue")
+    : null;
   const numericAggregates = numberValueColumn
     ? `
       min(${numberValueColumn}) AS minNumber,
@@ -2778,7 +3516,10 @@ function buildSummarySql(
   `;
 }
 
-function buildAggregateExpression(metricColumn: string, aggregate: AggregateMode): string {
+function buildAggregateExpression(
+  metricColumn: string,
+  aggregate: AggregateMode,
+): string {
   const metricId = quoteIdentifier(metricColumn);
   switch (aggregate) {
     case "avg":
@@ -2812,13 +3553,17 @@ function buildBucketSql(
     `${aggregateExpression} AS value`,
   ];
   if (outputMetricColumn && outputMetricColumn !== "value") {
-    selectParts.push(`${aggregateExpression} AS ${quoteIdentifier(outputMetricColumn)}`);
+    selectParts.push(
+      `${aggregateExpression} AS ${quoteIdentifier(outputMetricColumn)}`,
+    );
   }
   if (unitColumn) {
     selectParts.push(`last(${quoteIdentifier(unitColumn)}) AS uom`);
     const unitAlias = outputMetricColumn ? `${outputMetricColumn}_uom` : null;
     if (unitAlias && unitAlias !== "uom") {
-      selectParts.push(`last(${quoteIdentifier(unitColumn)}) AS ${quoteIdentifier(unitAlias)}`);
+      selectParts.push(
+        `last(${quoteIdentifier(unitColumn)}) AS ${quoteIdentifier(unitAlias)}`,
+      );
     }
   }
   return `
@@ -2850,24 +3595,32 @@ function buildCounterDeltaSourceSql(
 
   const counterValue = quoteIdentifier("counterValue");
   const previousCounterValue = quoteIdentifier("previousCounterValue");
-  const deltaExpression = resetPolicy === "new-value"
-    ? `CASE WHEN ${counterValue} >= ${previousCounterValue} THEN ${counterValue} - ${previousCounterValue} ELSE ${counterValue} END`
-    : `CASE WHEN ${counterValue} >= ${previousCounterValue} THEN ${counterValue} - ${previousCounterValue} ELSE null END`;
+  const deltaExpression =
+    resetPolicy === "new-value"
+      ? `CASE WHEN ${counterValue} >= ${previousCounterValue} THEN ${counterValue} - ${previousCounterValue} ELSE ${counterValue} END`
+      : `CASE WHEN ${counterValue} >= ${previousCounterValue} THEN ${counterValue} - ${previousCounterValue} ELSE null END`;
   const outputParts = [
     `${quoteIdentifier("timestamp")} AS ${quoteIdentifier("timestamp")}`,
     `${deltaExpression} AS ${quoteIdentifier("value")}`,
   ];
   if (outputMetricColumn && outputMetricColumn !== "value") {
-    outputParts.push(`${deltaExpression} AS ${quoteIdentifier(outputMetricColumn)}`);
+    outputParts.push(
+      `${deltaExpression} AS ${quoteIdentifier(outputMetricColumn)}`,
+    );
   }
   if (unitColumn) {
     outputParts.push(`${quoteIdentifier("uom")} AS ${quoteIdentifier("uom")}`);
     const unitAlias = outputMetricColumn ? `${outputMetricColumn}_uom` : null;
     if (unitAlias && unitAlias !== "uom") {
-      outputParts.push(`${quoteIdentifier("uom")} AS ${quoteIdentifier(unitAlias)}`);
+      outputParts.push(
+        `${quoteIdentifier("uom")} AS ${quoteIdentifier(unitAlias)}`,
+      );
     }
   }
-  const resetFilter = resetPolicy === "null" ? `AND ${counterValue} >= ${previousCounterValue}` : "";
+  const resetFilter =
+    resetPolicy === "null"
+      ? `AND ${counterValue} >= ${previousCounterValue}`
+      : "";
 
   return `
     SELECT ${outputParts.join(", ")}
@@ -2881,7 +3634,10 @@ function buildCounterDeltaSourceSql(
   `;
 }
 
-function buildCounterDeltaRawSql(deltaSourceSql: string, limit: number): string {
+function buildCounterDeltaRawSql(
+  deltaSourceSql: string,
+  limit: number,
+): string {
   return `
     SELECT *
     FROM (${deltaSourceSql})
@@ -2903,13 +3659,17 @@ function buildCounterDeltaBucketSql(
     `${valueAggregate} AS value`,
   ];
   if (outputMetricColumn && outputMetricColumn !== "value") {
-    selectParts.push(`${valueAggregate} AS ${quoteIdentifier(outputMetricColumn)}`);
+    selectParts.push(
+      `${valueAggregate} AS ${quoteIdentifier(outputMetricColumn)}`,
+    );
   }
   if (unitColumn) {
     selectParts.push(`last(${quoteIdentifier("uom")}) AS uom`);
     const unitAlias = outputMetricColumn ? `${outputMetricColumn}_uom` : null;
     if (unitAlias && unitAlias !== "uom") {
-      selectParts.push(`last(${quoteIdentifier("uom")}) AS ${quoteIdentifier(unitAlias)}`);
+      selectParts.push(
+        `last(${quoteIdentifier("uom")}) AS ${quoteIdentifier(unitAlias)}`,
+      );
     }
   }
   return `
@@ -2926,7 +3686,10 @@ async function queryQuestDb(
 ): Promise<{ data: unknown[]; raw: Record<string, unknown> }> {
   const compactSql = sql.replace(/\s+/g, " ").trim();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error("QuestDB request timed out")), cfg.statementTimeoutMs);
+  const timer = setTimeout(
+    () => controller.abort(new Error("QuestDB request timed out")),
+    cfg.statementTimeoutMs,
+  );
 
   try {
     const url = new URL("/exec", cfg.url);
@@ -2934,7 +3697,9 @@ async function queryQuestDb(
     url.searchParams.set("timings", "true");
     url.searchParams.set("count", "true");
 
-    const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString("base64");
+    const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString(
+      "base64",
+    );
     const response = await fetch(url, {
       method: "GET",
       headers: {
@@ -2953,16 +3718,25 @@ async function queryQuestDb(
     }
 
     if (!response.ok) {
-      const parsedObject = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+      const parsedObject =
+        parsed && typeof parsed === "object"
+          ? (parsed as Record<string, unknown>)
+          : null;
       const detailedError =
         (parsedObject?.["error"] as string | undefined) ??
         (parsedObject?.["message"] as string | undefined) ??
         (typeof parsed === "string" ? parsed : undefined);
-      throw new Error(detailedError ? `QuestDB error ${response.status}: ${detailedError}` : `QuestDB error ${response.status}`);
+      throw new Error(
+        detailedError
+          ? `QuestDB error ${response.status}: ${detailedError}`
+          : `QuestDB error ${response.status}`,
+      );
     }
 
     const dataset =
-      typeof parsed === "object" && parsed !== null && "dataset" in (parsed as Record<string, unknown>)
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "dataset" in (parsed as Record<string, unknown>)
         ? ((parsed as { dataset?: unknown[] }).dataset ?? [])
         : Array.isArray(parsed)
           ? parsed
@@ -2976,14 +3750,20 @@ async function queryQuestDb(
   }
 }
 
-async function getTableSchema(cfg: QuestDbConfig, table: string): Promise<TableSchema> {
+async function getTableSchema(
+  cfg: QuestDbConfig,
+  table: string,
+): Promise<TableSchema> {
   const now = Date.now();
   const cached = tableSchemaCache.get(table);
   if (cached && now - cached.fetchedAt < TABLE_COLUMNS_TTL_MS) {
     return cached.schema;
   }
 
-  const result = await queryQuestDb(cfg, `SHOW COLUMNS FROM ${quoteIdentifier(table)}`);
+  const result = await queryQuestDb(
+    cfg,
+    `SHOW COLUMNS FROM ${quoteIdentifier(table)}`,
+  );
   const columns = new Set<string>();
   const orderedColumns: string[] = [];
   const columnTypes = new Map<string, string>();
@@ -3015,14 +3795,22 @@ async function getTableSchema(cfg: QuestDbConfig, table: string): Promise<TableS
   return schema;
 }
 
-async function getTableColumns(cfg: QuestDbConfig, table: string): Promise<Set<string>> {
+async function getTableColumns(
+  cfg: QuestDbConfig,
+  table: string,
+): Promise<Set<string>> {
   const schema = await getTableSchema(cfg, table);
   return schema.columns;
 }
 
-function stripDatasetFromQuestDbResponse(parsed: unknown, query: string): Record<string, unknown> {
+function stripDatasetFromQuestDbResponse(
+  parsed: unknown,
+  query: string,
+): Record<string, unknown> {
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    const clone: Record<string, unknown> = { ...(parsed as Record<string, unknown>) };
+    const clone: Record<string, unknown> = {
+      ...(parsed as Record<string, unknown>),
+    };
     delete clone["dataset"];
     clone["query"] = query;
     return clone;
@@ -3040,8 +3828,13 @@ function stripDatasetFromQuestDbResponse(parsed: unknown, query: string): Record
 }
 
 function resolveRequestId(headerValue: unknown): string {
-  if (typeof headerValue === "string" && headerValue.trim().length > 0) return headerValue.trim();
-  if (Array.isArray(headerValue) && typeof headerValue[0] === "string" && headerValue[0].trim().length > 0) {
+  if (typeof headerValue === "string" && headerValue.trim().length > 0)
+    return headerValue.trim();
+  if (
+    Array.isArray(headerValue) &&
+    typeof headerValue[0] === "string" &&
+    headerValue[0].trim().length > 0
+  ) {
     return headerValue[0].trim();
   }
   return randomUUID();
@@ -3078,7 +3871,14 @@ async function resolveCatchAllAccessRules(
 
   const claims = await verifyTokenClaims(token, authCfg);
   const scopes = extractScopeSet(claims);
-  if (!(scopes.has("read:uns") || scopes.has("uns:read") || scopes.has("read:*") || scopes.has("*"))) {
+  if (
+    !(
+      scopes.has("read:uns") ||
+      scopes.has("uns:read") ||
+      scopes.has("read:*") ||
+      scopes.has("*")
+    )
+  ) {
     throw new HttpError(403, "Missing required token scope: read:uns");
   }
 
@@ -3090,9 +3890,15 @@ async function resolveCatchAllAccessRules(
   return accessRules;
 }
 
-function validateCatchAllTopicAccess(topic: string, accessRules: string[]): void {
+function validateCatchAllTopicAccess(
+  topic: string,
+  accessRules: string[],
+): void {
   if (!isTopicAllowedByAccessRules(topic, accessRules)) {
-    throw new HttpError(403, "Requested path is not allowed by token access rules.");
+    throw new HttpError(
+      403,
+      "Requested path is not allowed by token access rules.",
+    );
   }
 }
 
@@ -3108,11 +3914,16 @@ function extractBearerToken(headerValue: unknown): string | null {
   return null;
 }
 
-async function verifyTokenClaims(token: string, authCfg: CatchAllAuthConfig): Promise<JwtClaims> {
+async function verifyTokenClaims(
+  token: string,
+  authCfg: CatchAllAuthConfig,
+): Promise<JwtClaims> {
   try {
     const decoded =
       authCfg.jwksWellKnownUrl !== undefined
-        ? jwt.verify(token, await getPublicKeyFromJwks(token, authCfg), { algorithms: authCfg.algorithms ?? ["RS256"] })
+        ? jwt.verify(token, await getPublicKeyFromJwks(token, authCfg), {
+            algorithms: authCfg.algorithms ?? ["RS256"],
+          })
         : jwt.verify(token, authCfg.jwtSecret!);
     if (!decoded || typeof decoded !== "object") {
       throw new HttpError(401, "Invalid token");
@@ -3125,54 +3936,72 @@ async function verifyTokenClaims(token: string, authCfg: CatchAllAuthConfig): Pr
 
 function extractScopeSet(claims: JwtClaims): Set<string> {
   const scopes: string[] = [];
-  if (typeof claims.scope === "string") scopes.push(...claims.scope.split(/\s+/));
-  if (typeof claims.scopes === "string") scopes.push(...claims.scopes.split(/\s+/));
+  if (typeof claims.scope === "string")
+    scopes.push(...claims.scope.split(/\s+/));
+  if (typeof claims.scopes === "string")
+    scopes.push(...claims.scopes.split(/\s+/));
   if (Array.isArray(claims.scopes)) {
-    const scopeValues = claims.scopes.filter((value: unknown): value is string => typeof value === "string");
+    const scopeValues = claims.scopes.filter(
+      (value: unknown): value is string => typeof value === "string",
+    );
     scopes.push(...scopeValues);
   }
   if (Array.isArray(claims.permissions)) {
-    const permissionValues = claims.permissions.filter((value: unknown): value is string => typeof value === "string");
+    const permissionValues = claims.permissions.filter(
+      (value: unknown): value is string => typeof value === "string",
+    );
     scopes.push(...permissionValues);
   }
 
-  const normalized = scopes.map(scope => scope.trim().toLowerCase()).filter(Boolean);
+  const normalized = scopes
+    .map((scope) => scope.trim().toLowerCase())
+    .filter(Boolean);
   return new Set(normalized);
 }
 
 function extractAccessRules(claims: JwtClaims): string[] {
   const fromAccessRules = Array.isArray(claims.accessRules)
-    ? claims.accessRules.filter((rule: unknown): rule is string => typeof rule === "string")
+    ? claims.accessRules.filter(
+        (rule: unknown): rule is string => typeof rule === "string",
+      )
     : [];
-  const fromPathFilter = typeof claims.pathFilter === "string" ? [claims.pathFilter] : [];
+  const fromPathFilter =
+    typeof claims.pathFilter === "string" ? [claims.pathFilter] : [];
 
   return [...fromAccessRules, ...fromPathFilter]
-    .map(rule => rule.trim().replace(/^\/+|\/+$/g, ""))
+    .map((rule) => rule.trim().replace(/^\/+|\/+$/g, ""))
     .filter(Boolean);
 }
 
 function extractScanRowCount(raw: Record<string, unknown>): number | null {
-  const candidates = [raw["count"], raw["rowCount"], raw["rows"]].map(toNumber).filter((v): v is number => v !== null);
+  const candidates = [raw["count"], raw["rowCount"], raw["rows"]]
+    .map(toNumber)
+    .filter((v): v is number => v !== null);
   if (!candidates.length) return null;
   return Math.max(...candidates);
 }
 
-async function getPublicKeyFromJwks(token: string, authCfg: CatchAllAuthConfig): Promise<string> {
+async function getPublicKeyFromJwks(
+  token: string,
+  authCfg: CatchAllAuthConfig,
+): Promise<string> {
   if (!authCfg.jwksWellKnownUrl) {
     throw new Error("JWKS configuration missing");
   }
 
-  const decoded = jwt.decode(token, { complete: true }) as { header?: { kid?: string } } | null;
+  const decoded = jwt.decode(token, { complete: true }) as {
+    header?: { kid?: string };
+  } | null;
   const kid = decoded?.header?.kid;
   const keys = await fetchJwksKeys(authCfg.jwksWellKnownUrl);
-  let jwk = kid ? keys.find(key => key.kid === kid) : undefined;
+  let jwk = kid ? keys.find((key) => key.kid === kid) : undefined;
 
   if (!jwk && authCfg.activeKidUrl) {
     try {
       const response = await fetch(authCfg.activeKidUrl);
       if (response.ok) {
         const activeKid = (await response.text()).trim();
-        jwk = keys.find(key => key.kid === activeKid);
+        jwk = keys.find((key) => key.kid === activeKid);
       }
     } catch {
       // no-op
@@ -3235,8 +4064,14 @@ function normalizeRequestPath(rawPath: string): string {
   return withoutTrailing || "/";
 }
 
-function isSwaggerDefinitionRequest(requestPath: string, configuredSwaggerPath: string | undefined): boolean {
-  const normalizedConfigured = normalizeRequestPath(configuredSwaggerPath ?? "/uns-api-global/general-api/catchall-swagger.json");
+function isSwaggerDefinitionRequest(
+  requestPath: string,
+  configuredSwaggerPath: string | undefined,
+): boolean {
+  const normalizedConfigured = normalizeRequestPath(
+    configuredSwaggerPath ??
+      "/uns-api-global/general-api/catchall-swagger.json",
+  );
   const normalizedRequest = normalizeRequestPath(requestPath);
 
   const knownSwaggerPaths = new Set<string>([
