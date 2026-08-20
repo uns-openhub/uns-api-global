@@ -5,15 +5,21 @@ const dataSourceSchema = z.object({
   topic: z
     .string()
     .min(1, "dataSources[].topic is required")
-    .describe("MQTT topic filter pattern (supports # and + wildcards, e.g. 'enterprise/#')"),
+    .describe(
+      "MQTT topic filter pattern (supports # and + wildcards, e.g. 'enterprise/#')",
+    ),
   tablePrefix: z
     .string()
     .optional()
-    .describe("QuestDB table name prefix for history queries (optional — falls back to controller mapping resolution)"),
+    .describe(
+      "QuestDB table name prefix for history queries (optional — falls back to controller mapping resolution)",
+    ),
   history: z
     .boolean()
     .default(true)
-    .describe("Enable QuestDB history queries for topics matching this pattern"),
+    .describe(
+      "Enable QuestDB history queries for topics matching this pattern",
+    ),
   cache: z
     .boolean()
     .default(true)
@@ -22,17 +28,27 @@ const dataSourceSchema = z.object({
 
 export type DataSourceConfig = z.infer<typeof dataSourceSchema>;
 
+const nonEmptySecretValueSchema = secretValueSchema.refine(
+  (value) => typeof value !== "string" || value.trim().length > 0,
+  "QuestDB credential must not be empty",
+);
+
+const questDbUrlSchema = secretValueSchema.refine(
+  (value) => typeof value !== "string" || z.url().safeParse(value).success,
+  "questdb.url must be an absolute URL",
+);
+
 export const projectExtrasSchema = z.object({
   questdb: z.object({
-    url: z
-      .string()
-      .min(1, "questdb.url is required")
-      .describe("Base URL for QuestDB HTTP API (e.g. http://questdb:9000)"),
-    username: z
-      .string()
-      .min(1, "questdb.username is required")
-      .describe("QuestDB HTTP username (Basic Auth)"),
-    password: secretValueSchema.describe("QuestDB HTTP password (Basic Auth)"),
+    url: questDbUrlSchema.describe(
+      "Base URL for QuestDB HTTP API (e.g. http://questdb:9000)",
+    ),
+    username: nonEmptySecretValueSchema.describe(
+      "QuestDB HTTP username (Basic Auth)",
+    ),
+    password: nonEmptySecretValueSchema.describe(
+      "QuestDB HTTP password (Basic Auth)",
+    ),
     defaultLimit: z
       .number()
       .int()
@@ -62,7 +78,9 @@ export const projectExtrasSchema = z.object({
       .int()
       .positive()
       .default(744)
-      .describe("Maximum allowed lookback window (hours) for sampled maxPoints/bucketMs queries"),
+      .describe(
+        "Maximum allowed lookback window (hours) for sampled maxPoints/bucketMs queries",
+      ),
     statementTimeoutMs: z
       .number()
       .int()
@@ -87,15 +105,17 @@ export const projectExtrasSchema = z.object({
     .default([{ topic: "#", history: true, cache: true }])
     .describe(
       "Topic scoping for both QuestDB history queries and the MQTT last-value cache. " +
-      "Each entry defines an MQTT topic filter pattern. Topics not matching any entry are rejected. " +
-      "Similar to uns-archiver dataStorage — supports # and + wildcards.",
+        "Each entry defines an MQTT topic filter pattern. Topics not matching any entry are rejected. " +
+        "Similar to uns-archiver dataStorage — supports # and + wildcards.",
     ),
   catchAll: z
     .object({
       apiBasePath: z
         .string()
         .default("/api/catchall")
-        .describe("Path prefix exposed for the catch-all API (avoid /api to not clash with controller)."),
+        .describe(
+          "Path prefix exposed for the catch-all API (avoid /api to not clash with controller).",
+        ),
       swaggerPath: z
         .string()
         .default("/uns-api-global/general-api/catchall-swagger.json")
@@ -120,19 +140,25 @@ export const projectExtrasSchema = z.object({
       enabled: z
         .boolean()
         .default(false)
-        .describe("Enable MQTT subscription and in-memory last-value cache for batch queries"),
+        .describe(
+          "Enable MQTT subscription and in-memory last-value cache for batch queries",
+        ),
       topicRefreshIntervalMs: z
         .number()
         .int()
         .positive()
         .default(30000)
-        .describe("Interval for refreshing active topic subscriptions from controller (ms)"),
+        .describe(
+          "Interval for refreshing active topic subscriptions from controller (ms)",
+        ),
       staleTtlMs: z
         .number()
         .int()
         .positive()
         .default(86400000)
-        .describe("Evict cache entries not updated within this TTL (ms, default 24h)"),
+        .describe(
+          "Evict cache entries not updated within this TTL (ms, default 24h)",
+        ),
     })
     .default({
       enabled: false,

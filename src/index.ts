@@ -40,7 +40,11 @@ import {
 
 type TimeRange = { from?: string; to?: string; note?: string };
 type TimeFieldPreference = "auto" | "timestamp" | "interval";
-type QuestDbConfig = ProjectExtras["questdb"];
+type QuestDbConfig = Omit<ProjectExtras["questdb"], "url" | "username" | "password"> & {
+  url: string;
+  username: string;
+  password: string;
+};
 type CatchAllConfig = ProjectExtras["catchAll"];
 type AggregateMode = "avg" | "min" | "max" | "last" | "sum" | "count";
 type HistoryTransformMode = "raw" | "delta";
@@ -2216,7 +2220,20 @@ function parseProjectExtras(config: { questdb?: unknown; catchAll?: unknown; las
     throw new Error(message);
   }
 
-  return parsed.data;
+  const { questdb } = parsed.data;
+  if (typeof questdb.url !== "string" || typeof questdb.username !== "string" || typeof questdb.password !== "string") {
+    throw new Error("QuestDB configuration secret references must be resolved before the service starts.");
+  }
+
+  return {
+    ...parsed.data,
+    questdb: {
+      ...questdb,
+      url: questdb.url,
+      username: questdb.username,
+      password: questdb.password,
+    },
+  };
 }
 
 function normalizeBasePath(pathValue: string): string {
