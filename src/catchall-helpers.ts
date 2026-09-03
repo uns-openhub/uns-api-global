@@ -509,6 +509,66 @@ export function buildDataSql(
   `;
 }
 
+export function buildEntityDataSql(
+  table: string,
+  stableEntityId: string,
+  parsed: ParsedPath,
+  range: TimeRange,
+  limit: number,
+  dedupe: boolean,
+  schema: TableSchema,
+  temporal: TemporalStrategy,
+): string {
+  if (!schema.columns.has("stableEntityId") || !schema.columns.has("identityResolution")) {
+    throw new HttpError(400, "Table schema does not support stable entity queries.");
+  }
+  const relativeParts: string[] = [];
+  for (const [column, value] of [
+    ["objectType", parsed.objectType],
+    ["objectId", parsed.objectId],
+    ["attribute", parsed.attribute],
+  ] as const) {
+    if (value && schema.columns.has(column)) {
+      relativeParts.push(`${quoteIdentifier(column)} = ${escapeLiteral(value)}`);
+    }
+  }
+  if (!relativeParts.length) {
+    throw new HttpError(400, "Identity-aware table schema cannot distinguish the requested relative attribute path.");
+  }
+  const legacyPathWhere = buildWhere(parsed, {}, temporal, schema);
+  const identityWhere = [
+    `${quoteIdentifier("stableEntityId")} = ${escapeLiteral(stableEntityId)}`,
+    `${quoteIdentifier("identityResolution")} = 'resolved'`,
+    ...relativeParts,
+  ].join(" AND ");
+  const rangeParts: string[] = [];
+  if (range.from) rangeParts.push(`${quoteIdentifier(temporal.toColumn)} >= ${escapeLiteral(range.from)}`);
+  if (range.to) rangeParts.push(`${quoteIdentifier(temporal.fromColumn)} <= ${escapeLiteral(range.to)}`);
+  const where = `(((${identityWhere}) OR (${quoteIdentifier("stableEntityId")} IS NULL AND ${legacyPathWhere})))${rangeParts.length ? ` AND ${rangeParts.join(" AND ")}` : ""}`;
+  const tableId = quoteIdentifier(table);
+  const selectColumns = buildDataColumnList(schema).map(quoteIdentifier).join(", ");
+  const canDedupe = canApplyDedupe(dedupe, schema);
+  const pointTimeColumn = resolvePointTimeColumn(schema);
+  const sourceSql = canDedupe
+    ? `
+      SELECT ${selectColumns}
+      FROM ${tableId}
+      WHERE ${where}
+      LATEST ON ${quoteIdentifier(pointTimeColumn!)} PARTITION BY ${buildDedupePartitionColumns(schema).map(quoteIdentifier).join(", ")}
+    `
+    : `
+      SELECT ${selectColumns}
+      FROM ${tableId}
+      WHERE ${where}
+    `;
+  return `
+    SELECT *
+    FROM (${sourceSql})
+    ORDER BY ${temporal.orderBy}
+    LIMIT ${limit}
+  `;
+}
+
 export function buildSourceCountSql(sourceSql: string): string {
   return `
     SELECT

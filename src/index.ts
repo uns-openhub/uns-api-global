@@ -42,6 +42,7 @@ import { createPublicKey, randomUUID } from "node:crypto";
 import { request, gql } from "graphql-request";
 import {
   buildBoundaryCounterDeltaResponse,
+  buildEntityDataSql,
   computeCounterDeltaValue,
   counterBoundarySourceRange,
   isTopicAllowedByAccessRules,
@@ -2231,7 +2232,21 @@ async function handleBatchRange(
             sql = buildCounterDeltaRawSql(deltaSourceSql, limit);
           } else {
             sampling = { mode: "raw", transform };
-            sql = buildDataSql(table, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
+            const entitySelector = queryRequest.entitySelectorIndex === null
+              ? null
+              : entityPlan?.selectors[queryRequest.entitySelectorIndex] ?? null;
+            sql = entityStorage.mode === "identity-aware" && entitySelector
+              ? buildEntityDataSql(
+                  table,
+                  entitySelector.stableEntityId,
+                  parsedPath,
+                  range,
+                  limit,
+                  dedupeRequested,
+                  tableSchema,
+                  temporal,
+                )
+              : buildDataSql(table, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
           }
         }
 

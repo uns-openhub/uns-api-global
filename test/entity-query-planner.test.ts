@@ -137,6 +137,26 @@ test("fails closed when moved-path segments return incompatible columns", () => 
   ], 10), /incompatible/);
 });
 
+test("deduplicates legacy and enriched copies while preserving identity evidence", () => {
+  const columns = ["topic", "numberValue", "time", "stableEntityId", "identityResolution"];
+  const merged = mergeEntityHistoryRows([{
+    columns,
+    rows: [
+      ["site/line-a/press-14/state/main/speed", 72.4, "2026-09-01T09:59:59Z", null, null],
+      [
+        "site/line-a/press-14/state/main/speed",
+        72.4,
+        "2026-09-01T09:59:59Z",
+        stableEntityId,
+        "resolved",
+      ],
+    ],
+  }], 10);
+  assert.equal(merged.duplicatesRemoved, 1);
+  assert.equal(merged.rows[0]?.[3], stableEntityId);
+  assert.equal(merged.rows[0]?.[4], "resolved");
+});
+
 test("resolves current bindings in a narrow window around the requested instant", async () => {
   const calls: Array<{ from: string; to: string }> = [];
   const reader = {

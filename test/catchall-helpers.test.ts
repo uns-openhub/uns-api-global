@@ -13,6 +13,7 @@ import {
   buildCounterDeltaSourceSql,
   buildDataColumnList,
   buildDataSql,
+  buildEntityDataSql,
   buildDedupePartitionColumns,
   buildSourceCountSql,
   buildSourceSql,
@@ -362,6 +363,30 @@ test("raw mode SQL covers the simplest latest 3 records from/to use case", () =>
 
   const dedupedSql = buildDataSql("uns_sensor_data", parsed, range, 3, true, rawSchema, temporal).replace(/\s+/g, " ").trim();
   assert.match(dedupedSql, /LATEST ON "timestamp" PARTITION BY "topic", "asset", "objectType", "objectId", "attribute"/);
+});
+
+test("identity-aware raw SQL unions resolved identity rows with bounded legacy topic rows", () => {
+  const schema = makeSchema([
+    "topic", "asset", "objectType", "objectId", "attribute", "numberValue", "time",
+    "stableEntityId", "identityResolution", "identityTimeBasis", "identityBindingDigest",
+  ].map((column) => [column]));
+  const sql = buildEntityDataSql(
+    "uns_data",
+    "11111111-1111-4111-8111-111111111111",
+    parseUnsPath("enterprise/site/line-a/PRESS-14/equipment/main/temperature"),
+    { from: "2026-09-01T00:00:00.000Z", to: "2026-09-02T00:00:00.000Z" },
+    100,
+    false,
+    schema,
+    resolveTemporalStrategy(schema, "auto"),
+  );
+  assert.match(sql, /"stableEntityId" = '11111111-1111-4111-8111-111111111111'/);
+  assert.match(sql, /"identityResolution" = 'resolved'/);
+  assert.match(sql, /"stableEntityId" IS NULL/);
+  assert.match(sql, /"topic" = 'enterprise\/site\/line-a'/);
+  assert.match(sql, /"asset" = 'PRESS-14'/);
+  assert.match(sql, /"time" >= '2026-09-01T00:00:00.000Z'/);
+  assert.match(sql, /"time" <= '2026-09-02T00:00:00.000Z'/);
 });
 
 test("schema-aware raw helpers keep preferred columns first and apply dedupe only when possible", () => {

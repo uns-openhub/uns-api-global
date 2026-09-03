@@ -206,7 +206,21 @@ export async function planEntityCurrentBindings(
   });
 }
 
-const PATH_COLUMNS = new Set(["topic", "asset", "objectType", "objectId", "attribute"]);
+const NON_PAYLOAD_COLUMNS = new Set([
+  "topic",
+  "asset",
+  "objectType",
+  "objectId",
+  "attribute",
+  "stableEntityId",
+  "entityTypeKey",
+  "attributeDefinitionKey",
+  "identityBindingId",
+  "identityBindingRevision",
+  "identityBindingDigest",
+  "identityResolution",
+  "identityTimeBasis",
+]);
 
 export function mergeEntityHistoryRows(
   segments: Array<{ columns: string[]; rows: unknown[][] }>,
@@ -222,9 +236,9 @@ export function mergeEntityHistoryRows(
   }
   const nonPathIndexes = columns
     .map((column, index) => ({ column, index }))
-    .filter(({ column }) => !PATH_COLUMNS.has(column))
+    .filter(({ column }) => !NON_PAYLOAD_COLUMNS.has(column))
     .map(({ index }) => index);
-  const identityIndexes = nonPathIndexes.length
+  const payloadIndexes = nonPathIndexes.length
     ? nonPathIndexes
     : columns.map((_column, index) => index);
   const timeIndex = ["time", "timestamp", "intervalStart"]
@@ -232,9 +246,23 @@ export function mergeEntityHistoryRows(
     .find((index) => index >= 0) ?? -1;
   const allRows = segments.flatMap((segment) => segment.rows);
   const unique = new Map<string, unknown[]>();
+  const identityMetadataIndexes = columns
+    .map((column, index) => ({ column, index }))
+    .filter(({ column }) =>
+      (NON_PAYLOAD_COLUMNS.has(column) && column.startsWith("identity")) || column === "stableEntityId")
+    .map(({ index }) => index);
   for (const row of allRows) {
-    const key = JSON.stringify(identityIndexes.map((index) => row[index]));
-    if (!unique.has(key)) unique.set(key, row);
+    const key = JSON.stringify(payloadIndexes.map((index) => row[index]));
+    const current = unique.get(key);
+    if (!current) {
+      unique.set(key, row);
+      continue;
+    }
+    const score = (candidate: unknown[]) => identityMetadataIndexes.reduce(
+      (total, index) => total + (candidate[index] === null || candidate[index] === undefined || candidate[index] === "" ? 0 : 1),
+      0,
+    );
+    if (score(row) > score(current)) unique.set(key, row);
   }
   const rows = Array.from(unique.values()).sort((left, right) => {
     if (timeIndex < 0) return 0;
