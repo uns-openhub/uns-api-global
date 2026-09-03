@@ -26,6 +26,13 @@ import { TriggerService } from "./triggers/service.js";
 import { CaptureRegistry } from "./captures/registry.js";
 import { CapturePublisher } from "./captures/publisher.js";
 import { CaptureService, type CaptureSessionAuditEvent } from "./captures/service.js";
+import { ControllerEntityBindingClient } from "./entity-binding-client.js";
+import {
+  mergeEntityHistoryRows,
+  parseEntityHistorySelectors,
+  planEntityHistoryBindings,
+  type EntityHistorySelector,
+} from "./entity-query-planner.js";
 import jwt from "jsonwebtoken";
 import type { Algorithm } from "jsonwebtoken";
 import { createPublicKey, randomUUID } from "node:crypto";
@@ -138,6 +145,12 @@ const controllerTokenProvider = new ServiceTokenProvider({
 });
 const controllerClient = controllerRestUrl
   ? new UnsClient(controllerRestUrl, { tokenProvider: controllerTokenProvider })
+  : null;
+const entityBindingClient = controllerGraphqlUrl
+  ? new ControllerEntityBindingClient({
+      graphqlUrl: controllerGraphqlUrl,
+      tokenProvider: controllerTokenProvider,
+    })
   : null;
 const infraChannel = resolveMqttChannel(config.infra as MqttChannelConfig);
 const inputChannel = resolveMqttChannel(config.infra as MqttChannelConfig, config.input as MqttChannelConfig | undefined);
@@ -512,12 +525,33 @@ const swaggerDoc = {
             "application/json": {
               schema: {
                 type: "object",
-                required: ["topics"],
+                anyOf: [
+                  { required: ["topics"] },
+                  { required: ["entitySelectors"] },
+                ],
                 properties: {
                   topics: {
                     type: "array",
                     items: { type: "string" },
                     description: "Full attribute topic paths (max 500)",
+                  },
+                  entitySelectors: {
+                    type: "array",
+                    maxItems: 50,
+                    description:
+                      "Stable Asset identity plus a concrete attribute path relative to that Asset. " +
+                      "Raw history is resolved over every authorized historical topic interval.",
+                    items: {
+                      type: "object",
+                      required: ["stableEntityId", "attributePath"],
+                      properties: {
+                        stableEntityId: { type: "string", format: "uuid" },
+                        attributePath: {
+                          type: "string",
+                          example: "equipment/main/temperature",
+                        },
+                      },
+                    },
                   },
                   from: { type: "string", description: `ISO start time (default: last ${questdb.defaultLookbackHours}h)` },
                   to: { type: "string", description: "ISO end time (default: now)" },
@@ -545,9 +579,11 @@ const swaggerDoc = {
                 },
               },
               example: {
-                topics: [
-                  "enterprise/site/area/heat-treatment-line/equipment/zone-1/temperature",
-                  "enterprise/site/area/heat-treatment-line/equipment/zone-2/temperature",
+                entitySelectors: [
+                  {
+                    stableEntityId: "11111111-1111-4111-8111-111111111111",
+                    attributePath: "equipment/main/temperature",
+                  },
                 ],
                 from: "2026-04-09T06:00:00Z",
                 to: "2026-04-09T07:00:00Z",
@@ -1557,15 +1593,22 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
   // Parse body
   const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
   const topics: string[] = Array.isArray(body?.topics) ? body.topics.map((t: unknown) => String(t).trim()).filter(Boolean) : [];
+  let entitySelectors: EntityHistorySelector[];
+  try {
+    entitySelectors = parseEntityHistorySelectors(body?.entitySelectors);
+  } catch (error) {
+    throw new HttpError(400, error instanceof Error ? error.message : "Invalid entitySelectors");
+  }
 
-  if (topics.length === 0) {
-    throw new HttpError(400, "Request body must contain a non-empty 'topics' array.");
+  if (topics.length === 0 && entitySelectors.length === 0) {
+    throw new HttpError(400, "Request body must contain non-empty 'topics' or 'entitySelectors'.");
   }
   if (topics.length > 500) {
     throw new HttpError(400, "Maximum 500 topics per batch request.");
   }
 
-  await validateCatchAllAccessForTopics(req, topics, catchAllAuth);
+  const accessRules = await resolveCatchAllAccessRules(req, catchAllAuth);
+  for (const topic of topics) validateCatchAllTopicAccess(topic, accessRules);
 
   const mode = resolveBatchMode(req, body);
   if (mode !== "last" && mode !== "range") {
@@ -1573,11 +1616,14 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
   }
 
   if (mode === "last") {
+    if (entitySelectors.length) {
+      throw new HttpError(400, "entitySelectors are currently supported only for batch/range requests.");
+    }
     const transform = parseHistoryTransformMode(body?.transform);
     const counterResetPolicy = parseCounterResetPolicy(body?.counterResetPolicy ?? body?.resetPolicy);
     await handleBatchLast(topics, res, { transform, counterResetPolicy });
   } else {
-    await handleBatchRange(topics, body, res);
+    await handleBatchRange(topics, entitySelectors, body, res, accessRules);
   }
 }
 
@@ -1846,7 +1892,13 @@ async function handleBatchLast(topics: string[], res: any, options: BatchLastOpt
   });
 }
 
-async function handleBatchRange(topics: string[], body: any, res: any): Promise<void> {
+async function handleBatchRange(
+  topics: string[],
+  entitySelectors: EntityHistorySelector[],
+  body: any,
+  res: any,
+  accessRules: string[],
+): Promise<void> {
   const limit = clampLimit(body?.limit, questdb.defaultLimit, questdb.maxLimit);
   const summaryOnly = toBoolean(body?.summaryOnly ?? false);
   const transform = parseHistoryTransformMode(body?.transform);
@@ -1861,6 +1913,15 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
   const aggregate = parseAggregateMode(body?.aggregate) ?? DEFAULT_BUCKET_AGGREGATE;
   const requestedMetricColumn = parseOptionalColumnParam(body?.column ?? body?.metricColumn, "column");
   const sampledRequested = !summaryOnly && (requestedMaxPoints !== null || requestedBucketMs !== null);
+  if (entitySelectors.length && summaryOnly) {
+    throw new HttpError(400, "entitySelectors do not support summaryOnly until cross-binding aggregation is enabled.");
+  }
+  if (entitySelectors.length && transform === "delta") {
+    throw new HttpError(400, "entitySelectors do not support transform=delta until cross-binding boundary calculation is enabled.");
+  }
+  if (entitySelectors.length && sampledRequested) {
+    throw new HttpError(400, "entitySelectors do not support sampled history until cross-binding bucket aggregation is enabled.");
+  }
   if (
     sampledRequested &&
     requestedMaxPoints !== null &&
@@ -1869,7 +1930,7 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
   ) {
     throw new HttpError(400, "Body field maxPoints requires explicit from and to timestamps.");
   }
-  const range = normalizeRange(
+  const requestedRange = normalizeRange(
     body?.from,
     body?.to,
     questdb,
@@ -1883,6 +1944,47 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
     }
   }
 
+  if (entitySelectors.length && !entityBindingClient) {
+    throw new HttpError(503, "Entity history requires a configured controller GraphQL endpoint.");
+  }
+  let entityPlan: Awaited<ReturnType<typeof planEntityHistoryBindings>> | null = null;
+  if (entitySelectors.length) {
+    try {
+      entityPlan = await planEntityHistoryBindings(entityBindingClient!, entitySelectors, {
+        from: requestedRange.from!,
+        to: requestedRange.to!,
+      });
+    } catch (error) {
+      throw new HttpError(503, `Entity binding resolution failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    for (const selector of entityPlan.selectors) {
+      for (const interval of selector.intervals) {
+        validateCatchAllTopicAccess(interval.topic, accessRules);
+        if (!isHistoryAllowed(dataSources, interval.topic)) {
+          throw new HttpError(403, "An entity binding is not configured for history queries in dataSources.");
+        }
+      }
+    }
+  }
+
+  const queryRequests = [
+    ...topics.map((topic) => ({
+      topic,
+      range: requestedRange,
+      entitySelectorIndex: null as number | null,
+      bindingRevision: null as string | null,
+      bindingDigest: null as string | null,
+    })),
+    ...(entityPlan?.selectors.flatMap((selector, entitySelectorIndex) =>
+      selector.intervals.map((interval) => ({
+        topic: interval.topic,
+        range: { from: interval.from, to: interval.to },
+        entitySelectorIndex,
+        bindingRevision: interval.bindingRevision,
+        bindingDigest: interval.bindingDigest,
+      }))) ?? []),
+  ];
+
   // Resolve tables + run queries in parallel.  Each result carries the
   // full multi-line QuestDB SQL that was executed (`sql` field) so the
   // controller can surface it in the Explore dialog's "Show SQL" flow.
@@ -1891,14 +1993,23 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
   // wire — pasting into the QuestDB Web Console is the target use case,
   // and the multi-line form is drastically easier to read.
   const results = await Promise.all(
-    topics.map(async (topic) => {
+    queryRequests.map(async (queryRequest) => {
+      const { topic, range } = queryRequest;
       try {
         const tableFromDataSource = resolveTablePrefix(dataSources, topic);
         const table =
           tableFromDataSource ||
           (await resolveTableFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider }));
         if (!table) {
-          return { topic, error: "No QuestDB table mapping found.", data: null, sql: null, stats: null };
+          return {
+            ...queryRequest,
+            topic,
+            error: "No QuestDB table mapping found.",
+            data: null,
+            columns: null,
+            sql: null,
+            stats: null,
+          };
         }
 
         const parsedPath = parseUnsPath(topic);
@@ -1994,10 +2105,15 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
         const scanRowCount = extractScanRowCount(result.raw);
 
         return {
+          ...queryRequest,
           topic,
           error: null,
           data: result.data,
-          columns: sampling.mode === "raw" ? buildDataColumnList(tableColumns) : null,
+          columns: Array.isArray(result.raw["columns"])
+            ? (result.raw["columns"] as Array<{ name?: unknown }>)
+                .map((column) => typeof column?.name === "string" ? column.name : "")
+                .filter(Boolean)
+            : sampling.mode === "raw" ? buildDataColumnList(tableColumns) : [],
           sql,
           stats: {
             table,
@@ -2023,19 +2139,65 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
         };
       } catch (err) {
         const message = err instanceof HttpError ? err.message : (err instanceof Error ? err.message : String(err));
-        return { topic, error: message, data: null, sql: null, stats: null };
+        return { ...queryRequest, topic, error: message, data: null, columns: null, sql: null, stats: null };
       }
     }),
   );
 
+  const topicResults = results
+    .filter((result) => result.entitySelectorIndex === null)
+    .map(({ entitySelectorIndex: _selector, bindingRevision: _revision, bindingDigest: _digest, range: _range, ...result }) => result);
+  const entityResults = (entityPlan?.selectors ?? []).map((selector, selectorIndex) => {
+    const segments = results.filter((result) => result.entitySelectorIndex === selectorIndex);
+    const failed = segments.find((segment) => segment.error !== null);
+    const successful = segments.filter((segment) => segment.error === null && Array.isArray(segment.data));
+    let merged: ReturnType<typeof mergeEntityHistoryRows> = { columns: [], rows: [], duplicatesRemoved: 0 };
+    let mergeError: string | null = null;
+    if (!failed) {
+      try {
+        merged = mergeEntityHistoryRows(successful.map((segment) => ({
+          columns: segment.columns ?? [],
+          rows: segment.data as unknown[][],
+        })), limit);
+      } catch (error) {
+        mergeError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    return {
+      stableEntityId: selector.stableEntityId,
+      attributePath: selector.attributePath,
+      status: selector.status,
+      error: failed?.error ?? mergeError,
+      data: failed || mergeError ? null : merged.rows,
+      columns: failed || mergeError ? null : merged.columns,
+      duplicatesRemoved: merged.duplicatesRemoved,
+      segments: segments.map((segment) => ({
+        topic: segment.topic,
+        from: segment.range.from,
+        to: segment.range.to,
+        bindingRevision: segment.bindingRevision,
+        bindingDigest: segment.bindingDigest,
+        error: segment.error,
+        sql: segment.sql,
+        rowCount: Array.isArray(segment.data) ? segment.data.length : 0,
+      })),
+    };
+  });
+
   res.status(200).json({
-    results,
+    results: topicResults,
+    entityResults,
     stats: {
       requested: topics.length,
-      succeeded: results.filter(r => r.error === null).length,
-      failed: results.filter(r => r.error !== null).length,
-      from: range.from,
-      to: range.to,
+      requestedEntities: entitySelectors.length,
+      succeeded: topicResults.filter(r => r.error === null).length,
+      failed: topicResults.filter(r => r.error !== null).length,
+      succeededEntities: entityResults.filter(r => r.error === null && r.status === "resolved").length,
+      failedEntities: entityResults.filter(r => r.error !== null).length,
+      unresolvedEntities: entityResults.filter(r => r.status === "not-found").length,
+      bindingSource: entityPlan?.bindingSource ?? null,
+      from: requestedRange.from,
+      to: requestedRange.to,
       transform,
       counterResetPolicy: transform === "delta" ? counterResetPolicy : undefined,
     },

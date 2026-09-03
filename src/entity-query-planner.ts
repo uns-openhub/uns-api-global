@@ -11,6 +11,24 @@ export type EntityHistorySelector = {
   attributePath: string;
 };
 
+export function parseEntityHistorySelectors(value: unknown): EntityHistorySelector[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new TypeError("entitySelectors must be an array");
+  return value.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new TypeError(`entitySelectors[${index}] must be an object`);
+    }
+    const record = entry as Record<string, unknown>;
+    if (typeof record["stableEntityId"] !== "string" || typeof record["attributePath"] !== "string") {
+      throw new TypeError(`entitySelectors[${index}] requires stableEntityId and attributePath`);
+    }
+    return normalizeSelector({
+      stableEntityId: record["stableEntityId"],
+      attributePath: record["attributePath"],
+    });
+  });
+}
+
 export type EntityHistoryPathInterval = {
   topic: string;
   from: string;
@@ -30,6 +48,12 @@ export type EntityHistoryPlan = {
   to: string;
   selectors: EntityHistorySelectorPlan[];
   bindingSource: "cache" | "controller" | "stale-cache" | "mixed";
+};
+
+export type EntityHistoryRowsMerge = {
+  columns: string[];
+  rows: unknown[][];
+  duplicatesRemoved: number;
 };
 
 type EntityIntervalReader = Pick<ControllerEntityBindingClient, "listIntervals">;
@@ -134,4 +158,44 @@ export async function planEntityHistoryBindings(
     }),
     bindingSource: sources.size === 1 ? responses[0]!.result.source : "mixed",
   };
+}
+
+const PATH_COLUMNS = new Set(["topic", "asset", "objectType", "objectId", "attribute"]);
+
+export function mergeEntityHistoryRows(
+  segments: Array<{ columns: string[]; rows: unknown[][] }>,
+  limit: number,
+): EntityHistoryRowsMerge {
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError("limit must be a positive integer");
+  if (!segments.length) return { columns: [], rows: [], duplicatesRemoved: 0 };
+  const columns = segments[0]!.columns;
+  if (segments.some((segment) =>
+    segment.columns.length !== columns.length
+    || segment.columns.some((column, index) => column !== columns[index]))) {
+    throw new Error("Entity history segments returned incompatible QuestDB columns");
+  }
+  const nonPathIndexes = columns
+    .map((column, index) => ({ column, index }))
+    .filter(({ column }) => !PATH_COLUMNS.has(column))
+    .map(({ index }) => index);
+  const identityIndexes = nonPathIndexes.length
+    ? nonPathIndexes
+    : columns.map((_column, index) => index);
+  const timeIndex = ["time", "timestamp", "intervalStart"]
+    .map((column) => columns.indexOf(column))
+    .find((index) => index >= 0) ?? -1;
+  const allRows = segments.flatMap((segment) => segment.rows);
+  const unique = new Map<string, unknown[]>();
+  for (const row of allRows) {
+    const key = JSON.stringify(identityIndexes.map((index) => row[index]));
+    if (!unique.has(key)) unique.set(key, row);
+  }
+  const rows = Array.from(unique.values()).sort((left, right) => {
+    if (timeIndex < 0) return 0;
+    const leftTime = new Date(String(left[timeIndex] ?? "")).getTime();
+    const rightTime = new Date(String(right[timeIndex] ?? "")).getTime();
+    if (!Number.isFinite(leftTime) || !Number.isFinite(rightTime)) return 0;
+    return rightTime - leftTime;
+  }).slice(0, limit);
+  return { columns: [...columns], rows, duplicatesRemoved: allRows.length - unique.size };
 }

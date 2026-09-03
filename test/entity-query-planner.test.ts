@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { planEntityHistoryBindings } from "../src/entity-query-planner.js";
+import { mergeEntityHistoryRows, planEntityHistoryBindings } from "../src/entity-query-planner.js";
 
 const stableEntityId = "11111111-1111-4111-8111-111111111111";
 
@@ -101,4 +101,33 @@ test("rejects wildcard attribute paths and excessive unique entities", async () 
     ),
     /At most 20/,
   );
+});
+
+test("merges moved-path rows deterministically and removes boundary duplicates", () => {
+  const columns = ["topic", "asset", "numberValue", "time"];
+  const merged = mergeEntityHistoryRows([
+    {
+      columns,
+      rows: [
+        ["site/line-a", "press-14", 10, "2026-09-01T10:00:00Z"],
+        ["site/line-a", "press-14", 9, "2026-09-01T09:59:00Z"],
+      ],
+    },
+    {
+      columns,
+      rows: [
+        ["site/line-b", "press-14", 10, "2026-09-01T10:00:00Z"],
+        ["site/line-b", "press-14", 11, "2026-09-01T10:01:00Z"],
+      ],
+    },
+  ], 10);
+  assert.equal(merged.duplicatesRemoved, 1);
+  assert.deepEqual(merged.rows.map((row) => row[2]), [11, 10, 9]);
+});
+
+test("fails closed when moved-path segments return incompatible columns", () => {
+  assert.throws(() => mergeEntityHistoryRows([
+    { columns: ["numberValue", "time"], rows: [[1, "2026-09-01T10:00:00Z"]] },
+    { columns: ["value", "timestamp"], rows: [[1, "2026-09-01T10:00:00Z"]] },
+  ], 10), /incompatible/);
 });
