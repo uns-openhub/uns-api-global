@@ -1,0 +1,123 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { ControllerEntityBindingClient } from "../src/entity-binding-client.js";
+
+const resolved = (topic: string, revision = "7") => ({
+  topic,
+  asOf: null,
+  status: "resolved",
+  stableEntityId: "11111111-1111-4111-8111-111111111111",
+  entityTypeKey: "openhub.asset",
+  bindingKind: "attribute-topic",
+  matchedPath: topic,
+  timeBasis: "source-event-time",
+  sourceCount: 1,
+  revision,
+  digest: `sha256:${"1".repeat(64)}`,
+});
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+test("batches concrete topics, authenticates, and caches revisioned resolutions", async () => {
+  let now = 1_000;
+  const calls: Array<{ headers: HeadersInit | undefined; body: string }> = [];
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    calls.push({ headers: init?.headers, body: String(init?.body) });
+    const variables = JSON.parse(String(init?.body)).variables as { topics: string[] };
+    return jsonResponse({
+      data: { ResolveEntityObservationBindings: variables.topics.map((topic) => resolved(topic)) },
+    });
+  };
+  const client = new ControllerEntityBindingClient({
+    graphqlUrl: "http://controller/graphql",
+    tokenProvider: { getAccessToken: async () => "service-token" },
+    fetchImpl,
+    now: () => now,
+    cacheTtlMs: 1_000,
+  });
+
+  const first = await client.resolveTopics(["site/press-14/status", "/site/press-14/status/"]);
+  assert.equal(first.source, "controller");
+  assert.equal(first.resolutions.length, 1);
+  assert.equal(first.resolutions[0]?.revision, "7");
+  assert.match(JSON.stringify(calls[0]?.headers), /Bearer service-token/);
+
+  now += 500;
+  const second = await client.resolveTopics(["site/press-14/status"]);
+  assert.equal(second.source, "cache");
+  assert.equal(calls.length, 1);
+});
+
+test("uses bounded stale cache during a temporary controller failure", async () => {
+  let now = 1_000;
+  let fail = false;
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    if (fail) throw new Error("controller unavailable");
+    const variables = JSON.parse(String(init?.body)).variables as { topics: string[] };
+    return jsonResponse({ data: { ResolveEntityObservationBindings: variables.topics.map((topic) => resolved(topic)) } });
+  };
+  const client = new ControllerEntityBindingClient({
+    graphqlUrl: "http://controller/graphql",
+    tokenProvider: { getAccessToken: async () => "service-token" },
+    fetchImpl,
+    now: () => now,
+    cacheTtlMs: 100,
+    staleIfErrorMs: 1_000,
+  });
+  await client.resolveTopics(["site/press-14/status"]);
+
+  fail = true;
+  now += 200;
+  const fallback = await client.resolveTopics(["site/press-14/status"]);
+  assert.equal(fallback.source, "stale-cache");
+
+  now += 1_000;
+  await assert.rejects(() => client.resolveTopics(["site/press-14/status"]), /controller unavailable/);
+});
+
+test("omits controller-filtered paths and rejects unsafe or oversized requests", async () => {
+  const fetchImpl: typeof fetch = async () => jsonResponse({ data: { ResolveEntityObservationBindings: [] } });
+  const client = new ControllerEntityBindingClient({
+    graphqlUrl: "http://controller/graphql",
+    tokenProvider: { getAccessToken: async () => "service-token" },
+    fetchImpl,
+  });
+  const filtered = await client.resolveTopics(["restricted/site/asset/value"]);
+  assert.deepEqual(filtered.resolutions, []);
+  await assert.rejects(() => client.resolveTopics(["site/+/value"]), /concrete/);
+  await assert.rejects(
+    () => client.resolveTopics(Array.from({ length: 201 }, (_, index) => `site/asset-${index}/value`)),
+    /At most 200/,
+  );
+});
+
+test("keeps historical as-of cache entries isolated from current bindings", async () => {
+  const requestBodies: string[] = [];
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    requestBodies.push(String(init?.body));
+    const variables = JSON.parse(String(init?.body)).variables as { topics: string[]; asOf: string | null };
+    return jsonResponse({
+      data: {
+        ResolveEntityObservationBindings: variables.topics.map((topic) => ({
+          ...resolved(topic, variables.asOf ? "3" : "9"),
+          asOf: variables.asOf,
+        })),
+      },
+    });
+  };
+  const client = new ControllerEntityBindingClient({
+    graphqlUrl: "http://controller/graphql",
+    tokenProvider: { getAccessToken: async () => "service-token" },
+    fetchImpl,
+  });
+  const historical = await client.resolveTopics(["site/press-14/status"], "2026-09-01T10:00:00Z");
+  const current = await client.resolveTopics(["site/press-14/status"]);
+  assert.equal(historical.resolutions[0]?.revision, "3");
+  assert.equal(current.resolutions[0]?.revision, "9");
+  assert.equal(requestBodies.length, 2);
+});
