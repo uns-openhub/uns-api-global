@@ -254,3 +254,80 @@ test("assesses every expanded binding without returning a hidden topic", async (
   assert.equal(assessEntityPlanAccess(plan, () => true, () => false), "data-source-disabled");
   assert.equal(assessEntityPlanAccess(plan, () => true, () => true), null);
 });
+
+test("keeps topic reuse separated by entity and half-open time boundary", async () => {
+  const replacementEntityId = "22222222-2222-4222-8222-222222222222";
+  const reusedTopic = "site/line-a/press-14/equipment/main/temperature";
+  const reader = {
+    async listIntervals(entityId: string) {
+      const oldOccupant = entityId === stableEntityId;
+      return {
+        source: "controller" as const,
+        intervals: [{
+          topic: reusedTopic,
+          stableEntityId: entityId,
+          entityTypeKey: "openhub.asset",
+          bindingKind: "attribute-topic" as const,
+          validFrom: oldOccupant ? "2026-09-01T09:00:00.000Z" : "2026-09-01T10:00:00.000Z",
+          validTo: oldOccupant ? "2026-09-01T10:00:00.000Z" : null,
+          timeBasis: "source-event-time",
+          sourceCount: 1,
+          revision: oldOccupant ? "8" : "9",
+          digest: oldOccupant ? "old" : "replacement",
+        }],
+      };
+    },
+  };
+  const plan = await planEntityHistoryBindings(reader, [
+    { stableEntityId, attributePath: "equipment/main/temperature" },
+    { stableEntityId: replacementEntityId, attributePath: "equipment/main/temperature" },
+  ], { from: "2026-09-01T09:30:00Z", to: "2026-09-01T10:30:00Z" });
+  assert.deepEqual(plan.selectors.map((selector) => selector.intervals.map((interval) => [interval.from, interval.to])), [
+    [["2026-09-01T09:30:00.000Z", "2026-09-01T10:00:00.000Z"]],
+    [["2026-09-01T10:00:00.000Z", "2026-09-01T10:30:00.000Z"]],
+  ]);
+});
+
+test("preserves adjacent revisions when one source replaces another on the same topic", async () => {
+  const topic = "site/line-a/press-14/equipment/main/temperature";
+  const reader = {
+    async listIntervals() {
+      return {
+        source: "controller" as const,
+        intervals: [
+          {
+            topic,
+            stableEntityId,
+            entityTypeKey: "openhub.asset",
+            bindingKind: "attribute-topic" as const,
+            validFrom: "2026-09-01T09:00:00.000Z",
+            validTo: "2026-09-01T10:00:00.000Z",
+            timeBasis: "source-event-time",
+            sourceCount: 1,
+            revision: "8",
+            digest: "source-a",
+          },
+          {
+            topic,
+            stableEntityId,
+            entityTypeKey: "openhub.asset",
+            bindingKind: "attribute-topic" as const,
+            validFrom: "2026-09-01T10:00:00.000Z",
+            validTo: null,
+            timeBasis: "source-event-time",
+            sourceCount: 1,
+            revision: "9",
+            digest: "source-b",
+          },
+        ],
+      };
+    },
+  };
+  const plan = await planEntityHistoryBindings(
+    reader,
+    [{ stableEntityId, attributePath: "equipment/main/temperature" }],
+    { from: "2026-09-01T09:30:00Z", to: "2026-09-01T10:30:00Z" },
+  );
+  assert.deepEqual(plan.selectors[0]?.intervals.map((interval) => interval.bindingRevision), ["8", "9"]);
+  assert.deepEqual(plan.selectors[0]?.intervals.map((interval) => interval.bindingDigest), ["source-a", "source-b"]);
+});

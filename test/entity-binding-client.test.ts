@@ -194,3 +194,46 @@ test("validates entity interval selectors before calling the controller", async 
     /earlier/,
   );
 });
+
+test("uses only bounded stale interval evidence while the controller is unavailable", async () => {
+  let now = 1_000;
+  let fail = false;
+  const fetchImpl: typeof fetch = async () => {
+    if (fail) throw new Error("controller unavailable");
+    return jsonResponse({
+      data: {
+        ListEntityObservationBindingIntervals: [{
+          topic: "site/line-a/press-14/equipment/main/temperature",
+          stableEntityId: "11111111-1111-4111-8111-111111111111",
+          entityTypeKey: "openhub.asset",
+          bindingKind: "attribute-topic",
+          validFrom: "2026-09-01T09:00:00Z",
+          validTo: null,
+          timeBasis: "source-event-time",
+          sourceCount: 1,
+          revision: "8",
+          digest: `sha256:${"2".repeat(64)}`,
+        }],
+      },
+    });
+  };
+  const client = new ControllerEntityBindingClient({
+    graphqlUrl: "http://controller/graphql",
+    tokenProvider: { getAccessToken: async () => "service-token" },
+    fetchImpl,
+    now: () => now,
+    cacheTtlMs: 100,
+    staleIfErrorMs: 1_000,
+  });
+  const args = [
+    "11111111-1111-4111-8111-111111111111",
+    "2026-09-01T09:00:00Z",
+    "2026-09-01T11:00:00Z",
+  ] as const;
+  await client.listIntervals(...args);
+  fail = true;
+  now += 200;
+  assert.equal((await client.listIntervals(...args)).source, "stale-cache");
+  now += 1_000;
+  await assert.rejects(() => client.listIntervals(...args), /controller unavailable/);
+});
