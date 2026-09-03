@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mergeEntityHistoryRows, planEntityHistoryBindings } from "../src/entity-query-planner.js";
+import {
+  mergeEntityHistoryRows,
+  planEntityCurrentBindings,
+  planEntityHistoryBindings,
+} from "../src/entity-query-planner.js";
 
 const stableEntityId = "11111111-1111-4111-8111-111111111111";
 
@@ -130,4 +134,39 @@ test("fails closed when moved-path segments return incompatible columns", () => 
     { columns: ["numberValue", "time"], rows: [[1, "2026-09-01T10:00:00Z"]] },
     { columns: ["value", "timestamp"], rows: [[1, "2026-09-01T10:00:00Z"]] },
   ], 10), /incompatible/);
+});
+
+test("resolves current bindings in a narrow window around the requested instant", async () => {
+  const calls: Array<{ from: string; to: string }> = [];
+  const reader = {
+    async listIntervals(_entityId: string, from: string | Date, to: string | Date) {
+      calls.push({ from: String(from), to: String(to) });
+      return {
+        source: "controller" as const,
+        intervals: [{
+          topic: "site/line-b/press-14/equipment/main/temperature",
+          stableEntityId,
+          entityTypeKey: "asset",
+          bindingKind: "attribute-topic" as const,
+          validFrom: "2026-09-01T10:00:00.000Z",
+          validTo: null,
+          timeBasis: "observed-at",
+          sourceCount: 1,
+          revision: "rev-2",
+          digest: "digest-2",
+        }],
+      };
+    },
+  };
+  const plan = await planEntityCurrentBindings(
+    reader,
+    [{ stableEntityId, attributePath: "equipment/main/temperature" }],
+    "2026-09-03T12:00:00.000Z",
+  );
+  assert.deepEqual(calls, [{
+    from: "2026-09-03T11:59:59.999Z",
+    to: "2026-09-03T12:00:00.001Z",
+  }]);
+  assert.equal(plan.selectors[0]?.status, "resolved");
+  assert.equal(plan.selectors[0]?.intervals[0]?.topic, "site/line-b/press-14/equipment/main/temperature");
 });

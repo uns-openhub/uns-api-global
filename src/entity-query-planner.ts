@@ -160,6 +160,19 @@ export async function planEntityHistoryBindings(
   };
 }
 
+export async function planEntityCurrentBindings(
+  reader: EntityIntervalReader,
+  selectors: EntityHistorySelector[],
+  asOf: string | Date = new Date(),
+): Promise<EntityHistoryPlan> {
+  const instant = asOf instanceof Date ? asOf : new Date(asOf);
+  if (Number.isNaN(instant.getTime())) throw new TypeError("asOf must be a valid timestamp");
+  return planEntityHistoryBindings(reader, selectors, {
+    from: new Date(instant.getTime() - 1),
+    to: new Date(instant.getTime() + 1),
+  });
+}
+
 const PATH_COLUMNS = new Set(["topic", "asset", "objectType", "objectId", "attribute"]);
 
 export function mergeEntityHistoryRows(

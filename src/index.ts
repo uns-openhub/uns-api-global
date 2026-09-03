@@ -30,6 +30,7 @@ import { ControllerEntityBindingClient } from "./entity-binding-client.js";
 import {
   mergeEntityHistoryRows,
   parseEntityHistorySelectors,
+  planEntityCurrentBindings,
   planEntityHistoryBindings,
   type EntityHistorySelector,
 } from "./entity-query-planner.js";
@@ -409,10 +410,11 @@ const swaggerDoc = {
     },
     [`${apiBasePath}/batch/last`]: {
       post: {
-        summary: "Batch last values — current/latest value for multiple topics from in-memory cache",
+        summary: "Batch last values — current/latest value for topics or stable entities",
         description:
-          "Returns the most recent known value per topic from the MQTT last-value cache " +
+          "Returns the most recent known value per topic or stable entity attribute from the MQTT last-value cache " +
           "(seeded from QuestDB on startup), with bounded QuestDB latest-row fallback on cache misses. " +
+          "Entity selectors resolve their current authorized topic binding before data access. " +
           "Ideal for dashboards, asset snapshot views, and status panels. " +
           "Internally calls POST /api/catchall/batch with mode=last.",
         tags: [catchAll.swaggerTag ?? "CatchAll"],
@@ -422,12 +424,28 @@ const swaggerDoc = {
             "application/json": {
               schema: {
                 type: "object",
-                required: ["topics"],
+                anyOf: [
+                  { required: ["topics"] },
+                  { required: ["entitySelectors"] },
+                ],
                 properties: {
                   topics: {
                     type: "array",
                     items: { type: "string" },
                     description: "Full attribute topic paths (max 500)",
+                  },
+                  entitySelectors: {
+                    type: "array",
+                    maxItems: 50,
+                    description: "Stable Asset identity plus a concrete attribute path relative to that Asset.",
+                    items: {
+                      type: "object",
+                      required: ["stableEntityId", "attributePath"],
+                      properties: {
+                        stableEntityId: { type: "string", format: "uuid" },
+                        attributePath: { type: "string", example: "equipment/main/temperature" },
+                      },
+                    },
                   },
                   transform: {
                     type: "string",
@@ -442,10 +460,10 @@ const swaggerDoc = {
                 },
               },
               example: {
-                topics: [
-                  "enterprise/site/area/heat-treatment-line/equipment/zone-1/temperature",
-                  "enterprise/site/area/heat-treatment-line/equipment/zone-1/status",
-                ],
+                entitySelectors: [{
+                  stableEntityId: "11111111-1111-4111-8111-111111111111",
+                  attributePath: "equipment/main/temperature",
+                }],
               },
             },
           },
@@ -487,6 +505,24 @@ const swaggerDoc = {
                               resetPolicy: { type: "string", enum: ["new-value", "null"] },
                             },
                           },
+                        },
+                      },
+                    },
+                    entityResults: {
+                      type: "array",
+                      description: "Identity-addressed results with the selected physical topic and binding revision.",
+                      items: {
+                        type: "object",
+                        properties: {
+                          stableEntityId: { type: "string", format: "uuid" },
+                          attributePath: { type: "string" },
+                          status: { type: "string", enum: ["resolved", "not-found"] },
+                          topic: { type: "string", nullable: true },
+                          bindingRevision: { type: "string", nullable: true },
+                          value: { nullable: true },
+                          values: { type: "object", nullable: true },
+                          timestamp: { type: "string", nullable: true },
+                          source: { type: "string", enum: ["cache", "questdb", "miss"] },
                         },
                       },
                     },
@@ -1616,12 +1652,9 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
   }
 
   if (mode === "last") {
-    if (entitySelectors.length) {
-      throw new HttpError(400, "entitySelectors are currently supported only for batch/range requests.");
-    }
     const transform = parseHistoryTransformMode(body?.transform);
     const counterResetPolicy = parseCounterResetPolicy(body?.counterResetPolicy ?? body?.resetPolicy);
-    await handleBatchLast(topics, res, { transform, counterResetPolicy });
+    await handleBatchLast(topics, entitySelectors, res, { transform, counterResetPolicy }, accessRules);
   } else {
     await handleBatchRange(topics, entitySelectors, body, res, accessRules);
   }
@@ -1823,7 +1856,7 @@ async function tryQuestDbLastRowFallback(
   }
 }
 
-async function handleBatchLast(topics: string[], res: any, options: BatchLastOptions): Promise<void> {
+async function resolveBatchLastResults(topics: string[], options: BatchLastOptions): Promise<BatchLastResult[]> {
   const now = Date.now();
 
   // First pass: serve everything from the in-memory cache and collect misses.
@@ -1879,13 +1912,96 @@ async function handleBatchLast(topics: string[], res: any, options: BatchLastOpt
     }));
   }
 
+  return results;
+}
+
+async function handleBatchLast(
+  topics: string[],
+  entitySelectors: EntityHistorySelector[],
+  res: any,
+  options: BatchLastOptions,
+  accessRules: string[],
+): Promise<void> {
+  if (entitySelectors.length && options.transform === "delta") {
+    throw new HttpError(400, "entitySelectors do not support transform=delta until cross-binding boundary calculation is enabled.");
+  }
+  if (entitySelectors.length && !entityBindingClient) {
+    throw new HttpError(503, "Entity last values require a configured controller GraphQL endpoint.");
+  }
+
+  let entityPlan: Awaited<ReturnType<typeof planEntityCurrentBindings>> | null = null;
+  if (entitySelectors.length) {
+    try {
+      entityPlan = await planEntityCurrentBindings(entityBindingClient!, entitySelectors);
+    } catch (error) {
+      throw new HttpError(503, `Entity binding resolution failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    for (const selector of entityPlan.selectors) {
+      for (const interval of selector.intervals) {
+        validateCatchAllTopicAccess(interval.topic, accessRules);
+        if (!isHistoryAllowed(dataSources, interval.topic)) {
+          throw new HttpError(403, "An entity binding is not configured for data queries in dataSources.");
+        }
+      }
+    }
+  }
+
+  const entityTopics = Array.from(new Set(
+    entityPlan?.selectors.flatMap((selector) => selector.intervals.map((interval) => interval.topic)) ?? [],
+  ));
+  const allResults = await resolveBatchLastResults([...topics, ...entityTopics], options);
+  const topicResults = allResults.slice(0, topics.length);
+  const entityTopicResults = new Map(
+    allResults.slice(topics.length).map((result) => [result.topic, result]),
+  );
+  const entityResults = (entityPlan?.selectors ?? []).map((selector) => {
+    const candidates = selector.intervals.map((interval) => ({
+      interval,
+      result: entityTopicResults.get(interval.topic),
+    }));
+    const selected = candidates
+      .filter((candidate) => candidate.result?.timestamp)
+      .sort((left, right) =>
+        new Date(right.result!.timestamp!).getTime() - new Date(left.result!.timestamp!).getTime()
+        || right.interval.from.localeCompare(left.interval.from))[0];
+    return {
+      stableEntityId: selector.stableEntityId,
+      attributePath: selector.attributePath,
+      status: selector.status,
+      error: null,
+      topic: selected?.interval.topic ?? null,
+      bindingRevision: selected?.interval.bindingRevision ?? null,
+      bindingDigest: selected?.interval.bindingDigest ?? null,
+      value: selected?.result?.value ?? null,
+      values: selected?.result?.values ?? null,
+      uom: selected?.result?.uom ?? null,
+      timestamp: selected?.result?.timestamp ?? null,
+      dataGroup: selected?.result?.dataGroup ?? null,
+      ageMs: selected?.result?.ageMs ?? null,
+      source: selected?.result?.source ?? "miss",
+      sql: selected?.result?.sql ?? null,
+      candidateTopics: candidates.map((candidate) => ({
+        topic: candidate.interval.topic,
+        bindingRevision: candidate.interval.bindingRevision,
+        bindingDigest: candidate.interval.bindingDigest,
+        source: candidate.result?.source ?? "miss",
+        timestamp: candidate.result?.timestamp ?? null,
+      })),
+    };
+  });
+
   res.status(200).json({
-    results,
+    results: topicResults,
+    entityResults,
     stats: {
       requested: topics.length,
-      hits: results.filter(r => r.source === "cache").length,
-      questdbHits: results.filter(r => r.source === "questdb").length,
-      misses: results.filter(r => r.source === "miss").length,
+      requestedEntities: entitySelectors.length,
+      hits: topicResults.filter(r => r.source === "cache").length,
+      questdbHits: topicResults.filter(r => r.source === "questdb").length,
+      misses: topicResults.filter(r => r.source === "miss").length,
+      entityHits: entityResults.filter(r => r.source !== "miss").length,
+      entityMisses: entityResults.filter(r => r.source === "miss").length,
+      bindingSource: entityPlan?.bindingSource ?? null,
       cacheSize: lastValueMap.size,
       transform: options.transform,
     },
