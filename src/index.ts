@@ -2274,6 +2274,12 @@ async function handleBatchRange(
             )
           : rawResult;
         const scanRowCount = extractScanRowCount(result.raw);
+        if (scanRowCount !== null && scanRowCount > questdb.maxScanRows) {
+          throw new HttpError(
+            413,
+            `Query scan cost exceeded maxScanRows (${questdb.maxScanRows}). Narrow path/time-range or reduce requested scope.`,
+          );
+        }
 
         return {
           ...queryRequest,
@@ -2356,7 +2362,7 @@ async function handleBatchRange(
     };
   });
 
-  res.status(200).json({
+  const payload = {
     results: topicResults,
     entityResults,
     stats: {
@@ -2373,7 +2379,14 @@ async function handleBatchRange(
       transform,
       counterResetPolicy: transform === "delta" ? counterResetPolicy : undefined,
     },
-  });
+  };
+  if (Buffer.byteLength(JSON.stringify(payload), "utf8") > questdb.maxResponseBytes) {
+    throw new HttpError(
+      413,
+      `Response exceeds maxResponseBytes (${questdb.maxResponseBytes}). Reduce limit, selectors, or time-range.`,
+    );
+  }
+  res.status(200).json(payload);
 }
 
 // Start last-value cache (non-blocking — errors logged, not thrown)
