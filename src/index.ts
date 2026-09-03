@@ -29,6 +29,7 @@ import { CaptureService, type CaptureSessionAuditEvent } from "./captures/servic
 import { ControllerEntityBindingClient } from "./entity-binding-client.js";
 import { EntityLastValueCache } from "./entity-last-value-cache.js";
 import {
+  assessEntityPlanAccess,
   detectEntityStorageSchema,
   mergeEntityHistoryRows,
   parseEntityHistorySelectors,
@@ -1945,18 +1946,23 @@ async function handleBatchLast(
     } catch (error) {
       throw new HttpError(503, `Entity binding resolution failed: ${error instanceof Error ? error.message : String(error)}`);
     }
+    const accessFailure = assessEntityPlanAccess(
+      entityPlan,
+      (topic) => isTopicAllowedByAccessRules(topic, accessRules),
+      (topic) => isHistoryAllowed(dataSources, topic),
+    );
+    if (accessFailure === "path-access-denied") {
+      throw new HttpError(403, "An entity binding is outside the caller's topic access rules.");
+    }
+    if (accessFailure === "data-source-disabled") {
+      throw new HttpError(403, "An entity binding is not configured for data queries in dataSources.");
+    }
     for (const selector of entityPlan.selectors) {
       entityLastValueMap.replaceBindings(selector, selector.intervals.map((interval) => ({
         topic: interval.topic,
         bindingRevision: interval.bindingRevision,
         bindingDigest: interval.bindingDigest,
       })));
-      for (const interval of selector.intervals) {
-        validateCatchAllTopicAccess(interval.topic, accessRules);
-        if (!isHistoryAllowed(dataSources, interval.topic)) {
-          throw new HttpError(403, "An entity binding is not configured for data queries in dataSources.");
-        }
-      }
     }
   }
 
@@ -2099,13 +2105,16 @@ async function handleBatchRange(
     } catch (error) {
       throw new HttpError(503, `Entity binding resolution failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-    for (const selector of entityPlan.selectors) {
-      for (const interval of selector.intervals) {
-        validateCatchAllTopicAccess(interval.topic, accessRules);
-        if (!isHistoryAllowed(dataSources, interval.topic)) {
-          throw new HttpError(403, "An entity binding is not configured for history queries in dataSources.");
-        }
-      }
+    const accessFailure = assessEntityPlanAccess(
+      entityPlan,
+      (topic) => isTopicAllowedByAccessRules(topic, accessRules),
+      (topic) => isHistoryAllowed(dataSources, topic),
+    );
+    if (accessFailure === "path-access-denied") {
+      throw new HttpError(403, "An entity binding is outside the caller's topic access rules.");
+    }
+    if (accessFailure === "data-source-disabled") {
+      throw new HttpError(403, "An entity binding is not configured for history queries in dataSources.");
     }
   }
 

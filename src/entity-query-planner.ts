@@ -50,6 +50,22 @@ export type EntityHistoryPlan = {
   bindingSource: "cache" | "controller" | "stale-cache" | "mixed";
 };
 
+export type EntityPlanAccessFailure = "path-access-denied" | "data-source-disabled";
+
+export function assessEntityPlanAccess(
+  plan: EntityHistoryPlan,
+  canAccessTopic: (topic: string) => boolean,
+  canQueryTopic: (topic: string) => boolean,
+): EntityPlanAccessFailure | null {
+  for (const selector of plan.selectors) {
+    for (const interval of selector.intervals) {
+      if (!canAccessTopic(interval.topic)) return "path-access-denied";
+      if (!canQueryTopic(interval.topic)) return "data-source-disabled";
+    }
+  }
+  return null;
+}
+
 export type EntityHistoryRowsMerge = {
   columns: string[];
   rows: unknown[][];

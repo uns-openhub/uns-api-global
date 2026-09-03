@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  assessEntityPlanAccess,
   detectEntityStorageSchema,
   mergeEntityHistoryRows,
   planEntityCurrentBindings,
@@ -222,4 +223,34 @@ test("distinguishes legacy, identity-aware, and partial QuestDB schemas", () => 
       "identityBindingId|identityBindingRevision|identityBindingDigest",
     ],
   });
+});
+
+test("assesses every expanded binding without returning a hidden topic", async () => {
+  const reader = {
+    async listIntervals() {
+      return {
+        source: "controller" as const,
+        intervals: [{
+          topic: "restricted/site/press-14/equipment/main/temperature",
+          stableEntityId,
+          entityTypeKey: "asset",
+          bindingKind: "attribute-topic" as const,
+          validFrom: "2026-09-01T00:00:00.000Z",
+          validTo: null,
+          timeBasis: "event-time",
+          sourceCount: 1,
+          revision: "rev-1",
+          digest: "digest-1",
+        }],
+      };
+    },
+  };
+  const plan = await planEntityHistoryBindings(
+    reader,
+    [{ stableEntityId, attributePath: "equipment/main/temperature" }],
+    { from: "2026-09-01T00:00:00.000Z", to: "2026-09-02T00:00:00.000Z" },
+  );
+  assert.equal(assessEntityPlanAccess(plan, () => false, () => true), "path-access-denied");
+  assert.equal(assessEntityPlanAccess(plan, () => true, () => false), "data-source-disabled");
+  assert.equal(assessEntityPlanAccess(plan, () => true, () => true), null);
 });
