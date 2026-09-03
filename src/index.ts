@@ -31,11 +31,11 @@ import { EntityLastValueCache } from "./entity-last-value-cache.js";
 import {
   assessEntityPlanAccess,
   detectEntityStorageSchema,
+  mergeEntityBucketRows,
   mergeEntityHistoryRows,
   parseEntityHistorySelectors,
   planEntityCurrentBindings,
   planEntityHistoryBindings,
-  requiresCrossBindingAggregation,
   type EntityHistorySelector,
 } from "./entity-query-planner.js";
 import jwt from "jsonwebtoken";
@@ -44,6 +44,7 @@ import { createPublicKey, randomUUID } from "node:crypto";
 import { request, gql } from "graphql-request";
 import {
   buildBoundaryCounterDeltaResponse,
+  buildEntityBucketPartialSql,
   buildEntityDataSql,
   buildEntitySourceSql,
   computeCounterDeltaValue,
@@ -52,7 +53,7 @@ import {
   resolvePointTimeColumn as resolvePointTimeColumnFromSchema,
 } from "./catchall-helpers.js";
 
-type TimeRange = { from?: string; to?: string; note?: string };
+type TimeRange = { from?: string; to?: string; note?: string; toExclusive?: boolean };
 type TimeFieldPreference = "auto" | "timestamp" | "interval";
 type QuestDbConfig = Omit<ProjectExtras["questdb"], "url" | "username" | "password"> & {
   url: string;
@@ -582,8 +583,8 @@ const swaggerDoc = {
                     maxItems: 50,
                     description:
                       "Stable Asset identity plus a concrete attribute path relative to that Asset. " +
-                      "Raw history is resolved over every authorized historical topic interval. " +
-                      "Sampled history is supported when the requested window resolves to at most one binding interval per selector.",
+                      "Raw and sampled history are resolved over every authorized historical topic interval. " +
+                      "Sampled aggregates are merged across binding changes without treating a moved path as a new series.",
                     items: {
                       type: "object",
                       required: ["stableEntityId", "attributePath"],
@@ -2116,12 +2117,6 @@ async function handleBatchRange(
     if (accessFailure === "data-source-disabled") {
       throw new HttpError(403, "An entity binding is not configured for history queries in dataSources.");
     }
-    if (sampledRequested && requiresCrossBindingAggregation(entityPlan)) {
-      throw new HttpError(
-        400,
-        "Sampled entity history across multiple binding intervals requires cross-binding bucket aggregation; request raw history or narrow the time range.",
-      );
-    }
   }
 
   const queryRequests = [
@@ -2131,14 +2126,16 @@ async function handleBatchRange(
       entitySelectorIndex: null as number | null,
       bindingRevision: null as string | null,
       bindingDigest: null as string | null,
+      crossBindingSample: false,
     })),
     ...(entityPlan?.selectors.flatMap((selector, entitySelectorIndex) =>
       selector.intervals.map((interval) => ({
         topic: interval.topic,
-        range: { from: interval.from, to: interval.to },
+        range: { from: interval.from, to: interval.to, toExclusive: interval.toExclusive },
         entitySelectorIndex,
         bindingRevision: interval.bindingRevision,
         bindingDigest: interval.bindingDigest,
+        crossBindingSample: sampledRequested && selector.intervals.length > 1,
       }))) ?? []),
   ];
 
@@ -2187,7 +2184,8 @@ async function handleBatchRange(
         } else if (sampledRequested) {
           const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
           const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
-          const bucketMs = requestedBucketMs ?? deriveBucketMs(range, requestedMaxPoints!);
+          const bucketRange = queryRequest.crossBindingSample ? requestedRange : range;
+          const bucketMs = requestedBucketMs ?? deriveBucketMs(bucketRange, requestedMaxPoints!);
           const bucketAggregate: AggregateMode = transform === "delta" ? "sum" : aggregate;
           sampling = {
             mode: "bucketed",
@@ -2234,7 +2232,9 @@ async function handleBatchRange(
                   temporal,
                   [metricColumn, ...(unitColumn ? [unitColumn] : [])],
                 );
-            sql = buildBucketSql(sourceSql, temporal, metricColumn, unitColumn, aggregate, bucketMs, requestedMetricColumn);
+            sql = queryRequest.crossBindingSample
+              ? buildEntityBucketPartialSql(sourceSql, temporal, metricColumn, unitColumn, bucketMs)
+              : buildBucketSql(sourceSql, temporal, metricColumn, unitColumn, aggregate, bucketMs, requestedMetricColumn);
           }
         } else {
           if (transform === "delta") {
@@ -2353,10 +2353,28 @@ async function handleBatchRange(
     let mergeError: string | null = null;
     if (!failed) {
       try {
-        merged = mergeEntityHistoryRows(successful.map((segment) => ({
+        const mergeSegments = successful.map((segment) => ({
           columns: segment.columns ?? [],
           rows: segment.data as unknown[][],
-        })), limit);
+        }));
+        if (sampledRequested && selector.intervals.length > 1) {
+          merged = mergeEntityBucketRows(
+            mergeSegments,
+            aggregate,
+            requestedMetricColumn,
+            successful.some((segment) =>
+              segment.stats?.sampling.mode === "bucketed"
+              && segment.stats.sampling.unitColumn !== null),
+          );
+        } else if (sampledRequested && successful.length === 1) {
+          merged = {
+            columns: [...(successful[0]!.columns ?? [])],
+            rows: [...(successful[0]!.data as unknown[][])],
+            duplicatesRemoved: 0,
+          };
+        } else {
+          merged = mergeEntityHistoryRows(mergeSegments, limit);
+        }
       } catch (error) {
         mergeError = error instanceof Error ? error.message : String(error);
       }
@@ -2375,6 +2393,7 @@ async function handleBatchRange(
         to: segment.range.to,
         bindingRevision: segment.bindingRevision,
         bindingDigest: segment.bindingDigest,
+        toExclusive: segment.range.toExclusive === true,
         error: segment.error,
         sql: segment.sql,
         rowCount: Array.isArray(segment.data) ? segment.data.length : 0,
@@ -3048,7 +3067,8 @@ function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: TemporalStra
     parts.push(`${quoteIdentifier(temporal.toColumn)} >= ${escapeLiteral(range.from)}`);
   }
   if (range.to) {
-    parts.push(`${quoteIdentifier(temporal.fromColumn)} <= ${escapeLiteral(range.to)}`);
+    const operator = range.toExclusive ? "<" : "<=";
+    parts.push(`${quoteIdentifier(temporal.fromColumn)} ${operator} ${escapeLiteral(range.to)}`);
   }
   return parts.join(" AND ");
 }

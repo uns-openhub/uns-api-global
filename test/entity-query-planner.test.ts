@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   assessEntityPlanAccess,
   detectEntityStorageSchema,
+  mergeEntityBucketRows,
   mergeEntityHistoryRows,
   planEntityCurrentBindings,
   planEntityHistoryBindings,
@@ -66,6 +67,7 @@ test("plans one continuous entity attribute across old and new topic intervals",
     },
   ]);
   assert.equal(requiresCrossBindingAggregation(plan), true);
+  assert.deepEqual(plan.selectors[0]?.intervals.map((interval) => interval.toExclusive), [true, false]);
 });
 
 test("groups selectors by stable ID and keeps unmatched attributes explicit", async () => {
@@ -159,6 +161,27 @@ test("deduplicates legacy and enriched copies while preserving identity evidence
   assert.equal(merged.duplicatesRemoved, 1);
   assert.equal(merged.rows[0]?.[3], stableEntityId);
   assert.equal(merged.rows[0]?.[4], "resolved");
+});
+
+test("merges partial buckets across a move with aggregate-correct results", () => {
+  const columns = [
+    "timestamp", "__entityRowCount", "__entityValueCount", "__entitySum",
+    "__entityMin", "__entityMax", "__entityLast", "__entityLastTimestamp", "__entityUom",
+  ];
+  const segments = [
+    { columns, rows: [["2026-09-01T10:00:00Z", 2, 2, 20, 8, 12, 12, "2026-09-01T10:00:20Z", "bar"]] },
+    { columns, rows: [["2026-09-01T10:00:00Z", 3, 3, 60, 15, 25, 25, "2026-09-01T10:00:50Z", "bar"]] },
+  ];
+  assert.deepEqual(mergeEntityBucketRows(segments, "avg", null, true), {
+    columns: ["timestamp", "value", "uom"],
+    rows: [["2026-09-01T10:00:00Z", 16, "bar"]],
+    duplicatesRemoved: 0,
+  });
+  assert.equal(mergeEntityBucketRows(segments, "sum", null, false).rows[0]?.[1], 80);
+  assert.equal(mergeEntityBucketRows(segments, "min", null, false).rows[0]?.[1], 8);
+  assert.equal(mergeEntityBucketRows(segments, "max", null, false).rows[0]?.[1], 25);
+  assert.equal(mergeEntityBucketRows(segments, "count", null, false).rows[0]?.[1], 5);
+  assert.equal(mergeEntityBucketRows(segments, "last", "pressure", true).rows[0]?.[2], 25);
 });
 
 test("resolves current bindings in a narrow window around the requested instant", async () => {

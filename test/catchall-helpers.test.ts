@@ -14,6 +14,7 @@ import {
   buildDataColumnList,
   buildDataSql,
   buildEntityDataSql,
+  buildEntityBucketPartialSql,
   buildEntitySourceSql,
   buildDedupePartitionColumns,
   buildSourceCountSql,
@@ -412,6 +413,34 @@ test("identity-aware sampled source keeps stable identity and legacy path fallba
   assert.match(sql, /"topic" = 'enterprise\/site\/line-a'/);
   assert.match(sql, /"time" >= '2026-09-01T00:00:00.000Z'/);
   assert.match(sql, /"time" <= '2026-09-02T00:00:00.000Z'/);
+});
+
+test("entity bucket partial SQL exposes mergeable aggregate evidence", () => {
+  const sql = buildEntityBucketPartialSql(
+    'SELECT "numberValue", "uom", "time" FROM "uns_data"',
+    { mode: "timestamp", fromColumn: "time", toColumn: "time", orderBy: '"time" DESC' },
+    "numberValue",
+    "uom",
+    60_000,
+  ).replace(/\s+/g, " ").trim();
+  assert.match(sql, /timestamp_floor\('60000T', "time"\) AS "timestamp"/);
+  assert.match(sql, /count\(\) AS "__entityRowCount"/);
+  assert.match(sql, /count\("numberValue"\) AS "__entityValueCount"/);
+  assert.match(sql, /sum\("numberValue"\) AS "__entitySum"/);
+  assert.match(sql, /last\("time"\) AS "__entityLastTimestamp"/);
+  assert.match(sql, /last\("uom"\) AS "__entityUom"/);
+});
+
+test("exclusive range end prevents double counting at a binding boundary", () => {
+  const schema = makeSchema([["topic"], ["numberValue"], ["time"]]);
+  const where = buildWhere(
+    parseUnsPath("enterprise/site/line-a/PRESS-14/equipment/main/temperature"),
+    { from: "2026-09-01T09:00:00Z", to: "2026-09-01T10:00:00Z", toExclusive: true },
+    resolveTemporalStrategy(schema, "auto"),
+    schema,
+  );
+  assert.match(where, /"time" < '2026-09-01T10:00:00Z'/);
+  assert.doesNotMatch(where, /"time" <=/);
 });
 
 test("schema-aware raw helpers keep preferred columns first and apply dedupe only when possible", () => {

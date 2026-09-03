@@ -36,6 +36,7 @@ export type EntityHistoryPathInterval = {
   bindingRevision: string;
   bindingDigest: string;
   timeBasis: string;
+  toExclusive: boolean;
 };
 
 export type EntityHistorySelectorPlan = EntityHistorySelector & {
@@ -160,6 +161,8 @@ function planIntervals(
         bindingRevision: interval.revision,
         bindingDigest: interval.digest,
         timeBasis: interval.timeBasis,
+        toExclusive: interval.validTo !== null
+          && new Date(interval.validTo).getTime() <= new Date(to).getTime(),
       };
     })
     .filter((interval): interval is EntityHistoryPathInterval => interval !== null)
@@ -292,4 +295,104 @@ export function mergeEntityHistoryRows(
     return rightTime - leftTime;
   }).slice(0, limit);
   return { columns: [...columns], rows, duplicatesRemoved: allRows.length - unique.size };
+}
+
+type EntityBucketAggregate = "avg" | "min" | "max" | "last" | "sum" | "count";
+
+export function mergeEntityBucketRows(
+  segments: Array<{ columns: string[]; rows: unknown[][] }>,
+  aggregate: EntityBucketAggregate,
+  outputMetricColumn: string | null,
+  includeUnit: boolean,
+): EntityHistoryRowsMerge {
+  const outputColumns = ["timestamp", "value"];
+  if (outputMetricColumn && outputMetricColumn !== "value") outputColumns.push(outputMetricColumn);
+  if (includeUnit) {
+    outputColumns.push("uom");
+    const unitAlias = outputMetricColumn ? `${outputMetricColumn}_uom` : null;
+    if (unitAlias && unitAlias !== "uom") outputColumns.push(unitAlias);
+  }
+  if (!segments.length) return { columns: outputColumns, rows: [], duplicatesRemoved: 0 };
+
+  const required = [
+    "timestamp", "__entityRowCount", "__entityValueCount", "__entitySum",
+    "__entityMin", "__entityMax", "__entityLast", "__entityLastTimestamp",
+  ];
+  for (const segment of segments) {
+    const missing = required.filter((column) => !segment.columns.includes(column));
+    if (missing.length) throw new Error(`Entity bucket segment is missing columns: ${missing.join(", ")}`);
+  }
+  type Bucket = {
+    timestamp: unknown;
+    rowCount: number;
+    valueCount: number;
+    sum: number;
+    min: number | null;
+    max: number | null;
+    last: unknown;
+    lastTimestamp: number;
+    uom: unknown;
+  };
+  const buckets = new Map<string, Bucket>();
+  const finiteNumber = (value: unknown): number | null => {
+    const parsed = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  for (const segment of segments) {
+    const indexes = new Map(segment.columns.map((column, index) => [column, index]));
+    for (const row of segment.rows) {
+      const timestamp = row[indexes.get("timestamp")!];
+      const key = String(timestamp);
+      const rowCount = finiteNumber(row[indexes.get("__entityRowCount")!]) ?? 0;
+      const valueCount = finiteNumber(row[indexes.get("__entityValueCount")!]) ?? 0;
+      const sum = finiteNumber(row[indexes.get("__entitySum")!]) ?? 0;
+      const min = finiteNumber(row[indexes.get("__entityMin")!]);
+      const max = finiteNumber(row[indexes.get("__entityMax")!]);
+      const lastTimestampValue = row[indexes.get("__entityLastTimestamp")!];
+      const lastTimestamp = new Date(String(lastTimestampValue ?? "")).getTime();
+      const current = buckets.get(key) ?? {
+        timestamp,
+        rowCount: 0,
+        valueCount: 0,
+        sum: 0,
+        min: null,
+        max: null,
+        last: null,
+        lastTimestamp: Number.NEGATIVE_INFINITY,
+        uom: null,
+      };
+      current.rowCount += rowCount;
+      current.valueCount += valueCount;
+      current.sum += sum;
+      if (min !== null) current.min = current.min === null ? min : Math.min(current.min, min);
+      if (max !== null) current.max = current.max === null ? max : Math.max(current.max, max);
+      if (Number.isFinite(lastTimestamp) && lastTimestamp >= current.lastTimestamp) {
+        current.lastTimestamp = lastTimestamp;
+        current.last = row[indexes.get("__entityLast")!];
+        const unitIndex = indexes.get("__entityUom");
+        current.uom = unitIndex === undefined ? null : row[unitIndex];
+      }
+      buckets.set(key, current);
+    }
+  }
+  const rows = Array.from(buckets.values())
+    .sort((left, right) => String(left.timestamp).localeCompare(String(right.timestamp)))
+    .map((bucket) => {
+      const value = aggregate === "avg"
+        ? (bucket.valueCount ? bucket.sum / bucket.valueCount : null)
+        : aggregate === "sum" ? (bucket.valueCount ? bucket.sum : null)
+        : aggregate === "min" ? bucket.min
+        : aggregate === "max" ? bucket.max
+        : aggregate === "count" ? bucket.rowCount
+        : bucket.last;
+      const row: unknown[] = [bucket.timestamp, value];
+      if (outputMetricColumn && outputMetricColumn !== "value") row.push(value);
+      if (includeUnit) {
+        row.push(bucket.uom);
+        const unitAlias = outputMetricColumn ? `${outputMetricColumn}_uom` : null;
+        if (unitAlias && unitAlias !== "uom") row.push(bucket.uom);
+      }
+      return row;
+    });
+  return { columns: outputColumns, rows, duplicatesRemoved: 0 };
 }

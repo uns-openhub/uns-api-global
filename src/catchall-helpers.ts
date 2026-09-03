@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { UnsTopicMatcher } from "@uns-kit/core/uns/uns-topic-matcher.js";
 
-export type TimeRange = { from?: string; to?: string; note?: string };
+export type TimeRange = { from?: string; to?: string; note?: string; toExclusive?: boolean };
 export type TimeFieldPreference = "auto" | "timestamp" | "interval";
 export type AggregateMode = "avg" | "min" | "max" | "last" | "sum" | "count";
 export type HistoryTransformMode = "raw" | "delta";
@@ -448,7 +448,8 @@ export function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: Tempo
     parts.push(`${quoteIdentifier(temporal.toColumn)} >= ${escapeLiteral(range.from)}`);
   }
   if (range.to) {
-    parts.push(`${quoteIdentifier(temporal.fromColumn)} <= ${escapeLiteral(range.to)}`);
+    const operator = range.toExclusive ? "<" : "<=";
+    parts.push(`${quoteIdentifier(temporal.fromColumn)} ${operator} ${escapeLiteral(range.to)}`);
   }
   return parts.join(" AND ");
 }
@@ -571,7 +572,10 @@ export function buildEntitySourceSql(
   ].join(" AND ");
   const rangeParts: string[] = [];
   if (range.from) rangeParts.push(`${quoteIdentifier(temporal.toColumn)} >= ${escapeLiteral(range.from)}`);
-  if (range.to) rangeParts.push(`${quoteIdentifier(temporal.fromColumn)} <= ${escapeLiteral(range.to)}`);
+  if (range.to) {
+    const operator = range.toExclusive ? "<" : "<=";
+    rangeParts.push(`${quoteIdentifier(temporal.fromColumn)} ${operator} ${escapeLiteral(range.to)}`);
+  }
   const where = `(((${identityWhere}) OR (${quoteIdentifier("stableEntityId")} IS NULL AND ${legacyPathWhere})))${rangeParts.length ? ` AND ${rangeParts.join(" AND ")}` : ""}`;
   const tableId = quoteIdentifier(table);
   const canDedupe = canApplyDedupe(dedupe, schema);
@@ -724,6 +728,35 @@ export function buildBucketSql(
   if (unitColumn) {
     selectParts.push(`last(${quoteIdentifier(unitColumn)}) AS uom`);
   }
+  return `
+    SELECT ${selectParts.join(", ")}
+    FROM (${sourceSql})
+    GROUP BY ${timeBucketExpression}
+    ORDER BY 1 ASC
+  `;
+}
+
+export function buildEntityBucketPartialSql(
+  sourceSql: string,
+  temporal: TemporalStrategy,
+  metricColumn: string,
+  unitColumn: string | null,
+  bucketMs: number,
+): string {
+  const metricId = quoteIdentifier(metricColumn);
+  const timeId = quoteIdentifier(temporal.fromColumn);
+  const timeBucketExpression = `timestamp_floor('${bucketMs}T', ${timeId})`;
+  const selectParts = [
+    `${timeBucketExpression} AS "timestamp"`,
+    `count() AS "__entityRowCount"`,
+    `count(${metricId}) AS "__entityValueCount"`,
+    `sum(${metricId}) AS "__entitySum"`,
+    `min(${metricId}) AS "__entityMin"`,
+    `max(${metricId}) AS "__entityMax"`,
+    `last(${metricId}) AS "__entityLast"`,
+    `last(${timeId}) AS "__entityLastTimestamp"`,
+  ];
+  if (unitColumn) selectParts.push(`last(${quoteIdentifier(unitColumn)}) AS "__entityUom"`);
   return `
     SELECT ${selectParts.join(", ")}
     FROM (${sourceSql})
