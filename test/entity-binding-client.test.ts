@@ -121,3 +121,76 @@ test("keeps historical as-of cache entries isolated from current bindings", asyn
   assert.equal(current.resolutions[0]?.revision, "9");
   assert.equal(requestBodies.length, 2);
 });
+
+test("lists and caches exact entity binding intervals for a bounded history window", async () => {
+  let now = 1_000;
+  const requestBodies: string[] = [];
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    requestBodies.push(String(init?.body));
+    return jsonResponse({
+      data: {
+        ListEntityObservationBindingIntervals: [{
+          topic: "site/line-a/press-14/equipment/main/temperature",
+          stableEntityId: "11111111-1111-4111-8111-111111111111",
+          entityTypeKey: "openhub.asset",
+          bindingKind: "attribute-topic",
+          validFrom: "2026-09-01T09:00:00Z",
+          validTo: "2026-09-01T10:00:00Z",
+          timeBasis: "source-event-time",
+          sourceCount: 2,
+          revision: "8",
+          digest: `sha256:${"2".repeat(64)}`,
+        }],
+      },
+    });
+  };
+  const client = new ControllerEntityBindingClient({
+    graphqlUrl: "http://controller/graphql",
+    tokenProvider: { getAccessToken: async () => "service-token" },
+    fetchImpl,
+    now: () => now,
+    cacheTtlMs: 1_000,
+  });
+  const first = await client.listIntervals(
+    "11111111-1111-4111-8111-111111111111",
+    "2026-09-01T09:30:00Z",
+    "2026-09-01T10:30:00Z",
+  );
+  assert.equal(first.source, "controller");
+  assert.equal(first.intervals[0]?.revision, "8");
+  assert.equal(first.intervals[0]?.validFrom, "2026-09-01T09:00:00.000Z");
+  const variables = JSON.parse(requestBodies[0]!).variables as Record<string, unknown>;
+  assert.equal(variables["limit"], 200);
+
+  now += 500;
+  const second = await client.listIntervals(
+    "11111111-1111-4111-8111-111111111111",
+    "2026-09-01T09:30:00Z",
+    "2026-09-01T10:30:00Z",
+  );
+  assert.equal(second.source, "cache");
+  assert.equal(requestBodies.length, 1);
+});
+
+test("validates entity interval selectors before calling the controller", async () => {
+  const fetchImpl: typeof fetch = async () => {
+    throw new Error("must not fetch");
+  };
+  const client = new ControllerEntityBindingClient({
+    graphqlUrl: "http://controller/graphql",
+    tokenProvider: { getAccessToken: async () => "service-token" },
+    fetchImpl,
+  });
+  await assert.rejects(
+    () => client.listIntervals("invalid", "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z"),
+    /valid UUID/,
+  );
+  await assert.rejects(
+    () => client.listIntervals(
+      "11111111-1111-4111-8111-111111111111",
+      "2026-09-01T10:00:00Z",
+      "2026-09-01T09:00:00Z",
+    ),
+    /earlier/,
+  );
+});

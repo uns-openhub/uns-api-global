@@ -16,12 +16,30 @@ export type EntityBindingResolution = {
   digest: string | null;
 };
 
+export type EntityBindingInterval = {
+  topic: string;
+  stableEntityId: string;
+  entityTypeKey: string;
+  bindingKind: "attribute-topic";
+  validFrom: string;
+  validTo: string | null;
+  timeBasis: string;
+  sourceCount: number;
+  revision: string;
+  digest: string;
+};
+
 type AccessTokenProvider = {
   getAccessToken(): Promise<string | undefined>;
 };
 
 type CacheEntry = {
   resolution: EntityBindingResolution;
+  fetchedAt: number;
+};
+
+type IntervalCacheEntry = {
+  intervals: EntityBindingInterval[];
   fetchedAt: number;
 };
 
@@ -50,6 +68,33 @@ const RESOLVE_BINDINGS_QUERY = `
       entityTypeKey
       bindingKind
       matchedPath
+      timeBasis
+      sourceCount
+      revision
+      digest
+    }
+  }
+`;
+
+const LIST_BINDING_INTERVALS_QUERY = `
+  query ListEntityObservationBindingIntervals(
+    $stableEntityId: String!
+    $from: Timestamp!
+    $to: Timestamp!
+    $limit: Int
+  ) {
+    ListEntityObservationBindingIntervals(
+      stableEntityId: $stableEntityId
+      from: $from
+      to: $to
+      limit: $limit
+    ) {
+      topic
+      stableEntityId
+      entityTypeKey
+      bindingKind
+      validFrom
+      validTo
       timeBasis
       sourceCount
       revision
@@ -106,6 +151,35 @@ function parseResolution(value: unknown): EntityBindingResolution | null {
   };
 }
 
+function parseInterval(value: unknown): EntityBindingInterval | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  if (
+    typeof row["topic"] !== "string"
+    || typeof row["stableEntityId"] !== "string"
+    || typeof row["entityTypeKey"] !== "string"
+    || row["bindingKind"] !== "attribute-topic"
+    || typeof row["validFrom"] !== "string"
+    || typeof row["timeBasis"] !== "string"
+    || typeof row["revision"] !== "string"
+    || typeof row["digest"] !== "string"
+  ) return null;
+  const sourceCount = Number(row["sourceCount"]);
+  if (!Number.isSafeInteger(sourceCount) || sourceCount < 1) return null;
+  return {
+    topic: normalizeTopic(row["topic"]),
+    stableEntityId: row["stableEntityId"].trim().toLowerCase(),
+    entityTypeKey: row["entityTypeKey"],
+    bindingKind: "attribute-topic",
+    validFrom: normalizeAsOf(row["validFrom"])!,
+    validTo: row["validTo"] === null ? null : normalizeAsOf(String(row["validTo"])),
+    timeBasis: row["timeBasis"],
+    sourceCount,
+    revision: row["revision"],
+    digest: row["digest"],
+  };
+}
+
 export class ControllerEntityBindingClient {
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
@@ -113,6 +187,7 @@ export class ControllerEntityBindingClient {
   private readonly staleIfErrorMs: number;
   private readonly now: () => number;
   private readonly cache = new Map<string, CacheEntry>();
+  private readonly intervalCache = new Map<string, IntervalCacheEntry>();
 
   constructor(private readonly options: EntityBindingClientOptions) {
     if (!options.graphqlUrl.trim()) throw new TypeError("graphqlUrl is required");
@@ -175,6 +250,66 @@ export class ControllerEntityBindingClient {
 
   invalidate(): void {
     this.cache.clear();
+    this.intervalCache.clear();
+  }
+
+  async listIntervals(
+    stableEntityId: string,
+    from: string | Date,
+    to: string | Date,
+    limit = MAX_ENTITY_BINDING_TOPICS,
+  ): Promise<{ intervals: EntityBindingInterval[]; source: "cache" | "controller" | "stale-cache" }> {
+    const entityId = stableEntityId.trim().toLowerCase();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(entityId)) {
+      throw new TypeError("stableEntityId must be a valid UUID");
+    }
+    const normalizedFrom = normalizeAsOf(from)!;
+    const normalizedTo = normalizeAsOf(to)!;
+    if (new Date(normalizedFrom).getTime() >= new Date(normalizedTo).getTime()) {
+      throw new RangeError("from must be earlier than to");
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_ENTITY_BINDING_TOPICS) {
+      throw new RangeError(`limit must be between 1 and ${MAX_ENTITY_BINDING_TOPICS}`);
+    }
+    const key = `${entityId}\0${normalizedFrom}\0${normalizedTo}\0${limit}`;
+    const now = this.now();
+    const cached = this.intervalCache.get(key);
+    if (cached && now - cached.fetchedAt <= this.cacheTtlMs) {
+      return { intervals: cached.intervals, source: "cache" };
+    }
+    try {
+      const token = await this.options.tokenProvider.getAccessToken();
+      if (!token) throw new Error("Controller identity binding request requires a service access token");
+      const response = await this.fetchImpl(this.options.graphqlUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          query: LIST_BINDING_INTERVALS_QUERY,
+          variables: { stableEntityId: entityId, from: normalizedFrom, to: normalizedTo, limit },
+        }),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      const payload = await response.json() as {
+        data?: { ListEntityObservationBindingIntervals?: unknown[] | null } | null;
+        errors?: Array<{ message?: string }>;
+      };
+      if (!response.ok || payload.errors?.length) {
+        throw new Error(payload.errors?.[0]?.message ?? `Controller identity binding request failed with HTTP ${response.status}`);
+      }
+      const rows = payload.data?.ListEntityObservationBindingIntervals;
+      if (!Array.isArray(rows)) throw new Error("Controller entity binding interval response is missing data");
+      const intervals = rows.map(parseInterval).filter((row): row is EntityBindingInterval => row !== null);
+      this.intervalCache.set(key, { intervals, fetchedAt: now });
+      return { intervals, source: "controller" };
+    } catch (error) {
+      if (cached && now - cached.fetchedAt <= this.staleIfErrorMs) {
+        return { intervals: cached.intervals, source: "stale-cache" };
+      }
+      throw error;
+    }
   }
 
   private async fetchBindings(topics: string[], asOf: string | null): Promise<EntityBindingResolution[]> {
