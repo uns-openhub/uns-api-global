@@ -519,6 +519,34 @@ export function buildEntityDataSql(
   schema: TableSchema,
   temporal: TemporalStrategy,
 ): string {
+  const sourceSql = buildEntitySourceSql(
+    table,
+    stableEntityId,
+    parsed,
+    range,
+    dedupe,
+    schema,
+    temporal,
+    buildDataColumnList(schema),
+  );
+  return `
+    SELECT *
+    FROM (${sourceSql})
+    ORDER BY ${temporal.orderBy}
+    LIMIT ${limit}
+  `;
+}
+
+export function buildEntitySourceSql(
+  table: string,
+  stableEntityId: string,
+  parsed: ParsedPath,
+  range: TimeRange,
+  dedupe: boolean,
+  schema: TableSchema,
+  temporal: TemporalStrategy,
+  requestedColumns: string[],
+): string {
   if (!schema.columns.has("stableEntityId") || !schema.columns.has("identityResolution")) {
     throw new HttpError(400, "Table schema does not support stable entity queries.");
   }
@@ -546,10 +574,18 @@ export function buildEntityDataSql(
   if (range.to) rangeParts.push(`${quoteIdentifier(temporal.fromColumn)} <= ${escapeLiteral(range.to)}`);
   const where = `(((${identityWhere}) OR (${quoteIdentifier("stableEntityId")} IS NULL AND ${legacyPathWhere})))${rangeParts.length ? ` AND ${rangeParts.join(" AND ")}` : ""}`;
   const tableId = quoteIdentifier(table);
-  const selectColumns = buildDataColumnList(schema).map(quoteIdentifier).join(", ");
   const canDedupe = canApplyDedupe(dedupe, schema);
   const pointTimeColumn = resolvePointTimeColumn(schema);
-  const sourceSql = canDedupe
+  const selectedColumns = Array.from(
+    new Set(
+      requestedColumns
+        .concat([temporal.fromColumn, temporal.toColumn])
+        .concat(canDedupe && pointTimeColumn ? [pointTimeColumn, ...buildDedupePartitionColumns(schema)] : [])
+        .filter(column => schema.columns.has(column)),
+    ),
+  );
+  const selectColumns = selectedColumns.map(quoteIdentifier).join(", ");
+  return canDedupe
     ? `
       SELECT ${selectColumns}
       FROM ${tableId}
@@ -561,12 +597,6 @@ export function buildEntityDataSql(
       FROM ${tableId}
       WHERE ${where}
     `;
-  return `
-    SELECT *
-    FROM (${sourceSql})
-    ORDER BY ${temporal.orderBy}
-    LIMIT ${limit}
-  `;
 }
 
 export function buildSourceCountSql(sourceSql: string): string {

@@ -52,6 +52,10 @@ export type EntityHistoryPlan = {
 
 export type EntityPlanAccessFailure = "path-access-denied" | "data-source-disabled";
 
+export function requiresCrossBindingAggregation(plan: EntityHistoryPlan): boolean {
+  return plan.selectors.some((selector) => selector.intervals.length > 1);
+}
+
 export function assessEntityPlanAccess(
   plan: EntityHistoryPlan,
   canAccessTopic: (topic: string) => boolean,

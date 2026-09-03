@@ -6,6 +6,7 @@ import {
   mergeEntityHistoryRows,
   planEntityCurrentBindings,
   planEntityHistoryBindings,
+  requiresCrossBindingAggregation,
 } from "../src/entity-query-planner.js";
 
 const stableEntityId = "11111111-1111-4111-8111-111111111111";
@@ -64,6 +65,7 @@ test("plans one continuous entity attribute across old and new topic intervals",
       to: "2026-09-01T11:00:00.000Z",
     },
   ]);
+  assert.equal(requiresCrossBindingAggregation(plan), true);
 });
 
 test("groups selectors by stable ID and keeps unmatched attributes explicit", async () => {
@@ -84,6 +86,7 @@ test("groups selectors by stable ID and keeps unmatched attributes explicit", as
   );
   assert.equal(calls, 1);
   assert.deepEqual(plan.selectors.map((selector) => selector.status), ["not-found", "not-found"]);
+  assert.equal(requiresCrossBindingAggregation(plan), false);
 });
 
 test("rejects wildcard attribute paths and excessive unique entities", async () => {

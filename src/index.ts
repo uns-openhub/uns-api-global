@@ -35,6 +35,7 @@ import {
   parseEntityHistorySelectors,
   planEntityCurrentBindings,
   planEntityHistoryBindings,
+  requiresCrossBindingAggregation,
   type EntityHistorySelector,
 } from "./entity-query-planner.js";
 import jwt from "jsonwebtoken";
@@ -44,6 +45,7 @@ import { request, gql } from "graphql-request";
 import {
   buildBoundaryCounterDeltaResponse,
   buildEntityDataSql,
+  buildEntitySourceSql,
   computeCounterDeltaValue,
   counterBoundarySourceRange,
   isTopicAllowedByAccessRules,
@@ -580,7 +582,8 @@ const swaggerDoc = {
                     maxItems: 50,
                     description:
                       "Stable Asset identity plus a concrete attribute path relative to that Asset. " +
-                      "Raw history is resolved over every authorized historical topic interval.",
+                      "Raw history is resolved over every authorized historical topic interval. " +
+                      "Sampled history is supported when the requested window resolves to at most one binding interval per selector.",
                     items: {
                       type: "object",
                       required: ["stableEntityId", "attributePath"],
@@ -2067,9 +2070,6 @@ async function handleBatchRange(
   if (entitySelectors.length && transform === "delta") {
     throw new HttpError(400, "entitySelectors do not support transform=delta until cross-binding boundary calculation is enabled.");
   }
-  if (entitySelectors.length && sampledRequested) {
-    throw new HttpError(400, "entitySelectors do not support sampled history until cross-binding bucket aggregation is enabled.");
-  }
   if (
     sampledRequested &&
     requestedMaxPoints !== null &&
@@ -2115,6 +2115,12 @@ async function handleBatchRange(
     }
     if (accessFailure === "data-source-disabled") {
       throw new HttpError(403, "An entity binding is not configured for history queries in dataSources.");
+    }
+    if (sampledRequested && requiresCrossBindingAggregation(entityPlan)) {
+      throw new HttpError(
+        400,
+        "Sampled entity history across multiple binding intervals requires cross-binding bucket aggregation; request raw history or narrow the time range.",
+      );
     }
   }
 
@@ -2205,15 +2211,29 @@ async function handleBatchRange(
               [metricColumn, ...(unitColumn ? [unitColumn] : [])],
             );
           } else {
-            const sourceSql = buildSourceSql(
-              table,
-              parsedPath,
-              range,
-              dedupeRequested,
-              tableColumns,
-              temporal,
-              [metricColumn, ...(unitColumn ? [unitColumn] : [])],
-            );
+            const entitySelector = queryRequest.entitySelectorIndex === null
+              ? null
+              : entityPlan?.selectors[queryRequest.entitySelectorIndex] ?? null;
+            const sourceSql = entityStorage.mode === "identity-aware" && entitySelector
+              ? buildEntitySourceSql(
+                  table,
+                  entitySelector.stableEntityId,
+                  parsedPath,
+                  range,
+                  dedupeRequested,
+                  tableSchema,
+                  temporal,
+                  [metricColumn, ...(unitColumn ? [unitColumn] : [])],
+                )
+              : buildSourceSql(
+                  table,
+                  parsedPath,
+                  range,
+                  dedupeRequested,
+                  tableColumns,
+                  temporal,
+                  [metricColumn, ...(unitColumn ? [unitColumn] : [])],
+                );
             sql = buildBucketSql(sourceSql, temporal, metricColumn, unitColumn, aggregate, bucketMs, requestedMetricColumn);
           }
         } else {
