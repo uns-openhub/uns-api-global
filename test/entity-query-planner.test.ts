@@ -70,6 +70,63 @@ test("plans one continuous entity attribute across old and new topic intervals",
   assert.deepEqual(plan.selectors[0]?.intervals.map((interval) => interval.toExclusive), [true, false]);
 });
 
+test("keeps a late-arriving old-path row in event-time order across an Asset move", async () => {
+  const oldTopic = "site/line-a/press-14/equipment/main/temperature";
+  const newTopic = "site/line-b/press-14/equipment/main/temperature";
+  const cutover = "2026-09-01T10:00:00.000Z";
+  const reader = {
+    listIntervals: async () => ({
+      source: "controller" as const,
+      intervals: [
+        {
+          topic: oldTopic,
+          stableEntityId,
+          entityTypeKey: "openhub.asset",
+          bindingKind: "attribute-topic" as const,
+          validFrom: "2026-09-01T09:00:00.000Z",
+          validTo: cutover,
+          timeBasis: "source-event-time",
+          sourceCount: 1,
+          revision: "12",
+          digest: "old-binding",
+        },
+        {
+          topic: newTopic,
+          stableEntityId,
+          entityTypeKey: "openhub.asset",
+          bindingKind: "attribute-topic" as const,
+          validFrom: cutover,
+          validTo: null,
+          timeBasis: "source-event-time",
+          sourceCount: 1,
+          revision: "13",
+          digest: "new-binding",
+        },
+      ],
+    }),
+  };
+  const plan = await planEntityHistoryBindings(
+    reader,
+    [{ stableEntityId, attributePath: "equipment/main/temperature" }],
+    { from: "2026-09-01T09:30:00Z", to: "2026-09-01T10:30:00Z" },
+  );
+  assert.deepEqual(plan.selectors[0]?.intervals.map(({ topic, toExclusive }) => ({ topic, toExclusive })), [
+    { topic: oldTopic, toExclusive: true },
+    { topic: newTopic, toExclusive: false },
+  ]);
+
+  const columns = ["topic", "numberValue", "time", "stableEntityId"];
+  const merged = mergeEntityHistoryRows([
+    { columns, rows: [[newTopic, 11, "2026-09-01T10:01:00.000Z", stableEntityId]] },
+    // This row was archived after the new-path row, but carries pre-cutover event time.
+    { columns, rows: [[oldTopic, 9, "2026-09-01T09:59:59.000Z", stableEntityId]] },
+  ], 10);
+  assert.deepEqual(merged.rows.map((row) => [row[0], row[2], row[3]]), [
+    [newTopic, "2026-09-01T10:01:00.000Z", stableEntityId],
+    [oldTopic, "2026-09-01T09:59:59.000Z", stableEntityId],
+  ]);
+});
+
 test("groups selectors by stable ID and keeps unmatched attributes explicit", async () => {
   let calls = 0;
   const reader = {
