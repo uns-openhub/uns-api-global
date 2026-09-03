@@ -27,6 +27,7 @@ import { CaptureRegistry } from "./captures/registry.js";
 import { CapturePublisher } from "./captures/publisher.js";
 import { CaptureService, type CaptureSessionAuditEvent } from "./captures/service.js";
 import { ControllerEntityBindingClient } from "./entity-binding-client.js";
+import { EntityLastValueCache } from "./entity-last-value-cache.js";
 import {
   mergeEntityHistoryRows,
   parseEntityHistorySelectors,
@@ -1063,6 +1064,7 @@ type LastValueEntry = {
 };
 
 const lastValueMap = new Map<string, LastValueEntry>();
+const entityLastValueMap = new EntityLastValueCache<LastValueEntry>();
 let lvMqttInput: UnsMqttProxy | undefined;
 let lvActiveTopics: string[] = [];
 let triggerService: TriggerService | undefined;
@@ -1152,26 +1154,30 @@ function updateLastValue(topic: string, mqttMessage: string): void {
     if (data) {
       // Data attribute → single value stored as { value: X }
       const timestamp = data.time ?? new Date().toISOString();
-      lastValueMap.set(topic, {
+      const entry: LastValueEntry = {
         values: { value: data.value ?? null },
         uom: data.uom ?? null,
         timestamp,
         receivedAt: Date.now(),
         dataGroup: data.dataGroup ?? null,
         counter: buildCounterCacheState(topic, data.value ?? null, timestamp),
-      });
+      };
+      lastValueMap.set(topic, entry);
+      entityLastValueMap.updateTopic(topic, entry);
     } else if (table) {
       // Table attribute → multi-column values stored as { col1: X, col2: Y, ... }.
       // UnsPacket normalizes legacy arrays to the canonical named object first.
       const columns = tableColumnsToLastValues(table.columns);
       if (Object.keys(columns).length > 0) {
-        lastValueMap.set(topic, {
+        const entry: LastValueEntry = {
           values: columns,
           uom: null,
           timestamp: table.time ?? new Date().toISOString(),
           receivedAt: Date.now(),
           dataGroup: table.dataGroup ?? null,
-        });
+        };
+        lastValueMap.set(topic, entry);
+        entityLastValueMap.updateTopic(topic, entry);
       }
     }
   } catch {
@@ -1907,6 +1913,7 @@ async function resolveBatchLastResults(topics: string[], options: BatchLastOptio
       if (!fallback) return;
       const { entry, sql } = fallback;
       lastValueMap.set(topic, entry);
+      entityLastValueMap.updateTopic(topic, entry);
       const hitNow = Date.now();
       results[idx] = buildBatchLastResult(topic, entry, "questdb", sql, hitNow, options);
     }));
@@ -1937,6 +1944,11 @@ async function handleBatchLast(
       throw new HttpError(503, `Entity binding resolution failed: ${error instanceof Error ? error.message : String(error)}`);
     }
     for (const selector of entityPlan.selectors) {
+      entityLastValueMap.replaceBindings(selector, selector.intervals.map((interval) => ({
+        topic: interval.topic,
+        bindingRevision: interval.bindingRevision,
+        bindingDigest: interval.bindingDigest,
+      })));
       for (const interval of selector.intervals) {
         validateCatchAllTopicAccess(interval.topic, accessRules);
         if (!isHistoryAllowed(dataSources, interval.topic)) {
@@ -1954,16 +1966,27 @@ async function handleBatchLast(
   const entityTopicResults = new Map(
     allResults.slice(topics.length).map((result) => [result.topic, result]),
   );
+  for (const topic of entityTopics) {
+    const entry = lastValueMap.get(topic);
+    if (entry) entityLastValueMap.updateTopic(topic, entry);
+  }
   const entityResults = (entityPlan?.selectors ?? []).map((selector) => {
     const candidates = selector.intervals.map((interval) => ({
       interval,
       result: entityTopicResults.get(interval.topic),
     }));
-    const selected = candidates
-      .filter((candidate) => candidate.result?.timestamp)
-      .sort((left, right) =>
-        new Date(right.result!.timestamp!).getTime() - new Date(left.result!.timestamp!).getTime()
-        || right.interval.from.localeCompare(left.interval.from))[0];
+    const cached = entityLastValueMap.get(selector);
+    const selected = cached
+      ? candidates.find((candidate) =>
+          candidate.interval.topic === cached.topic
+          && candidate.interval.bindingRevision === cached.bindingRevision
+          && candidate.interval.bindingDigest === cached.bindingDigest)
+      : undefined;
+    const selectedResult = selected?.result?.timestamp
+      ? selected.result
+      : cached
+        ? buildBatchLastResult(cached.topic, cached.value, "cache", null, Date.now(), options)
+        : undefined;
     return {
       stableEntityId: selector.stableEntityId,
       attributePath: selector.attributePath,
@@ -1972,14 +1995,14 @@ async function handleBatchLast(
       topic: selected?.interval.topic ?? null,
       bindingRevision: selected?.interval.bindingRevision ?? null,
       bindingDigest: selected?.interval.bindingDigest ?? null,
-      value: selected?.result?.value ?? null,
-      values: selected?.result?.values ?? null,
-      uom: selected?.result?.uom ?? null,
-      timestamp: selected?.result?.timestamp ?? null,
-      dataGroup: selected?.result?.dataGroup ?? null,
-      ageMs: selected?.result?.ageMs ?? null,
-      source: selected?.result?.source ?? "miss",
-      sql: selected?.result?.sql ?? null,
+      value: selectedResult?.value ?? null,
+      values: selectedResult?.values ?? null,
+      uom: selectedResult?.uom ?? null,
+      timestamp: selectedResult?.timestamp ?? null,
+      dataGroup: selectedResult?.dataGroup ?? null,
+      ageMs: selectedResult?.ageMs ?? null,
+      source: selectedResult?.source ?? "miss",
+      sql: selectedResult?.sql ?? null,
       candidateTopics: candidates.map((candidate) => ({
         topic: candidate.interval.topic,
         bindingRevision: candidate.interval.bindingRevision,
@@ -2003,6 +2026,7 @@ async function handleBatchLast(
       entityMisses: entityResults.filter(r => r.source === "miss").length,
       bindingSource: entityPlan?.bindingSource ?? null,
       cacheSize: lastValueMap.size,
+      entityCacheSize: entityLastValueMap.size,
       transform: options.transform,
     },
   });
