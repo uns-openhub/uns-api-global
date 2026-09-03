@@ -56,6 +56,39 @@ export type EntityHistoryRowsMerge = {
   duplicatesRemoved: number;
 };
 
+export type EntityStorageSchemaMode = "legacy" | "identity-aware" | "partial";
+
+export type EntityStorageSchema = {
+  mode: EntityStorageSchemaMode;
+  stableEntityColumn: string | null;
+  bindingColumn: string | null;
+  missingColumns: string[];
+};
+
+const IDENTITY_REQUIRED_COLUMNS = ["stableEntityId", "identityResolution", "identityTimeBasis"] as const;
+const IDENTITY_BINDING_COLUMNS = ["identityBindingId", "identityBindingRevision", "identityBindingDigest"] as const;
+
+export function detectEntityStorageSchema(columns: Iterable<string>): EntityStorageSchema {
+  const available = new Set(columns);
+  const stableEntityColumn = available.has("stableEntityId") ? "stableEntityId" : null;
+  const bindingColumn = IDENTITY_BINDING_COLUMNS.find((column) => available.has(column)) ?? null;
+  const identityColumnsPresent = [
+    ...IDENTITY_REQUIRED_COLUMNS.filter((column) => available.has(column)),
+    ...IDENTITY_BINDING_COLUMNS.filter((column) => available.has(column)),
+  ];
+  if (identityColumnsPresent.length === 0) {
+    return { mode: "legacy", stableEntityColumn: null, bindingColumn: null, missingColumns: [] };
+  }
+  const missingColumns: string[] = IDENTITY_REQUIRED_COLUMNS.filter((column) => !available.has(column));
+  if (!bindingColumn) missingColumns.push("identityBindingId|identityBindingRevision|identityBindingDigest");
+  return {
+    mode: missingColumns.length ? "partial" : "identity-aware",
+    stableEntityColumn,
+    bindingColumn,
+    missingColumns,
+  };
+}
+
 type EntityIntervalReader = Pick<ControllerEntityBindingClient, "listIntervals">;
 
 function normalizeTime(value: string | Date, name: "from" | "to"): string {

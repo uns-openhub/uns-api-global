@@ -29,6 +29,7 @@ import { CaptureService, type CaptureSessionAuditEvent } from "./captures/servic
 import { ControllerEntityBindingClient } from "./entity-binding-client.js";
 import { EntityLastValueCache } from "./entity-last-value-cache.js";
 import {
+  detectEntityStorageSchema,
   mergeEntityHistoryRows,
   parseEntityHistorySelectors,
   planEntityCurrentBindings,
@@ -2155,6 +2156,12 @@ async function handleBatchRange(
         const parsedPath = parseUnsPath(topic);
         const tableSchema = await getTableSchema(questdb, table);
         const tableColumns = tableSchema.columns;
+        const entityStorage = detectEntityStorageSchema(tableColumns);
+        if (queryRequest.entitySelectorIndex !== null && entityStorage.mode === "partial") {
+          throw new Error(
+            `QuestDB table '${table}' has a partial stable identity schema; missing ${entityStorage.missingColumns.join(", ")}.`,
+          );
+        }
         const temporal = resolveTemporalStrategy(tableColumns, timeField);
         let sampling: HistorySamplingInfo;
         let sql: string;
@@ -2268,6 +2275,7 @@ async function handleBatchRange(
             sampling: sampling.mode === "bucketed"
               ? { ...sampling, returnedPoints: result.data?.length ?? 0 }
               : sampling,
+            entityStorage,
             truncated: sampling.mode === "raw" && (result.data?.length ?? 0) >= limit,
             // Keep the QuestDB column names so batch clients can map row arrays.
             raw: {

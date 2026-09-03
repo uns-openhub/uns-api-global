@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  detectEntityStorageSchema,
   mergeEntityHistoryRows,
   planEntityCurrentBindings,
   planEntityHistoryBindings,
@@ -169,4 +170,36 @@ test("resolves current bindings in a narrow window around the requested instant"
   }]);
   assert.equal(plan.selectors[0]?.status, "resolved");
   assert.equal(plan.selectors[0]?.intervals[0]?.topic, "site/line-b/press-14/equipment/main/temperature");
+});
+
+test("distinguishes legacy, identity-aware, and partial QuestDB schemas", () => {
+  assert.deepEqual(detectEntityStorageSchema(["topic", "numberValue", "time"]), {
+    mode: "legacy",
+    stableEntityColumn: null,
+    bindingColumn: null,
+    missingColumns: [],
+  });
+  assert.deepEqual(detectEntityStorageSchema([
+    "topic",
+    "stableEntityId",
+    "identityBindingDigest",
+    "identityResolution",
+    "identityTimeBasis",
+    "time",
+  ]), {
+    mode: "identity-aware",
+    stableEntityColumn: "stableEntityId",
+    bindingColumn: "identityBindingDigest",
+    missingColumns: [],
+  });
+  assert.deepEqual(detectEntityStorageSchema(["topic", "stableEntityId", "time"]), {
+    mode: "partial",
+    stableEntityColumn: "stableEntityId",
+    bindingColumn: null,
+    missingColumns: [
+      "identityResolution",
+      "identityTimeBasis",
+      "identityBindingId|identityBindingRevision|identityBindingDigest",
+    ],
+  });
 });
