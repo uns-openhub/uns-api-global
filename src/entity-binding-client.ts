@@ -16,6 +16,11 @@ export type EntityBindingResolution = {
   digest: string | null;
 };
 
+export type EntityBindingLookup = {
+  topic: string;
+  asOf: string | Date;
+};
+
 export type EntityBindingInterval = {
   topic: string;
   stableEntityId: string;
@@ -61,6 +66,24 @@ export type EntityBindingBatchResult = {
 const RESOLVE_BINDINGS_QUERY = `
   query ResolveEntityObservationBindings($topics: [String!]!, $asOf: Timestamp) {
     ResolveEntityObservationBindings(topics: $topics, asOf: $asOf) {
+      topic
+      asOf
+      status
+      stableEntityId
+      entityTypeKey
+      bindingKind
+      matchedPath
+      timeBasis
+      sourceCount
+      revision
+      digest
+    }
+  }
+`;
+
+const RESOLVE_BINDING_LOOKUPS_QUERY = `
+  query ResolveEntityObservationBindingLookups($lookups: [EntityObservationBindingLookupInput!]!) {
+    ResolveEntityObservationBindingLookups(lookups: $lookups) {
       topic
       asOf
       status
@@ -251,6 +274,41 @@ export class ControllerEntityBindingClient {
   invalidate(): void {
     this.cache.clear();
     this.intervalCache.clear();
+  }
+
+  async resolveLookups(lookups: EntityBindingLookup[]): Promise<EntityBindingResolution[]> {
+    if (lookups.length > MAX_ENTITY_BINDING_TOPICS) {
+      throw new RangeError(`At most ${MAX_ENTITY_BINDING_TOPICS} identity binding lookups may be resolved at once`);
+    }
+    if (lookups.length === 0) return [];
+    const normalized = lookups.map((lookup) => ({
+      topic: normalizeTopic(lookup.topic),
+      asOf: normalizeAsOf(lookup.asOf)!,
+    }));
+    const token = await this.options.tokenProvider.getAccessToken();
+    if (!token) throw new Error("Controller identity binding request requires a service access token");
+    const response = await this.fetchImpl(this.options.graphqlUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        query: RESOLVE_BINDING_LOOKUPS_QUERY,
+        variables: { lookups: normalized },
+      }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    const payload = await response.json() as {
+      data?: { ResolveEntityObservationBindingLookups?: unknown[] | null } | null;
+      errors?: Array<{ message?: string }>;
+    };
+    if (!response.ok || payload.errors?.length) {
+      throw new Error(payload.errors?.[0]?.message ?? `Controller identity binding request failed with HTTP ${response.status}`);
+    }
+    const rows = payload.data?.ResolveEntityObservationBindingLookups;
+    if (!Array.isArray(rows)) throw new Error("Controller temporal identity binding response is missing data");
+    return rows.map(parseResolution).filter((row): row is EntityBindingResolution => row !== null);
   }
 
   async listIntervals(

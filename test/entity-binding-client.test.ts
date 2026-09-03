@@ -122,6 +122,44 @@ test("keeps historical as-of cache entries isolated from current bindings", asyn
   assert.equal(requestBodies.length, 2);
 });
 
+test("resolves a bounded batch of topic and event-time pairs for reconciliation", async () => {
+  let sentLookups: Array<{ topic: string; asOf: string }> = [];
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    sentLookups = (JSON.parse(String(init?.body)).variables as {
+      lookups: Array<{ topic: string; asOf: string }>;
+    }).lookups;
+    return jsonResponse({
+      data: {
+        ResolveEntityObservationBindingLookups: sentLookups.map((lookup) => ({
+          ...resolved(lookup.topic),
+          asOf: lookup.asOf,
+        })),
+      },
+    });
+  };
+  const client = new ControllerEntityBindingClient({
+    graphqlUrl: "http://controller/graphql",
+    tokenProvider: { getAccessToken: async () => "service-token" },
+    fetchImpl,
+  });
+  const result = await client.resolveLookups([
+    { topic: "/site/line-a/press-14/status/", asOf: "2026-09-01T09:59:59Z" },
+    { topic: "site/line-b/press-14/status", asOf: new Date("2026-09-01T10:00:01Z") },
+  ]);
+
+  assert.deepEqual(sentLookups, [
+    { topic: "site/line-a/press-14/status", asOf: "2026-09-01T09:59:59.000Z" },
+    { topic: "site/line-b/press-14/status", asOf: "2026-09-01T10:00:01.000Z" },
+  ]);
+  assert.deepEqual(result.map((entry) => [entry.topic, entry.asOf]), sentLookups.map((entry) => [entry.topic, entry.asOf]));
+  await assert.rejects(
+    () => client.resolveLookups(Array.from({ length: 201 }, (_, index) => ({
+      topic: `site/asset-${index}/value`, asOf: "2026-09-01T10:00:00Z",
+    }))),
+    /At most 200/,
+  );
+});
+
 test("lists and caches exact entity binding intervals for a bounded history window", async () => {
   let now = 1_000;
   const requestBodies: string[] = [];
