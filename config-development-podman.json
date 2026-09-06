@@ -23,10 +23,7 @@
   "questdb": {
     "url": "http://questdb:9000",
     "username": "admin",
-    "password": {
-      "provider": "env",
-      "key": "QUESTDB_PASSWORD"
-    },
+    "password": "quest",
     "defaultLimit": 500,
     "maxLimit": 2000,
     "defaultLookbackHours": 24,
@@ -38,7 +35,7 @@
   },
   "dataSources": [
     {
-      "topic": "enterprise/#",
+      "topic": "forge-group/#",
       "history": true,
       "cache": true
     }
