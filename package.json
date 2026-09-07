@@ -1,6 +1,6 @@
 {
   "name": "uns-api-global",
-  "version": "4.1.9",
+  "version": "4.1.10",
   "private": true,
   "description": "Authenticated REST API for current and historical Unified Namespace data",
   "license": "MIT",
@@ -37,7 +37,8 @@
     "generate-codegen": "graphql-code-generator --require dotenv/config --config codegen.ts",
     "sync-uns-schema": "node ./node_modules/@uns-kit/core/dist/tools/sync-uns-schema.js",
     "sync-uns-metadata": "node ./node_modules/@uns-kit/core/dist/tools/sync-uns-metadata.js",
-    "test:catchall:local": "node scripts/test-catchall-local.mjs"
+    "test:catchall:local": "node scripts/test-catchall-local.mjs",
+    "identity:reconciliation-plan": "tsx src/local-tools/identity-reconciliation-plan.ts"
   },
   "dependencies": {
     "@uns-kit/api": "^3.0.16",

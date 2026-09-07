@@ -26,19 +26,34 @@ import { TriggerService } from "./triggers/service.js";
 import { CaptureRegistry } from "./captures/registry.js";
 import { CapturePublisher } from "./captures/publisher.js";
 import { CaptureService, type CaptureSessionAuditEvent } from "./captures/service.js";
+import { ControllerEntityBindingClient } from "./entity-binding-client.js";
+import { EntityLastValueCache } from "./entity-last-value-cache.js";
+import {
+  assessEntityPlanAccess,
+  detectEntityStorageSchema,
+  mergeEntityBucketRows,
+  mergeEntityHistoryRows,
+  parseEntityHistorySelectors,
+  planEntityCurrentBindings,
+  planEntityHistoryBindings,
+  type EntityHistorySelector,
+} from "./entity-query-planner.js";
 import jwt from "jsonwebtoken";
 import type { Algorithm } from "jsonwebtoken";
 import { createPublicKey, randomUUID } from "node:crypto";
 import { request, gql } from "graphql-request";
 import {
   buildBoundaryCounterDeltaResponse,
+  buildEntityBucketPartialSql,
+  buildEntityDataSql,
+  buildEntitySourceSql,
   computeCounterDeltaValue,
   counterBoundarySourceRange,
   isTopicAllowedByAccessRules,
   resolvePointTimeColumn as resolvePointTimeColumnFromSchema,
 } from "./catchall-helpers.js";
 
-type TimeRange = { from?: string; to?: string; note?: string };
+type TimeRange = { from?: string; to?: string; note?: string; toExclusive?: boolean };
 type TimeFieldPreference = "auto" | "timestamp" | "interval";
 type QuestDbConfig = Omit<ProjectExtras["questdb"], "url" | "username" | "password"> & {
   url: string;
@@ -138,6 +153,12 @@ const controllerTokenProvider = new ServiceTokenProvider({
 });
 const controllerClient = controllerRestUrl
   ? new UnsClient(controllerRestUrl, { tokenProvider: controllerTokenProvider })
+  : null;
+const entityBindingClient = controllerGraphqlUrl
+  ? new ControllerEntityBindingClient({
+      graphqlUrl: controllerGraphqlUrl,
+      tokenProvider: controllerTokenProvider,
+    })
   : null;
 const infraChannel = resolveMqttChannel(config.infra as MqttChannelConfig);
 const inputChannel = resolveMqttChannel(config.infra as MqttChannelConfig, config.input as MqttChannelConfig | undefined);
@@ -396,10 +417,11 @@ const swaggerDoc = {
     },
     [`${apiBasePath}/batch/last`]: {
       post: {
-        summary: "Batch last values — current/latest value for multiple topics from in-memory cache",
+        summary: "Batch last values — current/latest value for topics or stable entities",
         description:
-          "Returns the most recent known value per topic from the MQTT last-value cache " +
+          "Returns the most recent known value per topic or stable entity attribute from the MQTT last-value cache " +
           "(seeded from QuestDB on startup), with bounded QuestDB latest-row fallback on cache misses. " +
+          "Entity selectors resolve their current authorized topic binding before data access. " +
           "Ideal for dashboards, asset snapshot views, and status panels. " +
           "Internally calls POST /api/catchall/batch with mode=last.",
         tags: [catchAll.swaggerTag ?? "CatchAll"],
@@ -409,12 +431,28 @@ const swaggerDoc = {
             "application/json": {
               schema: {
                 type: "object",
-                required: ["topics"],
+                anyOf: [
+                  { required: ["topics"] },
+                  { required: ["entitySelectors"] },
+                ],
                 properties: {
                   topics: {
                     type: "array",
                     items: { type: "string" },
                     description: "Full attribute topic paths (max 500)",
+                  },
+                  entitySelectors: {
+                    type: "array",
+                    maxItems: 50,
+                    description: "Stable Asset identity plus a concrete attribute path relative to that Asset.",
+                    items: {
+                      type: "object",
+                      required: ["stableEntityId", "attributePath"],
+                      properties: {
+                        stableEntityId: { type: "string", format: "uuid" },
+                        attributePath: { type: "string", example: "equipment/main/temperature" },
+                      },
+                    },
                   },
                   transform: {
                     type: "string",
@@ -429,10 +467,10 @@ const swaggerDoc = {
                 },
               },
               example: {
-                topics: [
-                  "enterprise/site/area/heat-treatment-line/equipment/zone-1/temperature",
-                  "enterprise/site/area/heat-treatment-line/equipment/zone-1/status",
-                ],
+                entitySelectors: [{
+                  stableEntityId: "11111111-1111-4111-8111-111111111111",
+                  attributePath: "equipment/main/temperature",
+                }],
               },
             },
           },
@@ -477,6 +515,24 @@ const swaggerDoc = {
                         },
                       },
                     },
+                    entityResults: {
+                      type: "array",
+                      description: "Identity-addressed results with the selected physical topic and binding revision.",
+                      items: {
+                        type: "object",
+                        properties: {
+                          stableEntityId: { type: "string", format: "uuid" },
+                          attributePath: { type: "string" },
+                          status: { type: "string", enum: ["resolved", "not-found"] },
+                          topic: { type: "string", nullable: true },
+                          bindingRevision: { type: "string", nullable: true },
+                          value: { nullable: true },
+                          values: { type: "object", nullable: true },
+                          timestamp: { type: "string", nullable: true },
+                          source: { type: "string", enum: ["cache", "questdb", "miss"] },
+                        },
+                      },
+                    },
                     stats: {
                       type: "object",
                       properties: {
@@ -512,12 +568,34 @@ const swaggerDoc = {
             "application/json": {
               schema: {
                 type: "object",
-                required: ["topics"],
+                anyOf: [
+                  { required: ["topics"] },
+                  { required: ["entitySelectors"] },
+                ],
                 properties: {
                   topics: {
                     type: "array",
                     items: { type: "string" },
                     description: "Full attribute topic paths (max 500)",
+                  },
+                  entitySelectors: {
+                    type: "array",
+                    maxItems: 50,
+                    description:
+                      "Stable Asset identity plus a concrete attribute path relative to that Asset. " +
+                      "Raw and sampled history are resolved over every authorized historical topic interval. " +
+                      "Sampled aggregates are merged across binding changes without treating a moved path as a new series.",
+                    items: {
+                      type: "object",
+                      required: ["stableEntityId", "attributePath"],
+                      properties: {
+                        stableEntityId: { type: "string", format: "uuid" },
+                        attributePath: {
+                          type: "string",
+                          example: "equipment/main/temperature",
+                        },
+                      },
+                    },
                   },
                   from: { type: "string", description: `ISO start time (default: last ${questdb.defaultLookbackHours}h)` },
                   to: { type: "string", description: "ISO end time (default: now)" },
@@ -545,9 +623,11 @@ const swaggerDoc = {
                 },
               },
               example: {
-                topics: [
-                  "enterprise/site/area/heat-treatment-line/equipment/zone-1/temperature",
-                  "enterprise/site/area/heat-treatment-line/equipment/zone-2/temperature",
+                entitySelectors: [
+                  {
+                    stableEntityId: "11111111-1111-4111-8111-111111111111",
+                    attributePath: "equipment/main/temperature",
+                  },
                 ],
                 from: "2026-04-09T06:00:00Z",
                 to: "2026-04-09T07:00:00Z",
@@ -991,6 +1071,7 @@ type LastValueEntry = {
 };
 
 const lastValueMap = new Map<string, LastValueEntry>();
+const entityLastValueMap = new EntityLastValueCache<LastValueEntry>();
 let lvMqttInput: UnsMqttProxy | undefined;
 let lvActiveTopics: string[] = [];
 let triggerService: TriggerService | undefined;
@@ -1080,26 +1161,30 @@ function updateLastValue(topic: string, mqttMessage: string): void {
     if (data) {
       // Data attribute → single value stored as { value: X }
       const timestamp = data.time ?? new Date().toISOString();
-      lastValueMap.set(topic, {
+      const entry: LastValueEntry = {
         values: { value: data.value ?? null },
         uom: data.uom ?? null,
         timestamp,
         receivedAt: Date.now(),
         dataGroup: data.dataGroup ?? null,
         counter: buildCounterCacheState(topic, data.value ?? null, timestamp),
-      });
+      };
+      lastValueMap.set(topic, entry);
+      entityLastValueMap.updateTopic(topic, entry);
     } else if (table) {
       // Table attribute → multi-column values stored as { col1: X, col2: Y, ... }.
       // UnsPacket normalizes legacy arrays to the canonical named object first.
       const columns = tableColumnsToLastValues(table.columns);
       if (Object.keys(columns).length > 0) {
-        lastValueMap.set(topic, {
+        const entry: LastValueEntry = {
           values: columns,
           uom: null,
           timestamp: table.time ?? new Date().toISOString(),
           receivedAt: Date.now(),
           dataGroup: table.dataGroup ?? null,
-        });
+        };
+        lastValueMap.set(topic, entry);
+        entityLastValueMap.updateTopic(topic, entry);
       }
     }
   } catch {
@@ -1557,15 +1642,22 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
   // Parse body
   const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
   const topics: string[] = Array.isArray(body?.topics) ? body.topics.map((t: unknown) => String(t).trim()).filter(Boolean) : [];
+  let entitySelectors: EntityHistorySelector[];
+  try {
+    entitySelectors = parseEntityHistorySelectors(body?.entitySelectors);
+  } catch (error) {
+    throw new HttpError(400, error instanceof Error ? error.message : "Invalid entitySelectors");
+  }
 
-  if (topics.length === 0) {
-    throw new HttpError(400, "Request body must contain a non-empty 'topics' array.");
+  if (topics.length === 0 && entitySelectors.length === 0) {
+    throw new HttpError(400, "Request body must contain non-empty 'topics' or 'entitySelectors'.");
   }
   if (topics.length > 500) {
     throw new HttpError(400, "Maximum 500 topics per batch request.");
   }
 
-  await validateCatchAllAccessForTopics(req, topics, catchAllAuth);
+  const accessRules = await resolveCatchAllAccessRules(req, catchAllAuth);
+  for (const topic of topics) validateCatchAllTopicAccess(topic, accessRules);
 
   const mode = resolveBatchMode(req, body);
   if (mode !== "last" && mode !== "range") {
@@ -1575,9 +1667,9 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
   if (mode === "last") {
     const transform = parseHistoryTransformMode(body?.transform);
     const counterResetPolicy = parseCounterResetPolicy(body?.counterResetPolicy ?? body?.resetPolicy);
-    await handleBatchLast(topics, res, { transform, counterResetPolicy });
+    await handleBatchLast(topics, entitySelectors, res, { transform, counterResetPolicy }, accessRules);
   } else {
-    await handleBatchRange(topics, body, res);
+    await handleBatchRange(topics, entitySelectors, body, res, accessRules);
   }
 }
 
@@ -1777,7 +1869,7 @@ async function tryQuestDbLastRowFallback(
   }
 }
 
-async function handleBatchLast(topics: string[], res: any, options: BatchLastOptions): Promise<void> {
+async function resolveBatchLastResults(topics: string[], options: BatchLastOptions): Promise<BatchLastResult[]> {
   const now = Date.now();
 
   // First pass: serve everything from the in-memory cache and collect misses.
@@ -1828,25 +1920,137 @@ async function handleBatchLast(topics: string[], res: any, options: BatchLastOpt
       if (!fallback) return;
       const { entry, sql } = fallback;
       lastValueMap.set(topic, entry);
+      entityLastValueMap.updateTopic(topic, entry);
       const hitNow = Date.now();
       results[idx] = buildBatchLastResult(topic, entry, "questdb", sql, hitNow, options);
     }));
   }
 
+  return results;
+}
+
+async function handleBatchLast(
+  topics: string[],
+  entitySelectors: EntityHistorySelector[],
+  res: any,
+  options: BatchLastOptions,
+  accessRules: string[],
+): Promise<void> {
+  if (entitySelectors.length && options.transform === "delta") {
+    throw new HttpError(400, "entitySelectors do not support transform=delta until cross-binding boundary calculation is enabled.");
+  }
+  if (entitySelectors.length && !entityBindingClient) {
+    throw new HttpError(503, "Entity last values require a configured controller GraphQL endpoint.");
+  }
+
+  let entityPlan: Awaited<ReturnType<typeof planEntityCurrentBindings>> | null = null;
+  if (entitySelectors.length) {
+    try {
+      entityPlan = await planEntityCurrentBindings(entityBindingClient!, entitySelectors);
+    } catch (error) {
+      throw new HttpError(503, `Entity binding resolution failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const accessFailure = assessEntityPlanAccess(
+      entityPlan,
+      (topic) => isTopicAllowedByAccessRules(topic, accessRules),
+      (topic) => isHistoryAllowed(dataSources, topic),
+    );
+    if (accessFailure === "path-access-denied") {
+      throw new HttpError(403, "An entity binding is outside the caller's topic access rules.");
+    }
+    if (accessFailure === "data-source-disabled") {
+      throw new HttpError(403, "An entity binding is not configured for data queries in dataSources.");
+    }
+    for (const selector of entityPlan.selectors) {
+      entityLastValueMap.replaceBindings(selector, selector.intervals.map((interval) => ({
+        topic: interval.topic,
+        bindingRevision: interval.bindingRevision,
+        bindingDigest: interval.bindingDigest,
+      })));
+    }
+  }
+
+  const entityTopics = Array.from(new Set(
+    entityPlan?.selectors.flatMap((selector) => selector.intervals.map((interval) => interval.topic)) ?? [],
+  ));
+  const allResults = await resolveBatchLastResults([...topics, ...entityTopics], options);
+  const topicResults = allResults.slice(0, topics.length);
+  const entityTopicResults = new Map(
+    allResults.slice(topics.length).map((result) => [result.topic, result]),
+  );
+  for (const topic of entityTopics) {
+    const entry = lastValueMap.get(topic);
+    if (entry) entityLastValueMap.updateTopic(topic, entry);
+  }
+  const entityResults = (entityPlan?.selectors ?? []).map((selector) => {
+    const candidates = selector.intervals.map((interval) => ({
+      interval,
+      result: entityTopicResults.get(interval.topic),
+    }));
+    const cached = entityLastValueMap.get(selector);
+    const selected = cached
+      ? candidates.find((candidate) =>
+          candidate.interval.topic === cached.topic
+          && candidate.interval.bindingRevision === cached.bindingRevision
+          && candidate.interval.bindingDigest === cached.bindingDigest)
+      : undefined;
+    const selectedResult = selected?.result?.timestamp
+      ? selected.result
+      : cached
+        ? buildBatchLastResult(cached.topic, cached.value, "cache", null, Date.now(), options)
+        : undefined;
+    return {
+      stableEntityId: selector.stableEntityId,
+      attributePath: selector.attributePath,
+      status: selector.status,
+      error: null,
+      topic: selected?.interval.topic ?? null,
+      bindingRevision: selected?.interval.bindingRevision ?? null,
+      bindingDigest: selected?.interval.bindingDigest ?? null,
+      value: selectedResult?.value ?? null,
+      values: selectedResult?.values ?? null,
+      uom: selectedResult?.uom ?? null,
+      timestamp: selectedResult?.timestamp ?? null,
+      dataGroup: selectedResult?.dataGroup ?? null,
+      ageMs: selectedResult?.ageMs ?? null,
+      source: selectedResult?.source ?? "miss",
+      sql: selectedResult?.sql ?? null,
+      candidateTopics: candidates.map((candidate) => ({
+        topic: candidate.interval.topic,
+        bindingRevision: candidate.interval.bindingRevision,
+        bindingDigest: candidate.interval.bindingDigest,
+        source: candidate.result?.source ?? "miss",
+        timestamp: candidate.result?.timestamp ?? null,
+      })),
+    };
+  });
+
   res.status(200).json({
-    results,
+    results: topicResults,
+    entityResults,
     stats: {
       requested: topics.length,
-      hits: results.filter(r => r.source === "cache").length,
-      questdbHits: results.filter(r => r.source === "questdb").length,
-      misses: results.filter(r => r.source === "miss").length,
+      requestedEntities: entitySelectors.length,
+      hits: topicResults.filter(r => r.source === "cache").length,
+      questdbHits: topicResults.filter(r => r.source === "questdb").length,
+      misses: topicResults.filter(r => r.source === "miss").length,
+      entityHits: entityResults.filter(r => r.source !== "miss").length,
+      entityMisses: entityResults.filter(r => r.source === "miss").length,
+      bindingSource: entityPlan?.bindingSource ?? null,
       cacheSize: lastValueMap.size,
+      entityCacheSize: entityLastValueMap.size,
       transform: options.transform,
     },
   });
 }
 
-async function handleBatchRange(topics: string[], body: any, res: any): Promise<void> {
+async function handleBatchRange(
+  topics: string[],
+  entitySelectors: EntityHistorySelector[],
+  body: any,
+  res: any,
+  accessRules: string[],
+): Promise<void> {
   const limit = clampLimit(body?.limit, questdb.defaultLimit, questdb.maxLimit);
   const summaryOnly = toBoolean(body?.summaryOnly ?? false);
   const transform = parseHistoryTransformMode(body?.transform);
@@ -1861,6 +2065,12 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
   const aggregate = parseAggregateMode(body?.aggregate) ?? DEFAULT_BUCKET_AGGREGATE;
   const requestedMetricColumn = parseOptionalColumnParam(body?.column ?? body?.metricColumn, "column");
   const sampledRequested = !summaryOnly && (requestedMaxPoints !== null || requestedBucketMs !== null);
+  if (entitySelectors.length && summaryOnly) {
+    throw new HttpError(400, "entitySelectors do not support summaryOnly until cross-binding aggregation is enabled.");
+  }
+  if (entitySelectors.length && transform === "delta") {
+    throw new HttpError(400, "entitySelectors do not support transform=delta until cross-binding boundary calculation is enabled.");
+  }
   if (
     sampledRequested &&
     requestedMaxPoints !== null &&
@@ -1869,7 +2079,7 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
   ) {
     throw new HttpError(400, "Body field maxPoints requires explicit from and to timestamps.");
   }
-  const range = normalizeRange(
+  const requestedRange = normalizeRange(
     body?.from,
     body?.to,
     questdb,
@@ -1883,6 +2093,52 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
     }
   }
 
+  if (entitySelectors.length && !entityBindingClient) {
+    throw new HttpError(503, "Entity history requires a configured controller GraphQL endpoint.");
+  }
+  let entityPlan: Awaited<ReturnType<typeof planEntityHistoryBindings>> | null = null;
+  if (entitySelectors.length) {
+    try {
+      entityPlan = await planEntityHistoryBindings(entityBindingClient!, entitySelectors, {
+        from: requestedRange.from!,
+        to: requestedRange.to!,
+      });
+    } catch (error) {
+      throw new HttpError(503, `Entity binding resolution failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const accessFailure = assessEntityPlanAccess(
+      entityPlan,
+      (topic) => isTopicAllowedByAccessRules(topic, accessRules),
+      (topic) => isHistoryAllowed(dataSources, topic),
+    );
+    if (accessFailure === "path-access-denied") {
+      throw new HttpError(403, "An entity binding is outside the caller's topic access rules.");
+    }
+    if (accessFailure === "data-source-disabled") {
+      throw new HttpError(403, "An entity binding is not configured for history queries in dataSources.");
+    }
+  }
+
+  const queryRequests = [
+    ...topics.map((topic) => ({
+      topic,
+      range: requestedRange,
+      entitySelectorIndex: null as number | null,
+      bindingRevision: null as string | null,
+      bindingDigest: null as string | null,
+      crossBindingSample: false,
+    })),
+    ...(entityPlan?.selectors.flatMap((selector, entitySelectorIndex) =>
+      selector.intervals.map((interval) => ({
+        topic: interval.topic,
+        range: { from: interval.from, to: interval.to, toExclusive: interval.toExclusive },
+        entitySelectorIndex,
+        bindingRevision: interval.bindingRevision,
+        bindingDigest: interval.bindingDigest,
+        crossBindingSample: sampledRequested && selector.intervals.length > 1,
+      }))) ?? []),
+  ];
+
   // Resolve tables + run queries in parallel.  Each result carries the
   // full multi-line QuestDB SQL that was executed (`sql` field) so the
   // controller can surface it in the Explore dialog's "Show SQL" flow.
@@ -1891,19 +2147,34 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
   // wire — pasting into the QuestDB Web Console is the target use case,
   // and the multi-line form is drastically easier to read.
   const results = await Promise.all(
-    topics.map(async (topic) => {
+    queryRequests.map(async (queryRequest) => {
+      const { topic, range } = queryRequest;
       try {
         const tableFromDataSource = resolveTablePrefix(dataSources, topic);
         const table =
           tableFromDataSource ||
           (await resolveTableFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider }));
         if (!table) {
-          return { topic, error: "No QuestDB table mapping found.", data: null, sql: null, stats: null };
+          return {
+            ...queryRequest,
+            topic,
+            error: "No QuestDB table mapping found.",
+            data: null,
+            columns: null,
+            sql: null,
+            stats: null,
+          };
         }
 
         const parsedPath = parseUnsPath(topic);
         const tableSchema = await getTableSchema(questdb, table);
         const tableColumns = tableSchema.columns;
+        const entityStorage = detectEntityStorageSchema(tableColumns);
+        if (queryRequest.entitySelectorIndex !== null && entityStorage.mode === "partial") {
+          throw new Error(
+            `QuestDB table '${table}' has a partial stable identity schema; missing ${entityStorage.missingColumns.join(", ")}.`,
+          );
+        }
         const temporal = resolveTemporalStrategy(tableColumns, timeField);
         let sampling: HistorySamplingInfo;
         let sql: string;
@@ -1913,7 +2184,8 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
         } else if (sampledRequested) {
           const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
           const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
-          const bucketMs = requestedBucketMs ?? deriveBucketMs(range, requestedMaxPoints!);
+          const bucketRange = queryRequest.crossBindingSample ? requestedRange : range;
+          const bucketMs = requestedBucketMs ?? deriveBucketMs(bucketRange, requestedMaxPoints!);
           const bucketAggregate: AggregateMode = transform === "delta" ? "sum" : aggregate;
           sampling = {
             mode: "bucketed",
@@ -1937,16 +2209,32 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
               [metricColumn, ...(unitColumn ? [unitColumn] : [])],
             );
           } else {
-            const sourceSql = buildSourceSql(
-              table,
-              parsedPath,
-              range,
-              dedupeRequested,
-              tableColumns,
-              temporal,
-              [metricColumn, ...(unitColumn ? [unitColumn] : [])],
-            );
-            sql = buildBucketSql(sourceSql, temporal, metricColumn, unitColumn, aggregate, bucketMs, requestedMetricColumn);
+            const entitySelector = queryRequest.entitySelectorIndex === null
+              ? null
+              : entityPlan?.selectors[queryRequest.entitySelectorIndex] ?? null;
+            const sourceSql = entityStorage.mode === "identity-aware" && entitySelector
+              ? buildEntitySourceSql(
+                  table,
+                  entitySelector.stableEntityId,
+                  parsedPath,
+                  range,
+                  dedupeRequested,
+                  tableSchema,
+                  temporal,
+                  [metricColumn, ...(unitColumn ? [unitColumn] : [])],
+                )
+              : buildSourceSql(
+                  table,
+                  parsedPath,
+                  range,
+                  dedupeRequested,
+                  tableColumns,
+                  temporal,
+                  [metricColumn, ...(unitColumn ? [unitColumn] : [])],
+                );
+            sql = queryRequest.crossBindingSample
+              ? buildEntityBucketPartialSql(sourceSql, temporal, metricColumn, unitColumn, bucketMs)
+              : buildBucketSql(sourceSql, temporal, metricColumn, unitColumn, aggregate, bucketMs, requestedMetricColumn);
           }
         } else {
           if (transform === "delta") {
@@ -1973,7 +2261,21 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
             sql = buildCounterDeltaRawSql(deltaSourceSql, limit);
           } else {
             sampling = { mode: "raw", transform };
-            sql = buildDataSql(table, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
+            const entitySelector = queryRequest.entitySelectorIndex === null
+              ? null
+              : entityPlan?.selectors[queryRequest.entitySelectorIndex] ?? null;
+            sql = entityStorage.mode === "identity-aware" && entitySelector
+              ? buildEntityDataSql(
+                  table,
+                  entitySelector.stableEntityId,
+                  parsedPath,
+                  range,
+                  limit,
+                  dedupeRequested,
+                  tableSchema,
+                  temporal,
+                )
+              : buildDataSql(table, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
           }
         }
 
@@ -1992,12 +2294,23 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
             )
           : rawResult;
         const scanRowCount = extractScanRowCount(result.raw);
+        if (scanRowCount !== null && scanRowCount > questdb.maxScanRows) {
+          throw new HttpError(
+            413,
+            `Query scan cost exceeded maxScanRows (${questdb.maxScanRows}). Narrow path/time-range or reduce requested scope.`,
+          );
+        }
 
         return {
+          ...queryRequest,
           topic,
           error: null,
           data: result.data,
-          columns: sampling.mode === "raw" ? buildDataColumnList(tableColumns) : null,
+          columns: Array.isArray(result.raw["columns"])
+            ? (result.raw["columns"] as Array<{ name?: unknown }>)
+                .map((column) => typeof column?.name === "string" ? column.name : "")
+                .filter(Boolean)
+            : sampling.mode === "raw" ? buildDataColumnList(tableColumns) : [],
           sql,
           stats: {
             table,
@@ -2012,6 +2325,7 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
             sampling: sampling.mode === "bucketed"
               ? { ...sampling, returnedPoints: result.data?.length ?? 0 }
               : sampling,
+            entityStorage,
             truncated: sampling.mode === "raw" && (result.data?.length ?? 0) >= limit,
             // Keep the QuestDB column names so batch clients can map row arrays.
             raw: {
@@ -2023,23 +2337,95 @@ async function handleBatchRange(topics: string[], body: any, res: any): Promise<
         };
       } catch (err) {
         const message = err instanceof HttpError ? err.message : (err instanceof Error ? err.message : String(err));
-        return { topic, error: message, data: null, sql: null, stats: null };
+        return { ...queryRequest, topic, error: message, data: null, columns: null, sql: null, stats: null };
       }
     }),
   );
 
-  res.status(200).json({
-    results,
+  const topicResults = results
+    .filter((result) => result.entitySelectorIndex === null)
+    .map(({ entitySelectorIndex: _selector, bindingRevision: _revision, bindingDigest: _digest, range: _range, ...result }) => result);
+  const entityResults = (entityPlan?.selectors ?? []).map((selector, selectorIndex) => {
+    const segments = results.filter((result) => result.entitySelectorIndex === selectorIndex);
+    const failed = segments.find((segment) => segment.error !== null);
+    const successful = segments.filter((segment) => segment.error === null && Array.isArray(segment.data));
+    let merged: ReturnType<typeof mergeEntityHistoryRows> = { columns: [], rows: [], duplicatesRemoved: 0 };
+    let mergeError: string | null = null;
+    if (!failed) {
+      try {
+        const mergeSegments = successful.map((segment) => ({
+          columns: segment.columns ?? [],
+          rows: segment.data as unknown[][],
+        }));
+        if (sampledRequested && selector.intervals.length > 1) {
+          merged = mergeEntityBucketRows(
+            mergeSegments,
+            aggregate,
+            requestedMetricColumn,
+            successful.some((segment) =>
+              segment.stats?.sampling.mode === "bucketed"
+              && segment.stats.sampling.unitColumn !== null),
+          );
+        } else if (sampledRequested && successful.length === 1) {
+          merged = {
+            columns: [...(successful[0]!.columns ?? [])],
+            rows: [...(successful[0]!.data as unknown[][])],
+            duplicatesRemoved: 0,
+          };
+        } else {
+          merged = mergeEntityHistoryRows(mergeSegments, limit);
+        }
+      } catch (error) {
+        mergeError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    return {
+      stableEntityId: selector.stableEntityId,
+      attributePath: selector.attributePath,
+      status: selector.status,
+      error: failed?.error ?? mergeError,
+      data: failed || mergeError ? null : merged.rows,
+      columns: failed || mergeError ? null : merged.columns,
+      duplicatesRemoved: merged.duplicatesRemoved,
+      segments: segments.map((segment) => ({
+        topic: segment.topic,
+        from: segment.range.from,
+        to: segment.range.to,
+        bindingRevision: segment.bindingRevision,
+        bindingDigest: segment.bindingDigest,
+        toExclusive: segment.range.toExclusive === true,
+        error: segment.error,
+        sql: segment.sql,
+        rowCount: Array.isArray(segment.data) ? segment.data.length : 0,
+      })),
+    };
+  });
+
+  const payload = {
+    results: topicResults,
+    entityResults,
     stats: {
       requested: topics.length,
-      succeeded: results.filter(r => r.error === null).length,
-      failed: results.filter(r => r.error !== null).length,
-      from: range.from,
-      to: range.to,
+      requestedEntities: entitySelectors.length,
+      succeeded: topicResults.filter(r => r.error === null).length,
+      failed: topicResults.filter(r => r.error !== null).length,
+      succeededEntities: entityResults.filter(r => r.error === null && r.status === "resolved").length,
+      failedEntities: entityResults.filter(r => r.error !== null).length,
+      unresolvedEntities: entityResults.filter(r => r.status === "not-found").length,
+      bindingSource: entityPlan?.bindingSource ?? null,
+      from: requestedRange.from,
+      to: requestedRange.to,
       transform,
       counterResetPolicy: transform === "delta" ? counterResetPolicy : undefined,
     },
-  });
+  };
+  if (Buffer.byteLength(JSON.stringify(payload), "utf8") > questdb.maxResponseBytes) {
+    throw new HttpError(
+      413,
+      `Response exceeds maxResponseBytes (${questdb.maxResponseBytes}). Reduce limit, selectors, or time-range.`,
+    );
+  }
+  res.status(200).json(payload);
 }
 
 // Start last-value cache (non-blocking — errors logged, not thrown)
@@ -2681,7 +3067,8 @@ function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: TemporalStra
     parts.push(`${quoteIdentifier(temporal.toColumn)} >= ${escapeLiteral(range.from)}`);
   }
   if (range.to) {
-    parts.push(`${quoteIdentifier(temporal.fromColumn)} <= ${escapeLiteral(range.to)}`);
+    const operator = range.toExclusive ? "<" : "<=";
+    parts.push(`${quoteIdentifier(temporal.fromColumn)} ${operator} ${escapeLiteral(range.to)}`);
   }
   return parts.join(" AND ");
 }
