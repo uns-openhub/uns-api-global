@@ -38,6 +38,7 @@
     "sync-uns-schema": "node ./node_modules/@uns-kit/core/dist/tools/sync-uns-schema.js",
     "sync-uns-metadata": "node ./node_modules/@uns-kit/core/dist/tools/sync-uns-metadata.js",
     "test:catchall:local": "node scripts/test-catchall-local.mjs",
+    "test:identity-writer-rollback:local": "pnpm run build && node scripts/test-identity-writer-rollback-local.mjs",
     "identity:reconciliation-plan": "tsx src/local-tools/identity-reconciliation-plan.ts"
   },
   "dependencies": {
