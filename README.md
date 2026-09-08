@@ -134,6 +134,21 @@ CATCHALL_TEST_TOPICS='enterprise/site/area/line/motor-1/equipment/main/current,e
 pnpm run test:catchall:local
 ```
 
+The identity-writer rollback smoke needs only a disposable local QuestDB. It
+writes one identity-enriched row, then emulates the previous Archiver writer by
+writing a second row without optional identity columns. The current dual reader
+must return both rows through their half-open binding intervals. The temporary
+table is removed whether the smoke passes or fails.
+
+```bash
+QUESTDB_ROLLBACK_TEST_URL=http://localhost:9000 \
+pnpm run test:identity-writer-rollback:local
+```
+
+Set `QUESTDB_ROLLBACK_TEST_USERNAME` and `QUESTDB_ROLLBACK_TEST_PASSWORD` when
+the disposable QuestDB requires Basic authentication. This smoke is intentionally
+not part of `pnpm run verify`, because it performs short-lived database writes.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and
 [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 
