@@ -6,6 +6,7 @@
 // explicit on-change driver topics.
 
 import { logger } from "@uns-kit/core";
+import { ControllerRegistryHealth, type RegistryRefreshOptions, type RegistryHealth } from "../controller-registry-health.js";
 import type {
   CaptureConfig,
   CaptureCondition,
@@ -41,13 +42,14 @@ const STORAGE_DATA_GROUP_RE = /^[a-z0-9_.-]{1,60}$/;
 export type CaptureRegistryRefreshEvent = {
   previous: ReadonlyMap<string, CaptureDefinition>;
   current: ReadonlyMap<string, CaptureDefinition>;
+  reason?: string;
 };
 
 export type CaptureRegistryRefreshListener = (
   event: CaptureRegistryRefreshEvent,
 ) => void | Promise<void>;
 
-export type CaptureRegistryDeps = {
+export type CaptureRegistryDeps = RegistryRefreshOptions & {
   controllerRestUrl: string;
   getAccessToken: () => Promise<string | null>;
   refreshIntervalMs: number;
@@ -63,9 +65,13 @@ export class CaptureRegistry {
   private refreshListeners: Set<CaptureRegistryRefreshListener> = new Set();
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private started = false;
+  private generation = 0;
+  private refreshPromise: Promise<void> | null = null;
+  private readonly health: ControllerRegistryHealth;
 
   constructor(deps: CaptureRegistryDeps) {
     this.deps = deps;
+    this.health = new ControllerRegistryHealth("captures-registry", "Capture definitions", deps);
     this.fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
@@ -73,6 +79,7 @@ export class CaptureRegistry {
     if (this.started) return;
     this.started = true;
     await this.refresh();
+    if (!this.started) return;
     this.refreshTimer = setInterval(() => {
       this.refresh().catch((err) => {
         logger.warn(`[captures] background refresh failed: ${stringifyError(err)}`);
@@ -89,9 +96,16 @@ export class CaptureRegistry {
       this.refreshTimer = null;
     }
     this.started = false;
+    this.generation++;
+    this.refreshPromise = null;
+    this.health.authorizationFailure();
+    this.byId.clear();
+    this.byTopic.clear();
+    this.byTriggerId.clear();
   }
 
   getCapturesForTopic(topic: string): CaptureDefinition[] {
+    if (!this.executionAllowed()) return [];
     const ids = this.byTopic.get(topic);
     if (!ids || ids.size === 0) return [];
     const out: CaptureDefinition[] = [];
@@ -103,6 +117,7 @@ export class CaptureRegistry {
   }
 
   getCapturesForTrigger(triggerId: string): CaptureDefinition[] {
+    if (!this.executionAllowed()) return [];
     const ids = this.byTriggerId.get(triggerId);
     if (!ids || ids.size === 0) return [];
     const out: CaptureDefinition[] = [];
@@ -114,10 +129,12 @@ export class CaptureRegistry {
   }
 
   list(): CaptureDefinition[] {
+    if (!this.executionAllowed()) return [];
     return Array.from(this.byId.values());
   }
 
   size(): number {
+    if (!this.executionAllowed()) return 0;
     return this.byId.size;
   }
 
@@ -128,51 +145,67 @@ export class CaptureRegistry {
     };
   }
 
-  async refresh(): Promise<void> {
-    const url = `${this.deps.controllerRestUrl.replace(/\/+$/, "")}/captures`;
-    let token: string | null = null;
-    try {
-      token = await this.deps.getAccessToken();
-    } catch (err) {
-      logger.warn(`[captures] could not get access token: ${stringifyError(err)}`);
-      return;
-    }
-    if (!token) {
-      logger.warn("[captures] no access token available; skipping refresh");
-      return;
-    }
+  getHealth(): RegistryHealth { this.executionAllowed(); return this.health.get(); }
 
-    let payload: CaptureApiResponse;
-    try {
-      const response = await this.fetchImpl(url, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/json",
-        },
-      });
-      if (!response.ok) {
-        logger.warn(
-          `[captures] controller responded ${response.status} for GET /api/captures; keeping existing registry`,
-        );
-        return;
-      }
-      payload = (await response.json()) as CaptureApiResponse;
-    } catch (err) {
-      logger.warn(`[captures] failed to fetch from controller: ${stringifyError(err)}`);
-      return;
-    }
-    if (!payload || !Array.isArray(payload.captures)) {
-      logger.warn("[captures] unexpected response shape from controller; keeping existing registry");
-      return;
-    }
-    this.applyRows(payload.captures);
-    logger.info(
-      `[captures] registry refreshed: ${this.byId.size} active captures across ${this.byTopic.size} watched topics`,
-    );
+  private executionAllowed(): boolean {
+    if (this.health.allowed()) return true;
+    if (this.byId.size) void this.applyRows([], "registryUnavailable");
+    return false;
   }
 
-  private applyRows(rows: CaptureApiRow[]): void {
+  refresh(): Promise<void> {
+    if (this.refreshPromise) return this.refreshPromise;
+    const pending = this.refreshOnce(this.generation);
+    this.refreshPromise = pending;
+    void pending.finally(() => { if (this.refreshPromise === pending) this.refreshPromise = null; }).catch(() => undefined);
+    return pending;
+  }
+
+  private async refreshOnce(generation: number): Promise<void> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.deps.requestTimeoutMs ?? 5000);
+    const abort = new Promise<never>((_resolve, reject) => controller.signal.addEventListener("abort", () => reject(new Error("Registry timeout")), { once: true }));
+    const current = () => generation === this.generation;
+    try {
+      let token: string | null;
+      try { token = await Promise.race([this.deps.getAccessToken(), abort]); }
+      catch {
+        if (current()) { this.health.authorizationFailure(); await this.applyRows([], "authorizationUnavailable"); }
+        return;
+      }
+      if (!current()) return;
+      if (!token || this.health.tokenExpired(token)) {
+        this.health.authorizationFailure();
+        await this.applyRows([], "authorizationUnavailable");
+        return;
+      }
+      let response: Response;
+      try {
+        response = await Promise.race([this.fetchImpl(`${this.deps.controllerRestUrl.replace(/\/+$/, "")}/captures`, {
+          method: "GET", headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }, signal: controller.signal,
+        }), abort]);
+      } catch {
+        if (current()) { this.health.transportFailure(); this.executionAllowed(); }
+        return;
+      }
+      if (!current()) return;
+      if (response.status === 401 || response.status === 403) {
+        this.health.authorizationFailure(); await this.applyRows([], "authorizationUnavailable"); return;
+      }
+      if (!response.ok) { this.health.transportFailure(); this.executionAllowed(); return; }
+      const payload = await Promise.race([response.json(), abort]) as CaptureApiResponse;
+      if (!current()) return;
+      if (!payload || !Array.isArray(payload.captures)) { this.health.transportFailure(); this.executionAllowed(); return; }
+      // The credential may expire while a slow response body is being read.
+      if (this.health.tokenExpired(token)) { this.health.authorizationFailure(); await this.applyRows([], "authorizationUnavailable"); return; }
+      this.health.success(token);
+      await this.applyRows(payload.captures);
+    } catch {
+      if (current()) { this.health.transportFailure(); this.executionAllowed(); }
+    } finally { clearTimeout(timeout); }
+  }
+
+  private async applyRows(rows: CaptureApiRow[], reason?: string): Promise<void> {
     const previousById = this.byId;
     const nextById = new Map<string, CaptureDefinition>();
     const nextByTopic = new Map<string, Set<string>>();
@@ -222,14 +255,12 @@ export class CaptureRegistry {
     this.byId = nextById;
     this.byTopic = nextByTopic;
     this.byTriggerId = nextByTriggerId;
-    this.emitRefresh({ previous: previousById, current: nextById });
+    await this.emitRefresh({ previous: previousById, current: nextById, ...(reason ? {reason} : {}) });
   }
 
-  private emitRefresh(event: CaptureRegistryRefreshEvent): void {
+  private async emitRefresh(event: CaptureRegistryRefreshEvent): Promise<void> {
     for (const listener of this.refreshListeners) {
-      Promise.resolve(listener(event)).catch((err) => {
-        logger.warn(`[captures] registry refresh listener failed: ${stringifyError(err)}`);
-      });
+      try { await listener(event); } catch { logger.warn("[captures] registry refresh listener failed"); }
     }
   }
 }

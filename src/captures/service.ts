@@ -32,6 +32,7 @@ export type CaptureServiceDeps = {
   registry: CaptureRegistry;
   publisher: CapturePublisher;
   getLastValue: CaptureLastValueAccessor;
+  canRecord?: () => boolean;
   auditSession?: (event: CaptureSessionAuditEvent) => Promise<void> | void;
   now?: () => number;
   createSessionId?: () => string;
@@ -78,6 +79,8 @@ type ActiveCaptureSession = {
   rowCount: number;
   lastRowAt: string | null;
   aggregates: Map<string, ColumnAggregateState>;
+  publishQueue: Promise<void>;
+  closing: boolean;
 };
 
 type MappedCaptureValues = {
@@ -135,6 +138,7 @@ export class CaptureService {
   private readonly publisher: CapturePublisher;
   private readonly getLastValue: CaptureLastValueAccessor;
   private readonly auditSession: (event: CaptureSessionAuditEvent) => Promise<void> | void;
+  private readonly canRecord: () => boolean;
   private readonly now: () => number;
   private readonly createSessionId: () => string;
   private readonly timers: CaptureTimerApi;
@@ -142,6 +146,8 @@ export class CaptureService {
   private readonly activeSessions: Map<string, ActiveCaptureSession> = new Map();
   private readonly metrics: Map<string, CaptureRuntimeMetrics> = new Map();
   private readonly diagnostics: Map<string, CaptureRuntimeDiagnostics> = new Map();
+  private stopped = false;
+  private opening = new Map<string, Promise<void>>();
   private unsubscribeRegistryRefresh: (() => void) | null = null;
 
   constructor(deps: CaptureServiceDeps) {
@@ -149,6 +155,7 @@ export class CaptureService {
     this.publisher = deps.publisher;
     this.getLastValue = deps.getLastValue;
     this.auditSession = deps.auditSession ?? (() => undefined);
+    this.canRecord = deps.canRecord ?? (() => true);
     this.now = deps.now ?? (() => Date.now());
     this.createSessionId = deps.createSessionId ?? (() => randomUUID());
     this.timers = deps.timers ?? {
@@ -160,9 +167,10 @@ export class CaptureService {
   }
 
   async start(): Promise<void> {
+    this.stopped = false;
     if (!this.unsubscribeRegistryRefresh) {
       this.unsubscribeRegistryRefresh = this.registry.onRefresh((event) => {
-        void this.handleRegistryRefresh(event.current);
+        return this.handleRegistryRefresh(event.current, event.reason);
       });
     }
     await this.registry.start();
@@ -172,6 +180,7 @@ export class CaptureService {
   }
 
   stop(): void {
+    this.stopped = true;
     const stoppedAt = new Date(this.now()).toISOString();
     for (const session of this.activeSessions.values()) {
       this.clearSessionTimers(session);
@@ -181,7 +190,7 @@ export class CaptureService {
         metrics.lastEndedAt = stoppedAt;
         metrics.lastCloseReason = "runtimeRestart";
         this.metrics.set(capture.id, metrics);
-        this.emitSessionAudit({
+        void this.emitSessionAudit({
           eventType: "closed",
           captureId: capture.id,
           captureName: capture.name,
@@ -193,7 +202,7 @@ export class CaptureService {
           rowCount: session.rowCount,
           lastRowAt: session.lastRowAt,
           lastSuppressedReason: metrics.lastSuppressedReason,
-        });
+        }).catch(()=>undefined);
       }
     }
     this.activeSessions.clear();
@@ -263,7 +272,7 @@ export class CaptureService {
     });
 
     const active = this.activeSessions.get(capture.id) ?? null;
-    if (active) {
+    if (active && !active.closing) {
       this.recordSamplesForTopic(capture, active, ctx.topic);
     }
     const stopRise = prev.stop === false && stopResult === true;
@@ -317,8 +326,19 @@ export class CaptureService {
     }
   }
 
-  private async openSession(capture: CaptureDefinition, now: number): Promise<void> {
-    if (this.activeSessions.has(capture.id)) return;
+  private openSession(capture: CaptureDefinition, now: number): Promise<void> {
+    const pending = this.opening.get(capture.id);
+    if (pending) return pending;
+    const opening = this.openSessionOnce(capture, now);
+    this.opening.set(capture.id, opening);
+    void opening.finally(() => {
+      if (this.opening.get(capture.id) === opening) this.opening.delete(capture.id);
+    }).catch(() => undefined);
+    return opening;
+  }
+
+  private async openSessionOnce(capture: CaptureDefinition, now: number): Promise<void> {
+    if (this.stopped || this.activeSessions.has(capture.id) || !this.canRecord() || !this.registry.list().some(current => current.id === capture.id)) return;
     const startedAt = new Date(now).toISOString();
     const session: ActiveCaptureSession = {
       sessionId: this.createSessionId(),
@@ -330,7 +350,15 @@ export class CaptureService {
       rowCount: 0,
       lastRowAt: null,
       aggregates: new Map(),
+      publishQueue: Promise.resolve(),
+      closing: false,
     };
+    // Persist the opening checkpoint before this session accepts output.
+    await this.emitSessionAudit({eventType:"started",captureId:capture.id,captureName:capture.name,sessionId:session.sessionId,outputTopic:capture.outputTopic,startedAt,rowCount:0,lastRowAt:null,lastSuppressedReason:null});
+    if (this.stopped || !this.canRecord() || !this.registry.list().some(current => current.id === capture.id)) {
+      await this.emitSessionAudit({eventType:"closed",captureId:capture.id,captureName:capture.name,sessionId:session.sessionId,outputTopic:capture.outputTopic,startedAt,rowCount:0,endedAt:new Date(this.now()).toISOString(),closeReason:"registryUnavailable"});
+      return;
+    }
     this.activeSessions.set(capture.id, session);
     this.recordAllMappedSamples(capture, session);
     const metrics = this.metrics.get(capture.id) ?? freshMetrics();
@@ -338,17 +366,7 @@ export class CaptureService {
     metrics.lastStartedAt = startedAt;
     metrics.lastSuppressedReason = null;
     this.metrics.set(capture.id, metrics);
-    this.emitSessionAudit({
-      eventType: "started",
-      captureId: capture.id,
-      captureName: capture.name,
-      sessionId: session.sessionId,
-      outputTopic: capture.outputTopic,
-      startedAt,
-      rowCount: 0,
-      lastRowAt: null,
-      lastSuppressedReason: null,
-    });
+
 
     if (hasMode(capture, "singleShot")) {
       await this.closeSession(capture, session, "singleShot", { publishSummary: true });
@@ -387,17 +405,29 @@ export class CaptureService {
     reason: string,
     options: { publishSummary?: boolean } = {},
   ): Promise<void> {
+    if (session.closing) return;
+    session.closing = true;
     const endedAt = new Date(this.now()).toISOString();
     this.clearSessionTimers(session);
-    if (options.publishSummary === true || hasMode(capture, "summary")) {
-      await this.publishRow(capture, session, "summary", undefined, endedAt);
+    const publishSummary = options.publishSummary ?? hasMode(capture, "summary");
+    // Snapshot the closing values before later source updates or publish waits.
+    const summaryValues = publishSummary ? this.collectSummaryValues(capture, session) : undefined;
+    // Audit the complete session, including changes accepted before its close.
+    await session.publishQueue;
+    try {
+      if (publishSummary) {
+        await this.publishRow(capture, session, "summary", undefined, endedAt, summaryValues);
+      }
+    } catch {
+      // publishRow already records the failure. Close with the successful-row
+      // count and its diagnostic, rather than leave a permanently closing session.
     }
     this.activeSessions.delete(capture.id);
     const metrics = this.metrics.get(capture.id) ?? freshMetrics();
     metrics.lastEndedAt = endedAt;
     metrics.lastCloseReason = reason;
     this.metrics.set(capture.id, metrics);
-    this.emitSessionAudit({
+    await this.emitSessionAudit({
       eventType: "closed",
       captureId: capture.id,
       captureName: capture.name,
@@ -444,16 +474,21 @@ export class CaptureService {
     rowType: CaptureRowType,
     changedTopic?: string,
     endedAt?: string,
+    closingValues?: MappedCaptureValues | null,
   ): Promise<void> {
+    if (session.closing && rowType !== "summary") return;
     const sampledAt = endedAt ?? new Date(this.now()).toISOString();
-    const mapped = rowType === "summary"
-      ? this.collectSummaryValues(capture, session)
-      : this.collectMappedValues(capture);
+    const mapped = closingValues !== undefined
+      ? closingValues
+      : rowType === "summary"
+        ? this.collectSummaryValues(capture, session)
+        : this.collectMappedValues(capture);
     if (!mapped) {
       this.recordSuppression(capture.id, "required_value_missing");
       return;
     }
     const row: CaptureRow = {
+      eventId: randomUUID(),
       sessionId: session.sessionId,
       startedAt: session.startedAt,
       sampledAt,
@@ -463,14 +498,30 @@ export class CaptureService {
       ...(changedTopic ? { changedTopic } : {}),
       ...(endedAt ? { endedAt } : {}),
     };
-    await this.publisher.publishRow(capture, row);
-    session.rowCount++;
-    session.lastRowAt = sampledAt;
-    const metrics = this.metrics.get(capture.id) ?? freshMetrics();
-    metrics.rowCount++;
-    metrics.lastRowAt = sampledAt;
-    metrics.lastSuppressedReason = null;
-    this.metrics.set(capture.id, metrics);
+    const pending = session.publishQueue.then(async () => {
+      const registered = this.registry.list().some(current => current.id === capture.id);
+      // An authenticated disable may emit its final summary, while auth loss
+      // and stale snapshots suppress all new output, including summaries.
+      const authenticatedClose = rowType === "summary" && this.registry.getHealth().healthy;
+      if (this.stopped || !this.canRecord() || (!registered && !authenticatedClose)) return;
+      try {
+        await this.publisher.publishRow(capture, row);
+      } catch (error) {
+        this.recordSuppression(capture.id, `publish_error:${stringifyError(error)}`);
+        throw error;
+      }
+      session.rowCount++;
+      session.lastRowAt = sampledAt;
+      const metrics = this.metrics.get(capture.id) ?? freshMetrics();
+      metrics.rowCount++;
+      metrics.lastRowAt = sampledAt;
+      metrics.lastSuppressedReason = null;
+      this.metrics.set(capture.id, metrics);
+      await this.emitSessionAudit({eventType:"started",captureId:capture.id,captureName:capture.name,sessionId:session.sessionId,outputTopic:capture.outputTopic,startedAt:session.startedAt,rowCount:session.rowCount,lastRowAt:session.lastRowAt});
+    });
+    // Rejected rows remain diagnostic failures but must not poison later rows/close.
+    session.publishQueue = pending.catch(() => undefined);
+    await pending;
   }
 
   private collectMappedValues(capture: CaptureDefinition): MappedCaptureValues | null {
@@ -550,17 +601,19 @@ export class CaptureService {
 
   private async closeSessionsMissingFromRegistry(
     currentDefinitions: ReadonlyMap<string, CaptureDefinition>,
+    reason?: string,
   ): Promise<void> {
     for (const [captureId, session] of Array.from(this.activeSessions.entries())) {
       if (currentDefinitions.has(captureId)) continue;
-      await this.closeSession(session.capture, session, "disabled");
+      await this.closeSession(session.capture, session, reason ?? "disabled", reason ? {publishSummary:false} : {});
     }
   }
 
   private async handleRegistryRefresh(
     currentDefinitions: ReadonlyMap<string, CaptureDefinition>,
+    reason?: string,
   ): Promise<void> {
-    await this.closeSessionsMissingFromRegistry(currentDefinitions);
+    await this.closeSessionsMissingFromRegistry(currentDefinitions, reason);
     await this.openAlwaysOnSessions(currentDefinitions);
   }
 
@@ -583,10 +636,9 @@ export class CaptureService {
     logger.warn(`[captures] ${captureId}: ${reason}`);
   }
 
-  private emitSessionAudit(event: CaptureSessionAuditEvent): void {
-    Promise.resolve(this.auditSession(event)).catch((err) => {
-      logger.warn(`[captures] session audit failed: ${stringifyError(err)}`);
-    });
+  private async emitSessionAudit(event: CaptureSessionAuditEvent): Promise<void> {
+    try { await this.auditSession(event); }
+    catch { this.recordSuppression(event.captureId,"audit_checkpoint_unavailable"); throw new Error("Capture audit checkpoint unavailable; recording must pause."); }
   }
 }
 
