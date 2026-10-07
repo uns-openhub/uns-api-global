@@ -23,6 +23,8 @@ import {
   buildSummaryBoundarySql,
   buildTimeOrder,
   buildWhere,
+  parseCaptureSessionId,
+  captureSessionPredicate,
   canApplyDedupe,
   clampLimit,
   computeCounterDeltaValue,
@@ -871,4 +873,18 @@ test("request path helpers recognize swagger routes and numeric type support", (
   assert.equal(isSwaggerDefinitionRequest("/api/catchall/enterprise/site/area", "/uns-api-global/general-api/catchall-swagger.json"), false);
   assert.equal(isNumericQuestDbType("DOUBLE"), true);
   assert.equal(isNumericQuestDbType("BOOLEAN"), false);
+});
+
+
+test("Capture session restriction is validated and ANDed before raw limits", () => {
+  const schema = makeSchema([["topic"], ["sessionId"], ["timestamp", "TIMESTAMP"]]);
+  const path = {fullPath: "enterprise/site/area/line/output", captureSessionId: "a-b_1.2:3"};
+  const temporal = resolveTemporalStrategy(schema, "timestamp");
+  const where = buildWhere(path, {from: "2026-10-07T00:00:00Z", to: "2026-10-07T00:01:00Z"}, temporal, schema);
+  assert.match(where, /"topic" = 'enterprise\/site\/area\/line\/output' AND "sessionId" = 'a-b_1.2:3' AND/);
+  assert.match(buildDataSql("capture_table", path, {}, 2, false, schema, temporal), /"sessionId" = 'a-b_1.2:3'[\s\S]*LIMIT 2/);
+  assert.equal(parseCaptureSessionId(undefined), undefined);
+  for (const invalid of ["", " a", "a' OR 1=1", "a\n", "a".repeat(129), [], 5]) assert.throws(() => parseCaptureSessionId(invalid), /sessionId/);
+  assert.throws(() => captureSessionPredicate("safe", new Set(["timestamp", "topic"])), /sessionId column/);
+  assert.throws(() => buildWhere({fullPath:"no-path",captureSessionId:"safe"}, {}, temporal, makeSchema([["sessionId"],["timestamp"]])), /UNS path columns/);
 });

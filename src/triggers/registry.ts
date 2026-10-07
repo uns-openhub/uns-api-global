@@ -12,6 +12,7 @@
 // "triggers-watching-this-topic" index for hot-path message handling.
 
 import { logger } from "@uns-kit/core";
+import { ControllerRegistryHealth, type RegistryRefreshOptions, type RegistryHealth } from "../controller-registry-health.js";
 import type { TriggerDefinition, TriggerKind } from "./types.js";
 
 /** Matches the response shape uns-datahub-controller's
@@ -37,7 +38,7 @@ type TriggerApiResponse = {
   triggers: TriggerApiRow[];
 };
 
-export type TriggerRegistryDeps = {
+export type TriggerRegistryDeps = RegistryRefreshOptions & {
   /** Base URL of the controller's REST API (e.g.
    *  "http://localhost:3200/api").  Trailing slash optional —
    *  normalised here. */
@@ -64,9 +65,13 @@ export class TriggerRegistry {
   private bySourceTopic: Map<string, Set<string>> = new Map();
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private started = false;
+  private generation = 0;
+  private refreshPromise: Promise<void> | null = null;
+  private readonly health: ControllerRegistryHealth;
 
   constructor(deps: TriggerRegistryDeps) {
     this.deps = deps;
+    this.health = new ControllerRegistryHealth("triggers-registry", "Trigger definitions", deps);
     this.fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
@@ -78,6 +83,7 @@ export class TriggerRegistry {
     if (this.started) return;
     this.started = true;
     await this.refresh();
+    if (!this.started) return;
     this.refreshTimer = setInterval(() => {
       this.refresh().catch((err) => {
         logger.warn(`[triggers] background refresh failed: ${stringifyError(err)}`);
@@ -97,12 +103,18 @@ export class TriggerRegistry {
       this.refreshTimer = null;
     }
     this.started = false;
+    this.generation++;
+    this.refreshPromise = null;
+    this.health.authorizationFailure();
+    this.byId.clear();
+    this.bySourceTopic.clear();
   }
 
   /** All triggers watching a given source topic.  O(1) — used by
    *  the message handler to avoid scanning every trigger on every
    *  message.  Returns an empty array when no triggers match. */
   getTriggersForTopic(topic: string): TriggerDefinition[] {
+    if (!this.executionAllowed()) return [];
     const ids = this.bySourceTopic.get(topic);
     if (!ids || ids.size === 0) return [];
     const out: TriggerDefinition[] = [];
@@ -116,6 +128,7 @@ export class TriggerRegistry {
   /** Total count of cached triggers.  Used by health / metrics
    *  surfaces. */
   size(): number {
+    if (!this.executionAllowed()) return 0;
     return this.byId.size;
   }
 
@@ -124,66 +137,74 @@ export class TriggerRegistry {
    *  (including ones that haven't been evaluated yet, so the admin
    *  UI shows them as "Awaiting first value"). */
   list(): TriggerDefinition[] {
+    if (!this.executionAllowed()) return [];
     return Array.from(this.byId.values());
   }
 
   /** Force a refresh now.  Useful for tests + for an admin
    *  endpoint we might add later that nudges the registry on
    *  trigger-create instead of waiting for the interval. */
-  async refresh(): Promise<void> {
-    const url = `${this.deps.controllerRestUrl.replace(/\/+$/, "")}/triggers`;
-    let token: string | null = null;
-    try {
-      token = await this.deps.getAccessToken();
-    } catch (err) {
-      logger.warn(`[triggers] could not get access token: ${stringifyError(err)}`);
-      return;
-    }
-    if (!token) {
-      logger.warn(`[triggers] no access token available; skipping refresh`);
-      return;
-    }
-    let payload: TriggerApiResponse;
-    try {
-      const response = await this.fetchImpl(url, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/json",
-        },
-      });
-      if (!response.ok) {
-        logger.warn(
-          `[triggers] controller responded ${response.status} for GET /api/triggers; keeping existing registry`,
-        );
-        return;
-      }
-      payload = (await response.json()) as TriggerApiResponse;
-    } catch (err) {
-      logger.warn(`[triggers] failed to fetch from controller: ${stringifyError(err)}`);
-      return;
-    }
-    if (!payload || !Array.isArray(payload.triggers)) {
-      logger.warn(`[triggers] unexpected response shape from controller; keeping existing registry`);
-      return;
-    }
-    this.applyRows(payload.triggers);
-    logger.info(
-      `[triggers] registry refreshed: ${this.byId.size} active triggers across ${this.bySourceTopic.size} source topics`,
-    );
+  getHealth(): RegistryHealth { this.executionAllowed(); return this.health.get(); }
+
+  private executionAllowed(): boolean {
+    if (this.health.allowed()) return true;
+    if (this.byId.size) void this.applyRows([], "registryUnavailable");
+    return false;
   }
 
-  /** Replace the in-memory state with a freshly-fetched batch.
-   *  Atomic from the message-handler's perspective — readers either
-   *  see the old map or the new map, never an inconsistent middle.
-   *  Implemented with rebuilt-then-swap for that reason.
-   *
-   *  For `compare` triggers, BOTH `leftTopic` and `rightTopic` are
-   *  added to the inverted index so a message on either side
-   *  re-evaluates the relation.  `sourceTopic` for compare is
-   *  informational and not added — the runtime only ever drives
-   *  off the operand topics. */
-  private applyRows(rows: TriggerApiRow[]): void {
+  refresh(): Promise<void> {
+    if (this.refreshPromise) return this.refreshPromise;
+    const pending = this.refreshOnce(this.generation);
+    this.refreshPromise = pending;
+    void pending.finally(() => { if (this.refreshPromise === pending) this.refreshPromise = null; }).catch(() => undefined);
+    return pending;
+  }
+
+  private async refreshOnce(generation: number): Promise<void> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.deps.requestTimeoutMs ?? 5000);
+    const abort = new Promise<never>((_resolve, reject) => controller.signal.addEventListener("abort", () => reject(new Error("Registry timeout")), { once: true }));
+    const current = () => generation === this.generation;
+    try {
+      let token: string | null;
+      try { token = await Promise.race([this.deps.getAccessToken(), abort]); }
+      catch {
+        if (current()) { this.health.authorizationFailure(); await this.applyRows([], "authorizationUnavailable"); }
+        return;
+      }
+      if (!current()) return;
+      if (!token || this.health.tokenExpired(token)) {
+        this.health.authorizationFailure();
+        await this.applyRows([], "authorizationUnavailable");
+        return;
+      }
+      let response: Response;
+      try {
+        response = await Promise.race([this.fetchImpl(`${this.deps.controllerRestUrl.replace(/\/+$/, "")}/triggers`, {
+          method: "GET", headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }, signal: controller.signal,
+        }), abort]);
+      } catch {
+        if (current()) { this.health.transportFailure(); this.executionAllowed(); }
+        return;
+      }
+      if (!current()) return;
+      if (response.status === 401 || response.status === 403) {
+        this.health.authorizationFailure(); await this.applyRows([], "authorizationUnavailable"); return;
+      }
+      if (!response.ok) { this.health.transportFailure(); this.executionAllowed(); return; }
+      const payload = await Promise.race([response.json(), abort]) as TriggerApiResponse;
+      if (!current()) return;
+      if (!payload || !Array.isArray(payload.triggers)) { this.health.transportFailure(); this.executionAllowed(); return; }
+      // The credential may expire while a slow response body is being read.
+      if (this.health.tokenExpired(token)) { this.health.authorizationFailure(); await this.applyRows([], "authorizationUnavailable"); return; }
+      this.health.success(token);
+      await this.applyRows(payload.triggers);
+    } catch {
+      if (current()) { this.health.transportFailure(); this.executionAllowed(); }
+    } finally { clearTimeout(timeout); }
+  }
+
+  private async applyRows(rows: TriggerApiRow[], reason?: string): Promise<void> {
     const nextById = new Map<string, TriggerDefinition>();
     const nextBySourceTopic = new Map<string, Set<string>>();
     const addToIndex = (topic: string, id: string) => {

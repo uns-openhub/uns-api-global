@@ -117,6 +117,8 @@ export type CaptureLastValueAccessor = (topic: string) => CaptureLastValueSnapsh
 export type CaptureRowType = "interval" | "change" | "summary";
 
 export type CaptureRow = {
+  /** Stable emission identity; preserved when the packet is replayed. */
+  eventId?: string;
   sessionId: string;
   startedAt: string;
   sampledAt: string;

@@ -1,3 +1,7 @@
+import { QuestDbRequestError, HistoryReadError, readHistory } from "./history-source-diagnostics.js";
+import { buildLatestHistorySql, selectArchivedLatest, preserveConcurrentCacheValue, LatestLookupCoordinator, LatestLookupError } from "./latest-value-history.js";
+import { HISTORY_SOURCE_COLUMN, HistorySourceError, historyTableRelation, combineHistorySchemas, validateHistoryMappings, assertHistoryTransform, historySourceMetadata, type HistoryTableSource } from "./history-table-source.js";
+import { QuestDbMappingCache, QUESTDB_HISTORY_MAPPINGS_QUERY, type QuestDbMappingEntry } from "./questdb-mapping-cache.js";
 import {
   AuthClient,
   UnsProxyProcess,
@@ -25,6 +29,10 @@ import { TriggerPublisher } from "./triggers/publisher.js";
 import { TriggerService } from "./triggers/service.js";
 import { CaptureRegistry } from "./captures/registry.js";
 import { CapturePublisher } from "./captures/publisher.js";
+import { CaptureAuditOutbox } from "./captures/audit-outbox.js";
+import { sendCaptureAudit } from "./captures/audit-transport.js";
+import type { RegistryHealth } from "./controller-registry-health.js";
+import path from "node:path";
 import { CaptureService, type CaptureSessionAuditEvent } from "./captures/service.js";
 import { ControllerEntityBindingClient } from "./entity-binding-client.js";
 import { EntityLastValueCache } from "./entity-last-value-cache.js";
@@ -44,6 +52,9 @@ import { createPublicKey, randomUUID } from "node:crypto";
 import { request, gql } from "graphql-request";
 import {
   buildBoundaryCounterDeltaResponse,
+  HttpError as CatchallParameterError,
+  captureSessionPredicate,
+  parseCaptureSessionId,
   buildEntityBucketPartialSql,
   buildEntityDataSql,
   buildEntitySourceSql,
@@ -199,6 +210,17 @@ const apiOptions: IApiProxyOptions = config.uns?.jwksWellKnownUrl
 
 const apiInput = await unsProxyProcess.createApiProxy("general-api", apiOptions);
 let latestQuestDbHealth: QuestDbDependencyHealth | null = null;
+const automationHealth = new Map<string, RegistryHealth>();
+let automationHealthTimer: ReturnType<typeof setTimeout> | null = null;
+function reportAutomationHealth(health: RegistryHealth): void {
+  automationHealth.set(health.id, health);
+  if (automationHealthTimer) return;
+  automationHealthTimer = setTimeout(() => {
+    automationHealthTimer = null;
+    void publishApiGlobalServiceMetadata().catch(() => logger.warn("Automation dependency health publication failed."));
+  }, 250);
+  automationHealthTimer.unref?.();
+}
 
 async function refreshQuestDbHealth(): Promise<QuestDbDependencyHealth> {
   const checkedAt = new Date().toISOString();
@@ -256,7 +278,7 @@ async function publishApiGlobalServiceMetadata() {
       },
     ],
     extra: {
-      dependencies: [health],
+      dependencies: [health, ...automationHealth.values()],
       questdbHealth: health,
     },
   });
@@ -315,11 +337,16 @@ const swaggerDoc = {
             description: "Full attribute topic path",
           },
           {
+            name: "sessionId", in: "query", required: false,
+            schema: {type: "string", maxLength: 128},
+            description: "Exact Capture session restriction, applied with topic and time before limits or sampling. Requires sessionId in the history schema.",
+          },
+          {
             name: "table",
             in: "query",
             required: false,
             schema: { type: "string" },
-            description: "QuestDB table name (optional if controller mappings are available)",
+            description: "Explicit single-table override. Omit to combine compatible retained controller history mappings.",
           },
           {
             name: "from",
@@ -420,7 +447,7 @@ const swaggerDoc = {
         summary: "Batch last values — current/latest value for topics or stable entities",
         description:
           "Returns the most recent known value per topic or stable entity attribute from the MQTT last-value cache " +
-          "(seeded from QuestDB on startup), with bounded QuestDB latest-row fallback on cache misses. " +
+          "(seeded from all compatible retained QuestDB sources on startup), with bounded latest-row fallback on cache misses. Equal-time conflicting payloads return a per-item 409; dependency failures return 503. " +
           "Entity selectors resolve their current authorized topic binding before data access. " +
           "Ideal for dashboards, asset snapshot views, and status panels. " +
           "Internally calls POST /api/catchall/batch with mode=last.",
@@ -499,6 +526,9 @@ const swaggerDoc = {
                           dataGroup: { type: "string", nullable: true },
                           ageMs: { type: "number", nullable: true, description: "Milliseconds since last MQTT update" },
                           source: { type: "string", enum: ["cache", "questdb", "miss"], description: "cache = value available, questdb = lazy latest-row fallback, miss = no data yet" },
+                          error: { type: "string", description: "Per-item recovery/conflict error, absent on success" },
+                          status: { type: "integer", description: "Per-item failure status, absent on success" },
+                          history: { type: "object", description: "Archived candidate/selected tables and latest tie policy; retained on cache hits seeded from QuestDB" },
                           counter: {
                             type: "object",
                             nullable: true,
@@ -597,6 +627,7 @@ const swaggerDoc = {
                       },
                     },
                   },
+                  sessionId: { type: "string", maxLength: 128, description: "Exact Capture session restriction with explicit topics. Not supported for entitySelectors or latest-value mode; requires a sessionId history column." },
                   from: { type: "string", description: `ISO start time (default: last ${questdb.defaultLookbackHours}h)` },
                   to: { type: "string", description: "ISO end time (default: now)" },
                   limit: { type: "integer", description: `Raw row limit per topic (default ${questdb.defaultLimit}, max ${questdb.maxLimit})` },
@@ -696,11 +727,12 @@ const catchAllRegistrationOptions: Parameters<typeof apiInput.registerCatchAll>[
   swaggerDoc,
   tags: [catchAll.swaggerTag ?? "CatchAll"],
   queryParams: [
+    {name: "sessionId", type: "string", required: false, description: "Exact Capture session restriction; requires sessionId in the history schema."},
     {
       name: "table",
       type: "string",
       required: false,
-      description: "QuestDB table name (optional if controller mappings are available)",
+      description: "Explicit single-table override. Omit to combine compatible retained controller history mappings.",
     },
     {
       name: "from",
@@ -861,13 +893,11 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
 
     const tableFromQuery = sanitizeTable(String(query?.["table"] ?? ""));
     const tableFromDataSource = resolveTablePrefix(dataSources, topic);
-    const table =
-      tableFromQuery ||
-      tableFromDataSource ||
-      (await resolveTableFromController(topic, {
-        controllerGraphqlUrl,
-        tokenProvider: controllerTokenProvider,
-      }));
+    const mappings = await resolveHistoryFromController(topic, {
+      controllerGraphqlUrl, tokenProvider: controllerTokenProvider,
+    });
+    const tables = tableFromQuery || tableFromDataSource ? [tableFromQuery || tableFromDataSource!] : validateHistoryMappings(mappings);
+    const table = tables[0];
     if (!table) {
       throw new HttpError(
         400,
@@ -904,8 +934,9 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
       sampledRequested ? questdb.maxSampleLookbackHours : undefined,
     );
 
-    const parsedPath = parseUnsPath(topic);
-    const tableSchema = await getTableSchema(questdb, table);
+    const parsedPath = { ...parseUnsPath(topic), captureSessionId: parseCaptureSessionId(query?.["sessionId"]) };
+    const { source, schema: tableSchema } = combineHistorySchemas(tables, await Promise.all(tables.map(name => readHistory([name], "schema", () => getTableSchema(questdb, name)))));
+    assertHistoryTransform(source, transform);
     const tableColumns = tableSchema.columns;
     const temporal = resolveTemporalStrategy(tableColumns, timeField);
     const dedupeApplied = canApplyDedupe(dedupeRequested, tableColumns);
@@ -913,7 +944,7 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
     let sql: string;
     if (summaryOnly) {
       sampling = { mode: "summary" };
-      sql = buildSummarySql(table, parsedPath, range, temporal, tableColumns);
+      sql = buildSummarySql(source, parsedPath, range, temporal, tableColumns);
     } else if (sampledRequested) {
       const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
       const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
@@ -932,7 +963,7 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
       };
       if (transform === "delta") {
         sql = buildSourceSql(
-          table,
+          source,
           parsedPath,
           counterBoundarySourceRange(range, bucketMs),
           dedupeRequested,
@@ -942,7 +973,7 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
         );
       } else {
         const sourceSql = buildSourceSql(
-          table,
+          source,
           parsedPath,
           range,
           dedupeRequested,
@@ -957,7 +988,7 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
         const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
         const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
         const sourceSql = buildSourceSql(
-          table,
+          source,
           parsedPath,
           range,
           dedupeRequested,
@@ -977,11 +1008,11 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
         sql = buildCounterDeltaRawSql(deltaSourceSql, limit);
       } else {
         sampling = { mode: "raw", transform };
-        sql = buildDataSql(table, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
+        sql = buildDataSql(source, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
       }
     }
 
-    const rawResult = await queryQuestDb(questdb, sql);
+    const rawResult = await readHistory(tables, "query", () => queryQuestDb(questdb, sql));
     const result = sampling.mode === "bucketed" && sampling.transform === "delta"
       ? buildBoundaryCounterDeltaResponse(
           rawResult,
@@ -1004,7 +1035,8 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
     }
 
     const stats = {
-      table,
+      table: tables.length === 1 ? table : null,
+      history: historySourceMetadata(tables, mappings),
       limit,
       from: range.from,
       to: range.to,
@@ -1044,8 +1076,8 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
 
     res.status(200).json(payload);
   } catch (error) {
-    if (error instanceof HttpError) {
-      res.status(error.status).json({ error: error.message, requestId });
+    if (error instanceof HttpError || error instanceof CatchallParameterError || error instanceof HistorySourceError || error instanceof HistoryReadError) {
+      res.status(error.status).json({ error: error.message, requestId, ...(error instanceof HistoryReadError ? { diagnostic: error.diagnostic } : {}) });
       return;
     }
 
@@ -1063,6 +1095,8 @@ type LastValueEntry = {
   timestamp: string;
   receivedAt: number;
   dataGroup: string | null;
+  packetShape?: "data" | "table";
+  history?: ReturnType<typeof historySourceMetadata> & { selectedTables: string[]; latestTiePolicy: string };
   counter?: {
     absoluteValue: number;
     previousValue: number | null;
@@ -1072,6 +1106,7 @@ type LastValueEntry = {
 
 const lastValueMap = new Map<string, LastValueEntry>();
 const entityLastValueMap = new EntityLastValueCache<LastValueEntry>();
+const latestLookupCoordinator = new LatestLookupCoordinator<{ entry: LastValueEntry; sql: string }>({ timeoutMs: Math.min(questdb.statementTimeoutMs, 5_000) });
 let lvMqttInput: UnsMqttProxy | undefined;
 let lvActiveTopics: string[] = [];
 let triggerService: TriggerService | undefined;
@@ -1098,7 +1133,7 @@ function buildCounterCacheState(
   if (absoluteValue === null) return undefined;
 
   const previousEntry = lastValueMap.get(topic);
-  const previousEntryValue = previousEntry ? toNumber(previousEntry.values["value"]) : null;
+  const previousEntryValue = previousEntry && (previousEntry.history?.tables.length ?? 0) <= 1 ? toNumber(previousEntry.values["value"]) : null;
   const currentMs = timestampMs(timestamp);
   const previousMs = timestampMs(previousEntry?.timestamp);
   const hasLaterTimestamp = currentMs === null || previousMs === null || currentMs > previousMs;
@@ -1162,6 +1197,7 @@ function updateLastValue(topic: string, mqttMessage: string): void {
       // Data attribute → single value stored as { value: X }
       const timestamp = data.time ?? new Date().toISOString();
       const entry: LastValueEntry = {
+        packetShape: "data",
         values: { value: data.value ?? null },
         uom: data.uom ?? null,
         timestamp,
@@ -1177,6 +1213,7 @@ function updateLastValue(topic: string, mqttMessage: string): void {
       const columns = tableColumnsToLastValues(table.columns);
       if (Object.keys(columns).length > 0) {
         const entry: LastValueEntry = {
+          packetShape: "table",
           values: columns,
           uom: null,
           timestamp: table.time ?? new Date().toISOString(),
@@ -1339,6 +1376,7 @@ async function initTriggerService(): Promise<void> {
       }
     },
     refreshIntervalMs: lastValueCacheConfig.topicRefreshIntervalMs ?? 30_000,
+    onHealthChange: reportAutomationHealth,
   });
   const publisher = new TriggerPublisher({
     publish: async ({ outputTopic, payload }) => {
@@ -1413,6 +1451,7 @@ async function initCaptureService(): Promise<void> {
       }
     },
     refreshIntervalMs: lastValueCacheConfig.topicRefreshIntervalMs ?? 30_000,
+    onHealthChange: reportAutomationHealth,
   });
   const publisher = new CapturePublisher({
     publish: async ({ outputTopic, payload }) => {
@@ -1422,36 +1461,21 @@ async function initCaptureService(): Promise<void> {
         logger.warn(
           `[captures] publish to ${outputTopic} failed: ${err instanceof Error ? err.message : err}`,
         );
+        throw err;
       }
     },
   });
+  const auditOutbox = new CaptureAuditOutbox({
+    directory: path.join(path.dirname(process.env["UNS_CONFIG_PATH"] ?? "config.json"), "capture-audit"),
+    onHealthChange: reportAutomationHealth,
+    send: event => sendCaptureAudit({controllerRestUrl, getAccessToken: () => controllerTokenProvider.getAccessToken(), event}),
+  });
+  await auditOutbox.start();
   captureService = new CaptureService({
     registry,
     publisher,
-    auditSession: async (event: CaptureSessionAuditEvent) => {
-      const token = await controllerTokenProvider.getAccessToken();
-      if (!token) {
-        logger.warn("[captures] no access token available; skipping session audit");
-        return;
-      }
-      const response = await fetch(`${controllerRestUrl.replace(/\/+$/, "")}/captures/sessions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify({
-          ...event,
-          runtimeProcess: captureProcessName,
-        }),
-      });
-      if (!response.ok) {
-        logger.warn(
-          `[captures] controller responded ${response.status} for POST /api/captures/sessions`,
-        );
-      }
-    },
+    canRecord: () => auditOutbox.canRecord(),
+    auditSession: event => auditOutbox.enqueue({...event,runtimeProcess:captureProcessName}),
     getLastValue: (topic: string) => {
       const entry = lastValueMap.get(topic);
       if (!entry) return null;
@@ -1469,143 +1493,28 @@ async function initCaptureService(): Promise<void> {
 }
 
 async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
-  if (!topics.length) return;
-  const resolverCfg: MappingResolverConfig = { controllerGraphqlUrl, tokenProvider: controllerTokenProvider };
-
-  // Group topics by resolved table
-  const topicsByTable = new Map<string, string[]>();
-  for (const topic of topics) {
-    const tableFromDs = resolveTablePrefix(dataSources, topic);
-    const table = tableFromDs || (await resolveTableFromController(topic, resolverCfg));
-    if (!table) continue;
-    let list = topicsByTable.get(table);
-    if (!list) { list = []; topicsByTable.set(table, list); }
-    list.push(topic);
-  }
-
+  let next = 0;
   let seeded = 0;
-  for (const [table, tableTopics] of topicsByTable) {
-    try {
-      const columns = await getTableColumns(questdb, table);
-      const selectCols = buildDataColumnList(columns).map(quoteIdentifier).join(", ");
-      const partitionCols = buildDedupePartitionColumns(columns).map(quoteIdentifier).join(", ");
-      const pointTimeColumn = resolvePointTimeColumn(columns);
-      if (!pointTimeColumn || !partitionCols) continue;
-
-      // Build WHERE clause to limit to only our topics
-      const topicParts = tableTopics.map(t => {
-        const parsed = parseUnsPath(t);
-        const conditions: string[] = [];
-        if (parsed.topic && columns.has("topic")) conditions.push(`${quoteIdentifier("topic")} = ${escapeLiteral(parsed.topic)}`);
-        if (parsed.asset && columns.has("asset")) conditions.push(`${quoteIdentifier("asset")} = ${escapeLiteral(parsed.asset)}`);
-        if (parsed.objectType && columns.has("objectType")) conditions.push(`${quoteIdentifier("objectType")} = ${escapeLiteral(parsed.objectType)}`);
-        if (parsed.objectId && columns.has("objectId")) conditions.push(`${quoteIdentifier("objectId")} = ${escapeLiteral(parsed.objectId)}`);
-        if (parsed.attribute && columns.has("attribute")) conditions.push(`${quoteIdentifier("attribute")} = ${escapeLiteral(parsed.attribute)}`);
-        return conditions.length ? `(${conditions.join(" AND ")})` : null;
-      }).filter(Boolean);
-
-      if (!topicParts.length) continue;
-
-      const sql = `
-        SELECT ${selectCols}
-        FROM ${quoteIdentifier(table)}
-        WHERE ${topicParts.join(" OR ")}
-        LATEST ON ${quoteIdentifier(pointTimeColumn)} PARTITION BY ${partitionCols}
-      `;
-      const result = await queryQuestDb(questdb, sql);
-      if (!result.data?.length) continue;
-
-      // Parse rows back into cache entries
-      const rawCols = (result.raw as any)?.columns as Array<{ name: string; type: string }> | undefined;
-      const colNames = rawCols?.map((c: any) => c.name) ?? [];
-      const tsIdx = colNames.indexOf(pointTimeColumn);
-      const topicIdx = colNames.indexOf("topic");
-      const attrIdx = colNames.indexOf("attribute");
-      const assetIdx = colNames.indexOf("asset");
-      const objTypeIdx = colNames.indexOf("objectType");
-      const objIdIdx = colNames.indexOf("objectId");
-      const valueIdx = colNames.indexOf("value");
-      const numValueIdx = colNames.indexOf("numberValue");
-      const strValueIdx = colNames.indexOf("stringValue");
-      const uomIdx = colNames.indexOf("uom");
-      const valueTypeIdx = colNames.indexOf("valueType");
-
-      for (const row of result.data as unknown[][]) {
-        // Reconstruct the full topic path
-        const topicBase = topicIdx >= 0 ? String(row[topicIdx] ?? "") : "";
-        const asset = assetIdx >= 0 ? String(row[assetIdx] ?? "") : "";
-        const objType = objTypeIdx >= 0 ? String(row[objTypeIdx] ?? "") : "";
-        const objId = objIdIdx >= 0 ? String(row[objIdIdx] ?? "") : "";
-        const attr = attrIdx >= 0 ? String(row[attrIdx] ?? "") : "";
-        const fullTopic = [topicBase, asset, objType, objId, attr].filter(Boolean).join("/");
-        if (!fullTopic) continue;
-
-        const ts = tsIdx >= 0 ? String(row[tsIdx] ?? "") : "";
-        if (!ts) continue;
-
-        const valueType = valueTypeIdx >= 0 ? row[valueTypeIdx] : null;
-        const numVal = numValueIdx >= 0 ? row[numValueIdx] : (valueIdx >= 0 ? row[valueIdx] : null);
-        const strVal = strValueIdx >= 0 ? row[strValueIdx] : null;
-
-        // For seeded entries, set receivedAt to the actual data timestamp so
-        // ageMs reflects real staleness, not time since restart.
-        const seedReceivedAt = new Date(ts).getTime() || Date.now();
-
-        if (valueType === "number" || (typeof numVal === "number" && numVal !== null)) {
-          const seedCounter = buildSeedCounterState(numVal);
-          lastValueMap.set(fullTopic, {
-            values: { value: numVal },
-            uom: uomIdx >= 0 ? (row[uomIdx] as string ?? null) : null,
-            timestamp: ts,
-            receivedAt: seedReceivedAt,
-            dataGroup: null,
-            ...(seedCounter ? { counter: seedCounter } : {}),
-          });
+  // Four workers keep startup recovery bounded; lazy requests share the same lookup.
+  await Promise.all(Array.from({ length: Math.min(4, topics.length) }, async () => {
+    while (next < topics.length) {
+      const topic = topics[next++]!;
+      if (lastValueMap.has(topic)) continue;
+      try {
+        const fallback = await tryQuestDbLastRowFallback(topic);
+        if (!fallback) continue;
+        const selected = preserveConcurrentCacheValue(lastValueMap.get(topic), fallback.entry);
+        if (selected.inserted) {
+          lastValueMap.set(topic, selected.entry);
+          entityLastValueMap.updateTopic(topic, selected.entry);
           seeded++;
-        } else if (typeof strVal === "string" && strVal.length > 0) {
-          lastValueMap.set(fullTopic, {
-            values: { value: strVal },
-            uom: null,
-            timestamp: ts,
-            receivedAt: seedReceivedAt,
-            dataGroup: null,
-          });
-          seeded++;
-        } else {
-          // Table attribute fallback: collect all non-standard columns into values map
-          const standardCols = new Set([
-            "topic", "attribute", "asset", "objectType", "objectId",
-            "valueType", "value", "numberValue", "stringValue", "uom",
-            "time", "timestamp", "interval", "intervalStart", "intervalEnd",
-            "lastSeen", "deleted",
-          ]);
-          const customValues: Record<string, unknown> = {};
-          for (let ci = 0; ci < colNames.length; ci++) {
-            const colName = colNames[ci];
-            if (standardCols.has(colName)) continue;
-            const cellValue = (row as unknown[])[ci];
-            if (cellValue != null) customValues[colName] = cellValue;
-          }
-          if (Object.keys(customValues).length > 0) {
-            lastValueMap.set(fullTopic, {
-              values: customValues,
-              uom: null,
-              timestamp: ts,
-              receivedAt: seedReceivedAt,
-              dataGroup: null,
-            });
-            seeded++;
-          }
         }
+      } catch (error) {
+        logger.debug(`[last-value-cache] Seed unavailable: ${error instanceof Error ? error.message : 'lookup failed'}`);
       }
-    } catch (err) {
-      logger.warn(`[last-value-cache] QuestDB seed error for table ${table}: ${err instanceof Error ? err.message : err}`);
     }
-  }
-
-  if (seeded > 0) {
-    logger.info(`[last-value-cache] Seeded ${seeded} entries from QuestDB (${lastValueMap.size} total in cache).`);
-  }
+  }));
+  logger.info(`[last-value-cache] Seeded ${seeded} entries from QuestDB (${lastValueMap.size} total in cache).`);
 }
 
 // ─── Batch Endpoint (POST /api/catchall/batch) ─────────────────────────────
@@ -1665,6 +1574,7 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
   }
 
   if (mode === "last") {
+    if (body?.sessionId !== undefined) throw new HttpError(400, "sessionId requires range history; latest-value cache is not session filtered.");
     const transform = parseHistoryTransformMode(body?.transform);
     const counterResetPolicy = parseCounterResetPolicy(body?.counterResetPolicy ?? body?.resetPolicy);
     await handleBatchLast(topics, entitySelectors, res, { transform, counterResetPolicy }, accessRules);
@@ -1684,8 +1594,6 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
 // A short-lived throttle map prevents us from re-querying the same
 // permanently-empty topic on every tick.
 const BATCH_LAST_FALLBACK_LIMIT = 20;
-const BATCH_LAST_FALLBACK_THROTTLE_MS = 5_000;
-const batchLastFallbackAttemptAt = new Map<string, number>();
 
 type BatchLastOptions = {
   transform: HistoryTransformMode;
@@ -1712,12 +1620,16 @@ type BatchLastResult = {
   source: "cache" | "questdb" | "miss";
   sql: string | null;
   counter: BatchLastCounterResult | null;
+  history?: LastValueEntry["history"];
+  status?: number;
+  error?: string;
 };
 
 function buildBatchLastCounterResult(
   entry: LastValueEntry,
   resetPolicy: CounterResetPolicy,
 ): BatchLastCounterResult | null {
+  if (entry.packetShape === "table") return null;
   const computed = computeCounterDeltaValue(
     entry.counter?.absoluteValue ?? entry.values["value"],
     entry.counter?.previousValue ?? null,
@@ -1742,6 +1654,9 @@ function buildBatchLastResult(
   now: number,
   options: BatchLastOptions,
 ): BatchLastResult {
+  if (options.transform === "delta" && (entry.history?.tables.length ?? 0) > 1) {
+    throw new HistorySourceError("Counter continuity across publishers is unknown. Use absolute latest values.");
+  }
   const counter = buildBatchLastCounterResult(entry, options.counterResetPolicy);
   const deltaValues: Record<string, unknown> | null = counter
     ? {
@@ -1753,7 +1668,7 @@ function buildBatchLastResult(
     : null;
   return {
     topic,
-    value: options.transform === "delta" ? counter?.delta ?? null : entry.values["value"] ?? null,
+    value: options.transform === "delta" ? counter?.delta ?? null : entry.packetShape === "table" ? null : entry.values["value"] ?? null,
     values: options.transform === "delta" ? deltaValues : entry.values,
     uom: entry.uom,
     timestamp: entry.timestamp,
@@ -1762,111 +1677,43 @@ function buildBatchLastResult(
     source,
     sql,
     counter,
+    ...(entry.history ? { history: entry.history } : {}),
   };
 }
 
-async function tryQuestDbLastRowFallback(
-  topic: string,
-): Promise<{ entry: LastValueEntry; sql: string } | null> {
-  try {
-    const tableFromDataSource = resolveTablePrefix(dataSources, topic);
-    const table =
-      tableFromDataSource ||
-      (await resolveTableFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider }));
-    if (!table) return null;
+function failedBatchLastResult(topic: string, error: unknown): BatchLastResult {
+  return { topic, value: null, values: null, uom: null, timestamp: null, dataGroup: null, ageMs: null, source: "miss", sql: null, counter: null, status: error instanceof HistorySourceError || error instanceof LatestLookupError || error instanceof HistoryReadError ? error.status : 503, error: error instanceof HistorySourceError || error instanceof LatestLookupError || error instanceof HistoryReadError ? error.message : "Latest-value recovery failed.", ...(error instanceof HistoryReadError ? { diagnostic: error.diagnostic } : {}) };
+}
 
-    const parsedPath = parseUnsPath(topic);
-    const tableColumns = await getTableColumns(questdb, table);
-    const temporal = resolveTemporalStrategy(tableColumns, "auto");
-    // A latest-value lookup is not a history query. Sparse ObjectId attributes
-    // can be months old, so do not apply the raw-query lookback cap here.
-    const range: TimeRange = {};
-    const sql = buildDataSql(table, parsedPath, range, 1, true, tableColumns, temporal);
-    const result = await queryQuestDb(questdb, sql);
-    const rows = (result.data ?? []) as unknown[][];
-    if (!rows.length) return null;
-    const row = rows[0];
-    if (!row) return null;
-
-    // Column order for buildDataSql is buildDataColumnList(columns) — use
-    // the raw response columns to map values by name. queryQuestDb only
-    // returns `dataset`, so we need the column list from the raw response.
-    const rawAny = result.raw as Record<string, unknown>;
-    const rawColumns = Array.isArray(rawAny?.["columns"])
-      ? (rawAny["columns"] as Array<{ name?: string }>).map(c => c?.name ?? "")
-      : [];
-    const colIdx = (name: string): number => rawColumns.indexOf(name);
-
-    const tsIdx = colIdx(temporal.fromColumn);
-    const valueTypeIdx = colIdx("valueType");
-    const numValueIdx = colIdx("numberValue");
-    const valueIdx = colIdx("value");
-    const strValueIdx = colIdx("stringValue");
-    const uomIdx = colIdx("uom");
-
-    const ts = tsIdx >= 0 ? String(row[tsIdx] ?? "") : "";
-    if (!ts) return null;
-
-    const valueType = valueTypeIdx >= 0 ? row[valueTypeIdx] : null;
-    const numVal = numValueIdx >= 0 ? row[numValueIdx] : (valueIdx >= 0 ? row[valueIdx] : null);
-    const strVal = strValueIdx >= 0 ? row[strValueIdx] : null;
-    const seedReceivedAt = new Date(ts).getTime() || Date.now();
-
-    if (valueType === "number" || (typeof numVal === "number" && numVal !== null)) {
-      return {
-        entry: {
-          values: { value: numVal },
-          uom: uomIdx >= 0 ? (row[uomIdx] as string ?? null) : null,
-          timestamp: ts,
-          receivedAt: seedReceivedAt,
-          dataGroup: null,
-          counter: buildSeedCounterState(numVal),
-        },
-        sql,
-      };
-    }
-    if (typeof strVal === "string" && strVal.length > 0) {
-      return {
-        entry: {
-          values: { value: strVal },
-          uom: null,
-          timestamp: ts,
-          receivedAt: seedReceivedAt,
-          dataGroup: null,
-        },
-        sql,
-      };
-    }
-
-    // Table-attribute fallback: collect all non-standard columns into values map
-    const standardCols = new Set([
-      "topic", "attribute", "asset", "objectType", "objectId",
-      "valueType", "value", "numberValue", "stringValue", "uom",
-      "time", "timestamp", "interval", "intervalStart", "intervalEnd",
-      "lastSeen", "deleted",
-    ]);
-    const customValues: Record<string, unknown> = {};
-    for (let ci = 0; ci < rawColumns.length; ci++) {
-      const colName = rawColumns[ci];
-      if (!colName || standardCols.has(colName)) continue;
-      const cellValue = row[ci];
-      if (cellValue != null) customValues[colName] = cellValue;
-    }
-    if (Object.keys(customValues).length === 0) return null;
+async function tryQuestDbLastRowFallback(topic: string): Promise<{ entry: LastValueEntry; sql: string } | null> {
+  return latestLookupCoordinator.run(topic, async signal => {
+    const override = resolveTablePrefix(dataSources, topic);
+    const mappings = await resolveHistoryFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider });
+    const tables = override ? [override] : validateHistoryMappings(mappings);
+    if (!tables.length) return null;
+    const { source, schema } = combineHistorySchemas(tables, await Promise.all(tables.map(table => readHistory([table], "schema", () => getTableSchema(questdb, table, signal)))));
+    const temporal = resolveTemporalStrategy(schema.columns, 'auto');
+    const sql = buildLatestHistorySql(source, topic, schema, temporal);
+    const result = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, signal));
+    const scanRows = extractScanRowCount(result.raw);
+    if (scanRows !== null && scanRows > questdb.maxScanRows) throw new LatestLookupError("Latest-value recovery exceeds maxScanRows.", 413);
+    if (Buffer.byteLength(JSON.stringify(result), 'utf8') > questdb.maxResponseBytes) throw new LatestLookupError('Latest-value response exceeds the configured byte limit.', 413);
+    const columns = Array.isArray(result.raw['columns']) ? (result.raw['columns'] as Array<{ name: string }>).map(column => column.name) : [];
+    const suffix = mappings[0]?.suffix?.replace(/^_+/, "");
+    const packetShape = suffix === "data" || suffix === "table" ? suffix : undefined;
+    const selected = selectArchivedLatest(columns, result.data as unknown[][], temporal, packetShape);
+    if (!selected) return null;
+    const selectedTables = selected.selectedTables.length ? selected.selectedTables : tables;
     return {
       entry: {
-        values: customValues,
-        uom: null,
-        timestamp: ts,
-        receivedAt: seedReceivedAt,
-        dataGroup: null,
-      },
-      sql,
+        packetShape: selected.packetShape,
+        values: selected.values, uom: selected.uom, timestamp: selected.timestamp,
+        receivedAt: selected.receivedAt, dataGroup: null,
+        counter: tables.length === 1 && selected.packetShape === 'data' ? buildSeedCounterState(selected.values['value']) : undefined,
+        history: { ...historySourceMetadata(tables, mappings), selectedTables, latestTiePolicy: 'same-value-or-conflict' },
+      }, sql,
     };
-  } catch (err) {
-    logger.debug(`[batch/last] QuestDB fallback failed for ${topic}: ${err instanceof Error ? err.message : err}`);
-    return null;
-  }
+  });
 }
 
 async function resolveBatchLastResults(topics: string[], options: BatchLastOptions): Promise<BatchLastResult[]> {
@@ -1884,7 +1731,8 @@ async function resolveBatchLastResults(topics: string[], options: BatchLastOptio
     const topic = topics[i]!;
     const entry = lastValueMap.get(topic);
     if (entry) {
-      results[i] = buildBatchLastResult(topic, entry, "cache", null, now, options);
+      try { results[i] = buildBatchLastResult(topic, entry, "cache", null, now, options); }
+      catch (error) { results[i] = failedBatchLastResult(topic, error); }
       continue;
     }
     results[i] = {
@@ -1906,23 +1754,25 @@ async function resolveBatchLastResults(topics: string[], options: BatchLastOptio
   // we don't hammer the database on repeat requests for permanently-empty
   // topics. Successful lookups are inserted into lastValueMap so the next
   // batch call hits the fast path.
-  const eligible = misses
-    .filter(m => {
-      const lastAttempt = batchLastFallbackAttemptAt.get(m.topic);
-      return !lastAttempt || now - lastAttempt >= BATCH_LAST_FALLBACK_THROTTLE_MS;
-    })
-    .slice(0, BATCH_LAST_FALLBACK_LIMIT);
+  const eligible = misses.slice(0, BATCH_LAST_FALLBACK_LIMIT);
 
   if (eligible.length > 0) {
     await Promise.all(eligible.map(async ({ topic, idx }) => {
-      batchLastFallbackAttemptAt.set(topic, now);
-      const fallback = await tryQuestDbLastRowFallback(topic);
-      if (!fallback) return;
-      const { entry, sql } = fallback;
-      lastValueMap.set(topic, entry);
-      entityLastValueMap.updateTopic(topic, entry);
-      const hitNow = Date.now();
-      results[idx] = buildBatchLastResult(topic, entry, "questdb", sql, hitNow, options);
+      try {
+        const fallback = await tryQuestDbLastRowFallback(topic);
+        const concurrent = lastValueMap.get(topic);
+        if (!fallback && !concurrent) return;
+        const selected = fallback ? preserveConcurrentCacheValue(concurrent, fallback.entry) : { entry: concurrent!, inserted: false };
+        if (selected.inserted) {
+          lastValueMap.set(topic, selected.entry);
+          entityLastValueMap.updateTopic(topic, selected.entry);
+        }
+        results[idx] = buildBatchLastResult(topic, selected.entry, selected.inserted ? "questdb" : "cache", selected.inserted ? fallback!.sql : null, Date.now(), options);
+      } catch (error) {
+        const concurrent = lastValueMap.get(topic);
+        try { results[idx] = concurrent ? buildBatchLastResult(topic, concurrent, "cache", null, Date.now(), options) : failedBatchLastResult(topic, error); }
+        catch (conflict) { results[idx] = failedBatchLastResult(topic, conflict); }
+      }
     }));
   }
 
@@ -2003,7 +1853,7 @@ async function handleBatchLast(
       stableEntityId: selector.stableEntityId,
       attributePath: selector.attributePath,
       status: selector.status,
-      error: null,
+      error: selectedResult ? null : candidates.find(candidate => candidate.result?.error)?.result?.error ?? null,
       topic: selected?.interval.topic ?? null,
       bindingRevision: selected?.interval.bindingRevision ?? null,
       bindingDigest: selected?.interval.bindingDigest ?? null,
@@ -2015,6 +1865,7 @@ async function handleBatchLast(
       ageMs: selectedResult?.ageMs ?? null,
       source: selectedResult?.source ?? "miss",
       sql: selectedResult?.sql ?? null,
+      history: selectedResult?.history ?? null,
       candidateTopics: candidates.map((candidate) => ({
         topic: candidate.interval.topic,
         bindingRevision: candidate.interval.bindingRevision,
@@ -2025,7 +1876,7 @@ async function handleBatchLast(
     };
   });
 
-  res.status(200).json({
+  const payload = {
     results: topicResults,
     entityResults,
     stats: {
@@ -2033,7 +1884,8 @@ async function handleBatchLast(
       requestedEntities: entitySelectors.length,
       hits: topicResults.filter(r => r.source === "cache").length,
       questdbHits: topicResults.filter(r => r.source === "questdb").length,
-      misses: topicResults.filter(r => r.source === "miss").length,
+      misses: topicResults.filter(r => r.source === "miss" && !r.error).length,
+      failed: topicResults.filter(r => r.error).length,
       entityHits: entityResults.filter(r => r.source !== "miss").length,
       entityMisses: entityResults.filter(r => r.source === "miss").length,
       bindingSource: entityPlan?.bindingSource ?? null,
@@ -2041,7 +1893,9 @@ async function handleBatchLast(
       entityCacheSize: entityLastValueMap.size,
       transform: options.transform,
     },
-  });
+  };
+  if (Buffer.byteLength(JSON.stringify(payload), "utf8") > questdb.maxResponseBytes) throw new HttpError(413, "Latest-value response exceeds maxResponseBytes.");
+  res.status(200).json(payload);
 }
 
 async function handleBatchRange(
@@ -2051,6 +1905,8 @@ async function handleBatchRange(
   res: any,
   accessRules: string[],
 ): Promise<void> {
+  const captureSessionId = parseCaptureSessionId(body?.sessionId);
+  if (captureSessionId && entitySelectors.length) throw new HttpError(400, "sessionId requires explicit topic history, not entity selectors.");
   const limit = clampLimit(body?.limit, questdb.defaultLimit, questdb.maxLimit);
   const summaryOnly = toBoolean(body?.summaryOnly ?? false);
   const transform = parseHistoryTransformMode(body?.transform);
@@ -2151,9 +2007,9 @@ async function handleBatchRange(
       const { topic, range } = queryRequest;
       try {
         const tableFromDataSource = resolveTablePrefix(dataSources, topic);
-        const table =
-          tableFromDataSource ||
-          (await resolveTableFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider }));
+        const mappings = await resolveHistoryFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider });
+        const tables = tableFromDataSource ? [tableFromDataSource] : validateHistoryMappings(mappings);
+        const table = tables[0];
         if (!table) {
           return {
             ...queryRequest,
@@ -2166,8 +2022,9 @@ async function handleBatchRange(
           };
         }
 
-        const parsedPath = parseUnsPath(topic);
-        const tableSchema = await getTableSchema(questdb, table);
+        const parsedPath = { ...parseUnsPath(topic), captureSessionId };
+        const { source, schema: tableSchema } = combineHistorySchemas(tables, await Promise.all(tables.map(name => readHistory([name], "schema", () => getTableSchema(questdb, name)))));
+        assertHistoryTransform(source, transform);
         const tableColumns = tableSchema.columns;
         const entityStorage = detectEntityStorageSchema(tableColumns);
         if (queryRequest.entitySelectorIndex !== null && entityStorage.mode === "partial") {
@@ -2180,7 +2037,7 @@ async function handleBatchRange(
         let sql: string;
         if (summaryOnly) {
           sampling = { mode: "summary" };
-          sql = buildSummarySql(table, parsedPath, range, temporal, tableColumns);
+          sql = buildSummarySql(source, parsedPath, range, temporal, tableColumns);
         } else if (sampledRequested) {
           const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
           const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
@@ -2200,7 +2057,7 @@ async function handleBatchRange(
           };
           if (transform === "delta") {
             sql = buildSourceSql(
-              table,
+              source,
               parsedPath,
               counterBoundarySourceRange(range, bucketMs),
               dedupeRequested,
@@ -2214,7 +2071,7 @@ async function handleBatchRange(
               : entityPlan?.selectors[queryRequest.entitySelectorIndex] ?? null;
             const sourceSql = entityStorage.mode === "identity-aware" && entitySelector
               ? buildEntitySourceSql(
-                  table,
+                  source,
                   entitySelector.stableEntityId,
                   parsedPath,
                   range,
@@ -2224,7 +2081,7 @@ async function handleBatchRange(
                   [metricColumn, ...(unitColumn ? [unitColumn] : [])],
                 )
               : buildSourceSql(
-                  table,
+                  source,
                   parsedPath,
                   range,
                   dedupeRequested,
@@ -2241,7 +2098,7 @@ async function handleBatchRange(
             const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
             const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
             const sourceSql = buildSourceSql(
-              table,
+              source,
               parsedPath,
               range,
               dedupeRequested,
@@ -2266,7 +2123,7 @@ async function handleBatchRange(
               : entityPlan?.selectors[queryRequest.entitySelectorIndex] ?? null;
             sql = entityStorage.mode === "identity-aware" && entitySelector
               ? buildEntityDataSql(
-                  table,
+                  source,
                   entitySelector.stableEntityId,
                   parsedPath,
                   range,
@@ -2275,11 +2132,11 @@ async function handleBatchRange(
                   tableSchema,
                   temporal,
                 )
-              : buildDataSql(table, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
+              : buildDataSql(source, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
           }
         }
 
-        const rawResult = await queryQuestDb(questdb, sql);
+        const rawResult = await readHistory(tables, "query", () => queryQuestDb(questdb, sql));
         const result = sampling.mode === "bucketed" && sampling.transform === "delta"
           ? buildBoundaryCounterDeltaResponse(
               rawResult,
@@ -2313,7 +2170,8 @@ async function handleBatchRange(
             : sampling.mode === "raw" ? buildDataColumnList(tableColumns) : [],
           sql,
           stats: {
-            table,
+            table: tables.length === 1 ? table : null,
+            history: historySourceMetadata(tables, mappings),
             limit,
             from: range.from,
             to: range.to,
@@ -2336,8 +2194,8 @@ async function handleBatchRange(
           },
         };
       } catch (err) {
-        const message = err instanceof HttpError ? err.message : (err instanceof Error ? err.message : String(err));
-        return { ...queryRequest, topic, error: message, data: null, columns: null, sql: null, stats: null };
+        const message = err instanceof HttpError || err instanceof CatchallParameterError || err instanceof HistorySourceError || err instanceof HistoryReadError ? err.message : "History query failed.";
+        return { ...queryRequest, topic, error: message, data: null, columns: null, sql: null, stats: null, status: err instanceof HttpError || err instanceof CatchallParameterError || err instanceof HistorySourceError || err instanceof HistoryReadError ? err.status : 500, ...(err instanceof HistoryReadError ? { diagnostic: err.diagnostic } : {}) };
       }
     }),
   );
@@ -2455,12 +2313,6 @@ type MappingResolverConfig = {
   tokenProvider: AccessTokenProvider;
 };
 
-type QuestDbMappingEntry = {
-  topicPrefix?: string | null;
-  tableName?: string | null;
-  tablePrefix?: string | null;
-};
-
 type TableSchemaCacheEntry = {
   schema: TableSchema;
   fetchedAt: number;
@@ -2472,8 +2324,9 @@ type TemporalStrategy = {
   orderBy: string;
 };
 
-const mappingCache: { entries: QuestDbMappingEntry[]; fetchedAt: number } = { entries: [], fetchedAt: 0 };
-const MAPPINGS_TTL_MS = 60_000;
+const mappingCache = new QuestDbMappingCache({
+  onError: () => logger.warn("QuestDB mapping refresh unavailable; retaining the last valid snapshot."),
+});
 const jwksCache: { keys: JwkKey[]; fetchedAt: number } = { keys: [], fetchedAt: 0 };
 const JWKS_TTL_MS = 5 * 60_000;
 const tableSchemaCache = new Map<string, TableSchemaCacheEntry>();
@@ -2489,105 +2342,37 @@ class HttpError extends Error {
 }
 
 async function resolveTableFromController(topic: string, cfg: MappingResolverConfig): Promise<string | null> {
-  try {
-    const mappings = await getQuestDbMappings(cfg);
-    if (!mappings.length) return null;
-    const normalizedTopic = topic.replace(/^\/+|\/+$/g, "");
-    let best: { prefix: string; table: string } | null = null;
-
-    for (const entry of mappings) {
-      const prefix = (entry.topicPrefix ?? "").replace(/^\/+|\/+$/g, "");
-      const tableCandidate = sanitizeTable((entry.tableName ?? entry.tablePrefix ?? "").trim() || "");
-      if (!prefix || !tableCandidate) continue;
-      if (normalizedTopic.startsWith(prefix)) {
-        if (!best || prefix.length > best.prefix.length) {
-          best = { prefix, table: tableCandidate };
-        }
-      }
-    }
-
-    if (best) return best.table;
-
-    // Sibling fallback: if no exact prefix match, try finding a mapping for a sibling
-    // topic with the same attribute name but a different objectId (dynamic segment).
-    // For example: mat-c7d77380/location → find mat-*/location mapping.
-    const segments = normalizedTopic.split("/");
-    if (segments.length >= 2) {
-      const attributeName = segments[segments.length - 1];
-      // Try replacing the objectId (second-to-last segment) with a wildcard search
-      const parentPrefix = segments.slice(0, -2).join("/");
-      for (const entry of mappings) {
-        const prefix = (entry.topicPrefix ?? "").replace(/^\/+|\/+$/g, "");
-        const tableCandidate = sanitizeTable((entry.tableName ?? entry.tablePrefix ?? "").trim() || "");
-        if (!prefix || !tableCandidate) continue;
-        // Check if this mapping has the same parent prefix and attribute name
-        if (prefix.startsWith(parentPrefix + "/") && prefix.endsWith("/" + attributeName)) {
-          logger.debug(`resolveTableFromController sibling fallback: ${normalizedTopic} → ${tableCandidate} (via ${prefix})`);
-          return tableCandidate;
-        }
-      }
-    }
-
-    return null;
-  } catch (error) {
-    logger.warn(`resolveTableFromController failed: ${error instanceof Error ? error.message : String(error)}`);
-    return null;
-  }
+  return mappingCache.resolve(topic, signal => fetchQuestDbMappings(cfg, signal));
 }
 
-async function getQuestDbMappings(cfg: MappingResolverConfig): Promise<QuestDbMappingEntry[]> {
-  const now = Date.now();
-  if (mappingCache.entries.length && now - mappingCache.fetchedAt < MAPPINGS_TTL_MS) {
-    return mappingCache.entries;
-  }
+async function resolveHistoryFromController(topic: string, cfg: MappingResolverConfig): Promise<QuestDbMappingEntry[]> {
+  return mappingCache.resolveHistory(topic, signal => fetchQuestDbMappings(cfg, signal));
+}
+
+async function fetchQuestDbMappings(cfg: MappingResolverConfig, signal: AbortSignal): Promise<QuestDbMappingEntry[]> {
   if (!cfg.controllerGraphqlUrl) return [];
-  let token: string | null = null;
-  try {
-    token = await cfg.tokenProvider.getAccessToken() ?? null;
-  } catch (error) {
-    logger.warn(`QuestDBMappings auth error: ${error instanceof Error ? error.message : String(error)}`);
-    return [];
+  const token = await cfg.tokenProvider.getAccessToken();
+  signal.throwIfAborted();
+  if (!token) throw new Error("Controller authentication unavailable");
+  const response = await fetch(cfg.controllerGraphqlUrl, {
+    method: "POST",
+    signal,
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ query: QUESTDB_HISTORY_MAPPINGS_QUERY }),
+  });
+  const payload = await response.json() as {
+    data?: { QuestDBMappings?: QuestDbMappingEntry[] | null } | null;
+    errors?: Array<{ message?: string }>;
+  };
+  if (!response.ok || payload.errors?.length || !Array.isArray(payload.data?.QuestDBMappings)) {
+    throw new Error("Controller mapping query unavailable");
   }
-  if (!token) return [];
-
-  const query = `
-    query QuestMappings {
-      QuestDBMappings {
-        topicPrefix
-        tableName
-        tablePrefix
-      }
-    }
-  `;
-
-  try {
-    const response = await fetch(cfg.controllerGraphqlUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ query }),
-    });
-    const payload = (await response.json()) as {
-      data?: { QuestDBMappings?: QuestDbMappingEntry[] | null } | null;
-      errors?: Array<{ message?: string }>;
-    };
-    if (!response.ok) {
-      const message = payload?.errors?.[0]?.message ?? `status ${response.status}`;
-      logger.warn(`QuestDBMappings query failed: ${message}`);
-      return [];
-    }
-    const entries = (payload.data?.QuestDBMappings ?? []).filter(
-      (m): m is QuestDbMappingEntry => !!m && typeof m === "object",
-    );
-    mappingCache.entries = entries;
-    mappingCache.fetchedAt = now;
-    return entries;
-  } catch (error) {
-    logger.warn(`QuestDBMappings fetch error: ${error instanceof Error ? error.message : String(error)}`);
-    return [];
-  }
+  return payload.data.QuestDBMappings.filter((entry): entry is QuestDbMappingEntry =>
+    !!entry && typeof entry === "object" &&
+    (entry.topicPrefix == null || typeof entry.topicPrefix === "string") &&
+    (entry.tableName == null || typeof entry.tableName === "string") &&
+    (entry.tablePrefix == null || typeof entry.tablePrefix === "string") &&
+    ["dataGroup", "suffix", "questdbUrl", "processName", "packageName", "version", "updatedAt"].every(field => entry[field as keyof QuestDbMappingEntry] == null || typeof entry[field as keyof QuestDbMappingEntry] === "string"));
 }
 
 function parseProjectExtras(config: { questdb?: unknown; catchAll?: unknown; lastValueCache?: unknown; dataSources?: unknown }): {
@@ -2682,6 +2467,7 @@ function extractQueryParams(req: UnsEvents["apiGetEvent"]["req"]): Record<string
 
 type ParsedPath = {
   fullPath: string;
+  captureSessionId?: string | undefined;
   topic?: string | undefined;
   asset?: string | undefined;
   objectType?: string | undefined;
@@ -2971,6 +2757,7 @@ function buildDataColumnList(columns: Set<string>): string[] {
 function buildDedupePartitionColumns(columns: Set<string>): string[] {
   const preferredPartition = ["topic", "asset", "objectType", "objectId", "attribute", "intervalStart", "intervalEnd"];
   const selected = preferredPartition.filter(column => columns.has(column));
+  if (columns.has(HISTORY_SOURCE_COLUMN)) selected.push(HISTORY_SOURCE_COLUMN);
   if (selected.length) return selected;
   return ["topic", "asset", "objectType", "objectId", "attribute"].filter(column => columns.has(column));
 }
@@ -3063,6 +2850,8 @@ function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: TemporalStra
       "Table schema does not contain expected UNS path columns (topic/asset/objectType/objectId/attribute).",
     );
   }
+  const sessionPredicate = captureSessionPredicate(parsed.captureSessionId, columns);
+  if (sessionPredicate) parts.push(sessionPredicate);
   if (range.from) {
     parts.push(`${quoteIdentifier(temporal.toColumn)} >= ${escapeLiteral(range.from)}`);
   }
@@ -3074,7 +2863,7 @@ function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: TemporalStra
 }
 
 function buildDataSql(
-  table: string,
+  table: HistoryTableSource,
   parsed: ParsedPath,
   range: TimeRange,
   limit: number,
@@ -3085,7 +2874,7 @@ function buildDataSql(
   const where = buildWhere(parsed, range, temporal, columns);
   const selectColumns = buildDataColumnList(columns).map(quoteIdentifier).join(", ");
   const partitionColumns = buildDedupePartitionColumns(columns).map(quoteIdentifier).join(", ");
-  const tableId = quoteIdentifier(table);
+  const tableId = historyTableRelation(table, where, temporal.fromColumn);
   const canDedupe = canApplyDedupe(dedupe, columns);
   const pointTimeColumn = resolvePointTimeColumn(columns);
   if (canDedupe) {
@@ -3110,7 +2899,7 @@ function buildDataSql(
 }
 
 function buildSourceSql(
-  table: string,
+  table: HistoryTableSource,
   parsed: ParsedPath,
   range: TimeRange,
   dedupe: boolean,
@@ -3119,7 +2908,7 @@ function buildSourceSql(
   requestedColumns: string[],
 ): string {
   const where = buildWhere(parsed, range, temporal, columns);
-  const tableId = quoteIdentifier(table);
+  const tableId = historyTableRelation(table, where, temporal.fromColumn);
   const canDedupe = canApplyDedupe(dedupe, columns);
   const pointTimeColumn = resolvePointTimeColumn(columns);
   const selectedColumns = Array.from(
@@ -3148,7 +2937,7 @@ function buildSourceSql(
 }
 
 function buildSummarySql(
-  table: string,
+  table: HistoryTableSource,
   parsed: ParsedPath,
   range: TimeRange,
   temporal: TemporalStrategy,
@@ -3177,7 +2966,7 @@ function buildSummarySql(
       min(${startColumn}) AS firstTimestamp,
       max(${endColumn}) AS lastTimestamp,
       ${numericAggregates}
-    FROM ${quoteIdentifier(table)}
+    FROM ${historyTableRelation(table, where, temporal.fromColumn)}
     WHERE ${where}
   `;
 }
@@ -3327,6 +3116,7 @@ function buildCounterDeltaBucketSql(
 async function queryQuestDb(
   cfg: QuestDbConfig,
   sql: string,
+  signal?: AbortSignal,
 ): Promise<{ data: unknown[]; raw: Record<string, unknown> }> {
   const compactSql = sql.replace(/\s+/g, " ").trim();
   const controller = new AbortController();
@@ -3345,7 +3135,7 @@ async function queryQuestDb(
         Authorization: `Basic ${auth}`,
         Accept: "application/json",
       },
-      signal: controller.signal,
+      signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
     });
 
     const rawText = await response.text();
@@ -3362,7 +3152,7 @@ async function queryQuestDb(
         (parsedObject?.["error"] as string | undefined) ??
         (parsedObject?.["message"] as string | undefined) ??
         (typeof parsed === "string" ? parsed : undefined);
-      throw new Error(detailedError ? `QuestDB error ${response.status}: ${detailedError}` : `QuestDB error ${response.status}`);
+      throw new QuestDbRequestError("response", response.status, detailedError);
     }
 
     const dataset =
@@ -3375,19 +3165,22 @@ async function queryQuestDb(
     const rawWithQuery = stripDatasetFromQuestDbResponse(parsed, compactSql);
 
     return { data: dataset ?? [], raw: rawWithQuery };
+  } catch (error) {
+    if (error instanceof QuestDbRequestError) throw error;
+    throw new QuestDbRequestError(controller.signal.aborted || signal?.aborted ? "timeout" : "unavailable");
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function getTableSchema(cfg: QuestDbConfig, table: string): Promise<TableSchema> {
+async function getTableSchema(cfg: QuestDbConfig, table: string, signal?: AbortSignal): Promise<TableSchema> {
   const now = Date.now();
   const cached = tableSchemaCache.get(table);
   if (cached && now - cached.fetchedAt < TABLE_COLUMNS_TTL_MS) {
     return cached.schema;
   }
 
-  const result = await queryQuestDb(cfg, `SHOW COLUMNS FROM ${quoteIdentifier(table)}`);
+  const result = await queryQuestDb(cfg, `SHOW COLUMNS FROM ${quoteIdentifier(table)}`, signal);
   const columns = new Set<string>();
   const orderedColumns: string[] = [];
   const columnTypes = new Map<string, string>();

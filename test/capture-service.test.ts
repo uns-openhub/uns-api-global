@@ -335,8 +335,8 @@ test("trigger fire drivers open and close a capture session", async () => {
   const columns = columnsFromPayload(publishCalls[0]!.payload);
   assert.equal(columns["rowType"], "summary");
   assert.equal(columns["temperature"], 1120);
-  assert.equal(auditEvents[1]!.eventType, "closed");
-  assert.equal(auditEvents[1]!.closeReason, "triggerFire");
+  assert.equal(auditEvents.at(-1)!.eventType, "closed");
+  assert.equal(auditEvents.at(-1)!.closeReason, "triggerFire");
   service.stop();
 });
 
@@ -592,8 +592,8 @@ test("session audit records start and close evidence", async () => {
   now = 30_000;
   await service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "t2" });
 
-  assert.equal(auditEvents.length, 2);
-  assert.deepEqual(auditEvents[1]!, {
+  assert.equal(auditEvents.length, 3);
+  assert.deepEqual(auditEvents.at(-1)!, {
     eventType: "closed",
     captureId: BASE_CAPTURE.id,
     captureName: BASE_CAPTURE.name,
@@ -641,11 +641,11 @@ test("registry refresh closes active sessions that are no longer enabled", async
   assert.equal(columns["rowType"], "summary");
   assert.equal(columns["temperature"], 1115);
   assert.equal(columns["endedAt"], "1970-01-01T00:00:25.000Z");
-  assert.equal(auditEvents.length, 2);
-  assert.equal(auditEvents[1]!.eventType, "closed");
-  assert.equal(auditEvents[1]!.closeReason, "disabled");
-  assert.equal(auditEvents[1]!.rowCount, 1);
-  assert.equal(auditEvents[1]!.lastRowAt, "1970-01-01T00:00:25.000Z");
+  assert.equal(auditEvents.length, 3);
+  assert.equal(auditEvents.at(-1)!.eventType, "closed");
+  assert.equal(auditEvents.at(-1)!.closeReason, "disabled");
+  assert.equal(auditEvents.at(-1)!.rowCount, 1);
+  assert.equal(auditEvents.at(-1)!.lastRowAt, "1970-01-01T00:00:25.000Z");
   service.stop();
 });
 
@@ -678,8 +678,7 @@ test("interval mode publishes full snapshot rows while the session is active", a
   cache["factory/line/furnace/temp"] = { value: 1110 };
   now = 21_000;
   timers.intervals[0]!.callback();
-  await Promise.resolve();
-  await Promise.resolve();
+  await new Promise(resolve => setImmediate(resolve));
 
   assert.equal(publishCalls.length, 1);
   const columns = columnsFromPayload(publishCalls[0]!.payload);
@@ -798,5 +797,125 @@ test("skipRow suppresses rows when a required mapped value is missing", async ()
 
   assert.equal(publishCalls.length, 0);
   assert.equal(service.getRuntimeStates()[0]!.metrics.lastSuppressedReason, "required_value_missing");
+  service.stop();
+});
+
+test("publisher preserves explicit emission identity and generates one for legacy rows", async () => {
+  const publisher = new CapturePublisher({ publish: () => undefined });
+  const row = { eventId: "emission-stable", sessionId: "session-same", startedAt: "2026-10-06T10:00:00.000Z", sampledAt: "2026-10-06T10:00:01.000Z", rowType: "change" as const, values: { temperature: 900 } };
+  const first = await publisher.buildPayload(row);
+  const replay = await publisher.buildPayload(row);
+  assert.deepEqual(replay, first);
+  assert.equal(first.message.table?.eventId, "emission-stable");
+  assert.equal(first.message.table?.time, row.sampledAt);
+  assert.equal(first.message.table?.columns["eventId"], undefined);
+  const { eventId: _eventId, ...legacy } = row;
+  const a = await publisher.buildPayload(legacy);
+  const b = await publisher.buildPayload(legacy);
+  assert.ok(a.message.table?.eventId);
+  assert.notEqual(a.message.table?.eventId, b.message.table?.eventId);
+});
+
+test("same-time multi-input changes and summary have distinct identities and exact audit counts", async () => {
+  const auditEvents: CaptureSessionAuditEvent[] = [];
+  const capture: CaptureDefinition = { ...BASE_CAPTURE,
+    inputMappings: [...BASE_CAPTURE.inputMappings, { topic: "factory/line/furnace/pressure", columnName: "pressure", sourceType: "data", required: false, uomMode: "none" }],
+    captureConfig: { ...BASE_CAPTURE.captureConfig, modes: [{ type: "onChange", driverTopics: [] }, { type: "summary" }] },
+  };
+  const { service, cache, publishCalls } = makeServices([capture], { auditEvents, now: () => 20_000, cache: {
+    "factory/line/furnace/state": { value: "IDLE" },
+    "factory/line/furnace/temp": { value: 900 },
+    "factory/line/furnace/pressure": { value: 20 },
+  } });
+  await service.start();
+  await service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "t0" });
+  cache["factory/line/furnace/state"] = { value: "RUNNING" };
+  await service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "t0-start" });
+  await Promise.all([
+    service.onMessage({ topic: "factory/line/furnace/temp", sourceTimestamp: "t1" }),
+    service.onMessage({ topic: "factory/line/furnace/pressure", sourceTimestamp: "t1" }),
+  ]);
+  cache["factory/line/furnace/state"] = { value: "COMPLETE" };
+  await service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "t1" });
+  const tables = publishCalls.map(call => JSON.parse(call.payload).message.table);
+  assert.equal(tables.length, 3);
+  assert.equal(new Set(tables.map(table => table.time)).size, 1);
+  assert.equal(new Set(tables.map(table => table.eventId)).size, 3);
+  assert.deepEqual(tables.map(table => table.columns.rowType.value), ["change", "change", "summary"]);
+  assert.equal(auditEvents.find(event => event.eventType === "closed")?.rowCount, 3);
+  service.stop();
+});
+
+test("rejected Capture publish is not counted and leaves a runtime diagnostic", async () => {
+  const capture: CaptureDefinition = { ...BASE_CAPTURE, captureConfig: { ...BASE_CAPTURE.captureConfig, modes: [{ type: "onChange", driverTopics: [] }] } };
+  const registry = new CaptureRegistry({ controllerRestUrl: "http://localhost:3200/api", getAccessToken: async () => "test", refreshIntervalMs: 60_000, fetchImpl: fakeFetch([capture]) as typeof fetch });
+  let running = false;
+  const service = new CaptureService({ registry, publisher: new CapturePublisher({ publish: async () => { throw new Error("publisher rejected"); } }), now: () => 20_000, timers: makeTimers().api, getLastValue: topic => ({ value: topic.endsWith("state") ? (running ? "RUNNING" : "IDLE") : 900, uom: null, time: "2026-10-06T10:00:00.000Z", receivedAt: 20_000 }) });
+  await service.start();
+  await service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "t0" });
+  running = true;
+  await service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "t0-start" });
+  await assert.rejects(service.onMessage({ topic: "factory/line/furnace/temp", sourceTimestamp: "t1" }), /publisher rejected/);
+  const state = service.getRuntimeStates()[0]!;
+  assert.equal(state.rowCount, 0);
+  assert.equal(state.metrics.rowCount, 0);
+  assert.match(state.metrics.lastSuppressedReason!, /publish_error:publisher rejected/);
+  service.stop();
+});
+
+
+test("closing audit waits for an already pending change publish", async () => {
+  const capture: CaptureDefinition = { ...BASE_CAPTURE, captureConfig: { ...BASE_CAPTURE.captureConfig, modes: [{ type: "onChange", driverTopics: [] }, { type: "summary" }] } };
+  const registry = new CaptureRegistry({ controllerRestUrl: "http://localhost:3200/api", getAccessToken: async () => "test", refreshIntervalMs: 60_000, fetchImpl: fakeFetch([capture]) as typeof fetch });
+  let state = "IDLE";
+  let temperature = 900;
+  let summaryTemperature: unknown;
+  let release!: () => void;
+  const pendingChange = new Promise<void>(resolve => { release = resolve; });
+  const events: CaptureSessionAuditEvent[] = [];
+  const published: string[] = [];
+  const service = new CaptureService({ registry, publisher: new CapturePublisher({ publish: async ({ payload }) => {
+    const type = JSON.parse(payload).message.table.columns.rowType.value;
+    if (type === "change") await pendingChange;
+    published.push(type);
+    if (type === "summary") summaryTemperature = JSON.parse(payload).message.table.columns.temperature.value;
+  } }), now: () => 20_000, timers: makeTimers().api, auditSession: event => { events.push(event); }, getLastValue: topic => ({ value: topic.endsWith("state") ? state : temperature, uom: null, time: "2026-10-06T10:00:00.000Z", receivedAt: 20_000 }) });
+  await service.start();
+  await service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "t0" });
+  state = "RUNNING";
+  await service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "t1" });
+  const change = service.onMessage({ topic: "factory/line/furnace/temp", sourceTimestamp: "t2" });
+  await new Promise(resolve => setImmediate(resolve));
+  state = "COMPLETE";
+  const close = service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "t2" });
+  await new Promise(resolve => setImmediate(resolve));
+  temperature = 999;
+  await service.onMessage({ topic: "factory/line/furnace/temp", sourceTimestamp: "after-close" });
+  try {
+    assert.equal(events.filter(event => event.eventType === "closed").length, 0);
+  } finally { release(); await Promise.all([change, close]); service.stop(); }
+  assert.deepEqual(published, ["change", "summary"]);
+  assert.equal(summaryTemperature, 900);
+  assert.equal(events.find(event => event.eventType === "closed")?.rowCount, 2);
+});
+
+
+test("failed closing summary audits only successful rows and does not strand the session", async () => {
+  const capture: CaptureDefinition = { ...BASE_CAPTURE, captureConfig: { ...BASE_CAPTURE.captureConfig, windowMode: "alwaysOn", modes: [{ type: "summary" }] } };
+  const registry = new CaptureRegistry({ controllerRestUrl: "http://localhost:3200/api", getAccessToken: async () => "test", refreshIntervalMs: 60_000, fetchImpl: fakeFetch([capture]) as typeof fetch });
+  let state = "IDLE";
+  const audit: CaptureSessionAuditEvent[] = [];
+  const service = new CaptureService({ registry, publisher: new CapturePublisher({ publish: async () => { throw new Error("summary rejected"); } }), now: () => 20_000, timers: makeTimers().api, auditSession: event => { audit.push(event); }, getLastValue: topic => ({ value: topic.endsWith("state") ? state : 900, uom: null, time: "2026-10-06T10:00:00.000Z", receivedAt: 20_000 }) });
+  await service.start();
+  await service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "t0" });
+  state = "COMPLETE";
+  await service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "t1" });
+  assert.equal(service.getRuntimeStates()[0]!.active, false);
+  const closed = audit.find(event => event.eventType === "closed")!;
+  assert.equal(closed.rowCount, 0);
+  assert.match(closed.lastSuppressedReason!, /publish_error:summary rejected/);
+  state = "IDLE";
+  await service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "t2" });
+  assert.equal(service.getRuntimeStates()[0]!.active, true);
   service.stop();
 });

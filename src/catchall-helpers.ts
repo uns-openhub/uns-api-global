@@ -1,3 +1,4 @@
+import { HISTORY_SOURCE_COLUMN, historyTableRelation, type HistoryTableSource } from "./history-table-source.js";
 import { randomUUID } from "node:crypto";
 import { UnsTopicMatcher } from "@uns-kit/core/uns/uns-topic-matcher.js";
 
@@ -15,6 +16,7 @@ export type QuestDbRangeConfig = {
 
 export type ParsedPath = {
   fullPath: string;
+  captureSessionId?: string | undefined;
   topic?: string | undefined;
   asset?: string | undefined;
   objectType?: string | undefined;
@@ -414,6 +416,7 @@ export function buildDataColumnList(schema: TableSchema): string[] {
 export function buildDedupePartitionColumns(schema: TableSchema): string[] {
   const preferredPartition = ["topic", "asset", "objectType", "objectId", "attribute", "intervalStart", "intervalEnd"];
   const selected = preferredPartition.filter(column => schema.columns.has(column));
+  if (schema.columns.has(HISTORY_SOURCE_COLUMN)) selected.push(HISTORY_SOURCE_COLUMN);
   if (selected.length) return selected;
   return ["topic", "asset", "objectType", "objectId", "attribute"].filter(column => schema.columns.has(column));
 }
@@ -422,6 +425,22 @@ export function canApplyDedupe(dedupeRequested: boolean, schema: TableSchema): b
   if (!dedupeRequested) return false;
   if (!resolvePointTimeColumn(schema)) return false;
   return buildDedupePartitionColumns(schema).length > 0;
+}
+
+/** Optional exact Capture restriction. Never substitutes for topic authorization. */
+export function parseCaptureSessionId(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(value)) {
+    throw new HttpError(400, "sessionId must be a non-empty identifier of at most 128 characters.");
+  }
+  return value;
+}
+
+export function captureSessionPredicate(value: unknown, columns: Set<string>): string | undefined {
+  const id = parseCaptureSessionId(value);
+  if (id === undefined) return undefined;
+  if (!columns.has("sessionId")) throw new HttpError(400, "Selected history does not contain a sessionId column.");
+  return `${quoteIdentifier("sessionId")} = ${escapeLiteral(id)}`;
 }
 
 export function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: TemporalStrategy, schema: TableSchema): string {
@@ -444,6 +463,8 @@ export function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: Tempo
       "Table schema does not contain expected UNS path columns (topic/asset/objectType/objectId/attribute).",
     );
   }
+  const sessionPredicate = captureSessionPredicate(parsed.captureSessionId, schema.columns);
+  if (sessionPredicate) parts.push(sessionPredicate);
   if (range.from) {
     parts.push(`${quoteIdentifier(temporal.toColumn)} >= ${escapeLiteral(range.from)}`);
   }
@@ -455,7 +476,7 @@ export function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: Tempo
 }
 
 export function buildSourceSql(
-  table: string,
+  table: HistoryTableSource,
   parsed: ParsedPath,
   range: TimeRange,
   dedupe: boolean,
@@ -464,7 +485,7 @@ export function buildSourceSql(
   requestedColumns: string[],
 ): string {
   const where = buildWhere(parsed, range, temporal, schema);
-  const tableId = quoteIdentifier(table);
+  const tableId = historyTableRelation(table, where, temporal.fromColumn);
   const canDedupe = canApplyDedupe(dedupe, schema);
   const pointTimeColumn = resolvePointTimeColumn(schema);
   const selectedColumns = Array.from(
@@ -493,7 +514,7 @@ export function buildSourceSql(
 }
 
 export function buildDataSql(
-  table: string,
+  table: HistoryTableSource,
   parsed: ParsedPath,
   range: TimeRange,
   limit: number,
@@ -511,7 +532,7 @@ export function buildDataSql(
 }
 
 export function buildEntityDataSql(
-  table: string,
+  table: HistoryTableSource,
   stableEntityId: string,
   parsed: ParsedPath,
   range: TimeRange,
@@ -539,7 +560,7 @@ export function buildEntityDataSql(
 }
 
 export function buildEntitySourceSql(
-  table: string,
+  table: HistoryTableSource,
   stableEntityId: string,
   parsed: ParsedPath,
   range: TimeRange,
@@ -577,7 +598,7 @@ export function buildEntitySourceSql(
     rangeParts.push(`${quoteIdentifier(temporal.fromColumn)} ${operator} ${escapeLiteral(range.to)}`);
   }
   const where = `(((${identityWhere}) OR (${quoteIdentifier("stableEntityId")} IS NULL AND ${legacyPathWhere})))${rangeParts.length ? ` AND ${rangeParts.join(" AND ")}` : ""}`;
-  const tableId = quoteIdentifier(table);
+  const tableId = historyTableRelation(table, where, temporal.fromColumn);
   const canDedupe = canApplyDedupe(dedupe, schema);
   const pointTimeColumn = resolvePointTimeColumn(schema);
   const selectedColumns = Array.from(

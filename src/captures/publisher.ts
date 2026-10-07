@@ -4,6 +4,7 @@
 // runtime decides when rows should be emitted; this module only translates a
 // row into a table message and delegates packet construction to uns-kit core.
 
+import { randomUUID } from "node:crypto";
 import { UnsPacket } from "@uns-kit/core/uns/uns-packet.js";
 import {
   isIOS8601Type,
@@ -64,6 +65,8 @@ export class CapturePublisher {
       table: {
         time: asIso8601(row.sampledAt, "sampledAt"),
         dataGroup,
+        // Same-time snapshots are separate emissions; replay keeps this packet ID.
+        eventId: row.eventId ?? randomUUID(),
         columns,
       },
     });
