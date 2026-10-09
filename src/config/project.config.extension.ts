@@ -40,6 +40,60 @@ const questDbUrlSchema = secretValueSchema.refine(
 
 export const projectExtrasSchema = z.object({
   questdb: z.object({
+    queryDiagnostics: z
+      .object({
+        databaseLabel: z
+          .string()
+          .regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/)
+          .default("questdb")
+          .describe(
+            "Non-secret logical database label, for example history-replica",
+          ),
+        failureCooldownMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(60000)
+          .default(5000)
+          .describe(
+            "Pause new queries after dependency timeouts, connection failures or HTTP 5xx",
+          ),
+        maxConcurrent: z
+          .number()
+          .int()
+          .min(1)
+          .max(64)
+          .default(4)
+          .describe("Maximum simultaneous QuestDB queries in this API process"),
+        maxQueued: z
+          .number()
+          .int()
+          .min(0)
+          .max(1000)
+          .default(64)
+          .describe("Bounded waiting queue; excess work returns 503"),
+        queueTimeoutMs: z
+          .number()
+          .int()
+          .min(1)
+          .max(60000)
+          .default(1000)
+          .describe("Maximum queue wait before 503"),
+        slowQueryMs: z
+          .number()
+          .int()
+          .positive()
+          .default(1000)
+          .describe("Slow-query diagnostic threshold in milliseconds"),
+      })
+      .default({
+        databaseLabel: "questdb",
+        failureCooldownMs: 5000,
+        maxConcurrent: 4,
+        maxQueued: 64,
+        queueTimeoutMs: 1000,
+        slowQueryMs: 1000,
+      }),
     url: questDbUrlSchema.describe(
       "Base URL for QuestDB HTTP API (e.g. http://questdb:9000)",
     ),

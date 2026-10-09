@@ -157,6 +157,20 @@ export interface ProjectAppConfig {
         project?: string | undefined;
     } | undefined;
     questdb: {
+        queryDiagnostics?: {
+            /** Non-secret logical database label, for example history-replica */
+            databaseLabel?: string;
+            /** Pause new queries after dependency timeouts, connection failures or HTTP 5xx */
+            failureCooldownMs?: number;
+            /** Maximum simultaneous QuestDB queries in this API process */
+            maxConcurrent?: number;
+            /** Bounded waiting queue; excess work returns 503 */
+            maxQueued?: number;
+            /** Maximum queue wait before 503 */
+            queueTimeoutMs?: number;
+            /** Slow-query diagnostic threshold in milliseconds */
+            slowQueryMs?: number;
+        };
         /** Base URL for QuestDB HTTP API (e.g. http://questdb:9000) */
         url: string | ({
             /** Load the secret from an environment variable. */
