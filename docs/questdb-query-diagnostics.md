@@ -2,18 +2,20 @@
 
 ## Development and release boundary
 
-This is an unreleased integration on the latest API development source, including
-retained history mappings (`QuestDBMappings(includeHistory: true)`), multi-source
-history, latest-value recovery and automation recovery. The development baseline
-is snapshot commit `cc97fb0`, taken from the existing pending API checkout without
-changing it. The initial released-4.1.11 diagnostics branch is superseded for this
-work; no legacy-controller mapping adapter is included here.
+Release candidate **4.1.13** is based on released API **4.1.12**, commit
+`fbf3ede3a0952ab0958214978628d1d7246e2e95`, with the diagnostics/workload
+changes applied as a separate delta. Retained history mappings
+(`QuestDBMappings(includeHistory: true)`), multi-source history, latest-value
+recovery and automation recovery remain from that released baseline. The earlier
+4.1.11 development snapshot is retained only as historical evidence.
 
-Deploy this work with a controller that supports the new history contract. Old
-production controller 2.1.138 is not a target for this integration. Controller
-and API upgrade, artifact versions and production rollout remain separate steps.
-The root API version is still 4.1.11; that version must not be republished for
-this unreleased development tree.
+The declared supported controller baseline is **2.1.144 or newer, below 3**.
+Controller main at `4ae108d5c05d7bd9456988461f5526dfa6bba466` already contains
+the required history contract. No new controller runtime code is required for
+this slice. Upgrade the controller before installing this API where an older
+controller is still deployed. Old production controller 2.1.138 is not a target;
+there is no legacy mapping fallback. Package versions and source/CI evidence do
+not by themselves approve a production rollout.
 
 The controller signs user subjects and machine identity IDs/names and forwards
 the bearer token. API Global verifies the signature before using the caller
@@ -178,9 +180,10 @@ independent cancellation; coordinator tests link joined callers to schema/data
 executions. This is not live controller-to-API acceptance.
 
 Toolkit publication, API dependency locking and registry-package verification are
-complete. Produce a new, unused API version plus the matching latest controller
-artifact. In
-staging, exercise the actual controller → API proxy/auth path, browser headers,
+complete. The source release candidate is API 4.1.13 with controller 2.1.144 or
+newer. Merging its version PR creates a Git tag and GitHub source release via
+the repository workflow; that does not verify an installed Runtime artifact.
+In staging, exercise the actual controller → API proxy/auth path, browser headers,
 administrator-only Swagger endpoint, partial batch failures and representative
 multi-source/interval history. Then approve a coordinated production upgrade,
 compare caller/query-family rates and replica metrics, and tune from evidence.
