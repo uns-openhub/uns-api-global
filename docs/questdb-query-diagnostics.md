@@ -21,10 +21,11 @@ label. No unsigned caller header or new identity-forwarding protocol is needed.
 The safe toolkit HTTP logger is required because earlier toolkit versions logged
 URLs and unverified decoded emails before the API handler could redact them.
 
-UNS kit 3.0.22 is built and committed but, as checked on 2026-10-09, not yet
-available on npm. Startup rejects the old logger. Publish the toolkit first,
-then set the API dependency floor and lockfile to at least 3.0.22. Verification
-with local built packages does not prove a distributable npm-resolved artifact.
+UNS kit 3.0.22 was published on 2026-10-09. This API now declares minimum
+API/core package versions `^3.0.22`, with both packages locked to npm 3.0.22.
+Verification used a fresh registry installation and `pnpm install
+--frozen-lockfile`, with no local toolkit links. Startup rejects the old logger;
+the safe logger prerequisite passed against the installed published API package.
 
 ## Source findings: old incident versus current development
 
@@ -168,15 +169,17 @@ counters and actual loopback HTTP execution/failures/timeouts. Kit tests verify
 that middleware omits URL/token/email and logs completion/disconnect once.
 
 No production database queries or deployment are part of this verification.
-The latest integration passed 210 tests, typecheck and build with the actual locally built kit
-3.0.22 (the preceding 209-test pass also used the existing locked packages). The safe
-logger startup prerequisite was also exercised against that built package.
+The latest integration passed 210 tests, typecheck and build with both the local
+built toolkit and, subsequently, the npm-installed kit 3.0.22. The safe logger
+startup prerequisite also passed against the installed published package.
+Configuration schema regeneration produced no additional changes.
 Loopback HTTP tests include preserved history-source error classification and
 independent cancellation; coordinator tests link joined callers to schema/data
 executions. This is not live controller-to-API acceptance.
 
-After kit publication and dependency-lock update, repeat verification and produce
-a new, unused API version plus the matching latest controller artifact. In
+Toolkit publication, API dependency locking and registry-package verification are
+complete. Produce a new, unused API version plus the matching latest controller
+artifact. In
 staging, exercise the actual controller → API proxy/auth path, browser headers,
 administrator-only Swagger endpoint, partial batch failures and representative
 multi-source/interval history. Then approve a coordinated production upgrade,

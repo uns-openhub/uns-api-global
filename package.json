@@ -49,8 +49,8 @@
     "identity:reconciliation-plan": "tsx src/local-tools/identity-reconciliation-plan.ts"
   },
   "dependencies": {
-    "@uns-kit/api": "^3.0.16",
-    "@uns-kit/core": "^3.0.16",
+    "@uns-kit/api": "^3.0.22",
+    "@uns-kit/core": "^3.0.22",
     "jsonwebtoken": "^9.0.3",
     "zod": "^4.4.3"
   },
