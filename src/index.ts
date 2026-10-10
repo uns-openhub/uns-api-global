@@ -1,4 +1,11 @@
-import { QuestDbRequestError, HistoryReadError, readHistory } from "./history-source-diagnostics.js";
+import { RouteOwnerRegistration, routeRegistrationEnvironment } from "./route-owner-registration.js";
+import { AuthorizationStatus, AuthorizationStatusError } from "./authorization-status.js";
+import { resolveQueryDeploymentBudget } from "./query-deployment-budget.js";
+import * as apiRequestLogging from "@uns-kit/api/request-log.js";
+import { requireSafeRequestLogging } from "./query-diagnostics-prerequisites.js";
+import { QueryDiagnostics, QueryWorkloadError } from "./query-diagnostics.js";
+import { queryQuestDbHttp, QuestDbQueryError } from "./questdb-http.js";
+import { HistoryReadError, readHistory } from "./history-source-diagnostics.js";
 import { buildLatestHistorySql, selectArchivedLatest, preserveConcurrentCacheValue, LatestLookupCoordinator, LatestLookupError } from "./latest-value-history.js";
 import { HISTORY_SOURCE_COLUMN, HistorySourceError, historyTableRelation, combineHistorySchemas, validateHistoryMappings, assertHistoryTransform, historySourceMetadata, type HistoryTableSource } from "./history-table-source.js";
 import { QuestDbMappingCache, QUESTDB_HISTORY_MAPPINGS_QUERY, type QuestDbMappingEntry } from "./questdb-mapping-cache.js";
@@ -61,7 +68,9 @@ import {
   computeCounterDeltaValue,
   counterBoundarySourceRange,
   isTopicAllowedByAccessRules,
+  isQueryDiagnosticsRequest,
   resolvePointTimeColumn as resolvePointTimeColumnFromSchema,
+  resolveTemporalStrategy as resolveTemporalStrategyFromSchema,
 } from "./catchall-helpers.js";
 
 type TimeRange = { from?: string; to?: string; note?: string; toExclusive?: boolean };
@@ -143,12 +152,25 @@ const NON_VALUE_COLUMNS = new Set([
   "interval",
 ]);
 
+requireSafeRequestLogging(apiRequestLogging);
 const config = await ConfigFile.loadConfig();
-const { questdb, catchAll, lastValueCache: lastValueCacheConfig, dataSources } = parseProjectExtras(config);
+const { authorization: authorizationConfig, questdb, catchAll, lastValueCache: lastValueCacheConfig, dataSources } = parseProjectExtras(config);
+const verifiedRequestClaims = new WeakMap<object, JwtClaims>();
+const queryDiagnostics = new QueryDiagnostics({
+  ...questdb.queryDiagnostics,
+  ...resolveQueryDeploymentBudget(questdb.queryDiagnostics),
+  emit: event => {
+    const log = { ...event, component: "questdb-query-diagnostics", message: "QuestDB workload diagnostics" };
+    if (event["slow"] || event["outcome"] === "failed" || event["outcome"] === "timeout") logger.warn(log);
+    else logger.info(log);
+  },
+});
 const apiBasePath = normalizeBasePath(catchAll.apiBasePath ?? "/api/catchall");
 const catchAllSwaggerPath = catchAll.swaggerPath ?? "/uns-api-global/general-api/catchall-swagger.json";
 const controllerGraphqlUrl = typeof config.uns?.graphql === "string" ? config.uns.graphql.replace(/\/+$/, "") : null;
 const controllerRestUrl = typeof config.uns?.rest === "string" ? config.uns.rest.replace(/\/+$/, "") : null;
+const authorizationStatus = new AuthorizationStatus({ controllerRest: controllerRestUrl, mode: authorizationConfig.mode, cacheMs: authorizationConfig.statusCacheMs });
+if (authorizationConfig.mode === "offline") logger.warn("Authorization status checks are explicitly disabled; offline JWT mode does not enforce immediate identity revocation.");
 let legacyAuthClient: Promise<AuthClient | null> | undefined;
 const legacyAuthFallback: AccessTokenProvider = {
   async getAccessToken(): Promise<string | undefined> {
@@ -225,7 +247,7 @@ function reportAutomationHealth(health: RegistryHealth): void {
 async function refreshQuestDbHealth(): Promise<QuestDbDependencyHealth> {
   const checkedAt = new Date().toISOString();
   try {
-    await queryQuestDb(questdb, "SELECT 1");
+    await queryQuestDb(questdb, "SELECT 1", undefined, "health");
     latestQuestDbHealth = {
       id: "questdb",
       label: "QuestDB",
@@ -324,6 +346,14 @@ const swaggerDoc = {
     description: catchAll.description ?? "Catch-all UNS data API",
   },
   paths: {
+    [`${apiBasePath}/diagnostics/queries`]: {
+      get: {
+        summary: "Inspect active and recent QuestDB queries",
+        description: "Administrator only. Safe caller IDs, request/query correlation, fingerprints, workload limits and cache counters. No SQL, topics, credentials or parameters are exposed.",
+        tags: ["Diagnostics"], security: [{ bearerAuth: [] }],
+        responses: { "200": { description: "Bounded process-local diagnostic snapshot" }, "401": { description: "Authentication required" }, "403": { description: "Administrator role required" } },
+      },
+    },
     [`${apiBasePath}/{topicPath}`]: {
       get: {
         summary: catchAll.description ?? "Catch-all UNS data API",
@@ -803,6 +833,22 @@ const catchAllTopicFilters = Array.from(
   ),
 );
 
+const routeEnvironment = routeRegistrationEnvironment(process.env);
+const routeOwnerRegistration = routeEnvironment ? new RouteOwnerRegistration({ ...routeEnvironment,
+  processName: config.uns.processName,
+  onState: ready => {
+    if (ready) logger.info("Runtime route ownership registered with the owning controller.");
+    else logger.warn("Runtime route ownership registration unavailable; retrying in the background.");
+  },
+  onReady: async () => {
+    for (const filter of catchAllTopicFilters.length ? catchAllTopicFilters : ["#"]) await apiInput.registerCatchAll(filter, catchAllRegistrationOptions);
+  },
+}) : undefined;
+apiInput.event.on("unsProxyProducedApiCatchAll", event => {
+  try { routeOwnerRegistration?.observe(event.producedCatchall); }
+  catch { logger.warn("Route ownership registration received inconsistent runtime origins."); }
+});
+
 for (const topicFilter of catchAllTopicFilters.length ? catchAllTopicFilters : ["#"]) {
   await apiInput.registerCatchAll(topicFilter, catchAllRegistrationOptions);
 }
@@ -818,9 +864,21 @@ setInterval(() => {
 
 apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
   const { req, res } = event;
-  const requestId = resolveRequestId(req?.headers?.["x-request-id"]);
+  const middlewareId = (req as unknown as Record<symbol, unknown>)[Symbol.for("uns.http.request-id")];
+  const requestId = typeof middlewareId === "string" ? middlewareId : randomUUID();
   res.setHeader("x-request-id", requestId);
 
+  const pathForDiagnostics = normalizeRequestPath(req.path ?? "");
+  const operation = isBatchRequest(req) ? (resolveBatchMode(req, req.body) === "range" ? "batch-range" : "batch-last")
+    : isQueryDiagnosticsRequest(pathForDiagnostics, apiBasePath) ? "query-diagnostics"
+    : pathForDiagnostics.endsWith("/triggers/runtime") ? "trigger-runtime"
+    : pathForDiagnostics.endsWith("/captures/runtime") ? "capture-runtime"
+    : isSwaggerDefinitionRequest(pathForDiagnostics, catchAll.swaggerPath) ? "swagger" : "history";
+  await queryDiagnostics.runRequest(requestId, operation, () => handleApiRequest(event, requestId));
+});
+
+async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: string): Promise<void> {
+  const { req, res } = event;
   try {
     // Intercept POST /api/catchall/batch before the normal GET handler
     if (isBatchRequest(req)) {
@@ -833,6 +891,13 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
       res.status(200).json(swaggerDoc);
       return;
     }
+
+    const bearer = extractBearerToken(req?.headers?.["authorization"]);
+    if (!bearer) throw new HttpError(401, "Missing Authorization header");
+    const authenticatedClaims = await verifyTokenClaims(bearer, catchAllAuth);
+    queryDiagnostics.authenticate(authenticatedClaims);
+    await authorizationStatus.check(bearer);
+    verifiedRequestClaims.set(req, authenticatedClaims);
 
     // Stage 4b — admin-only runtime inspection endpoint.  Returns
     // per-trigger live state (lastSeenValue, lastFiredAt, fireCount,
@@ -876,6 +941,14 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
         states: captureService.getRuntimeStates(),
         capturedAt: new Date().toISOString(),
       });
+      return;
+    }
+
+    const isQueryDiagnostics = isQueryDiagnosticsRequest(requestPath, apiBasePath);
+    if (isQueryDiagnostics) {
+      const claims = authenticatedClaims;
+      if (!Array.isArray(claims["roles"]) || !claims["roles"].includes("admin")) throw new HttpError(403, "Administrator role required");
+      res.status(200).json({ ...queryDiagnostics.snapshot(), authorization: authorizationStatus.snapshot() });
       return;
     }
 
@@ -1076,16 +1149,17 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
 
     res.status(200).json(payload);
   } catch (error) {
-    if (error instanceof HttpError || error instanceof CatchallParameterError || error instanceof HistorySourceError || error instanceof HistoryReadError) {
+    if (error instanceof AuthorizationStatusError || error instanceof HttpError || error instanceof CatchallParameterError || error instanceof HistorySourceError || error instanceof HistoryReadError || error instanceof QueryWorkloadError || error instanceof QuestDbQueryError) {
       res.status(error.status).json({ error: error.message, requestId, ...(error instanceof HistoryReadError ? { diagnostic: error.diagnostic } : {}) });
       return;
     }
 
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error(`[${requestId}] catch-all handler error: ${message}`);
+    logger.error({ component: "questdb-query-diagnostics", event: "http.failed", requestId, message: "Catch-all request failed; inspect correlated query diagnostics." });
     res.status(500).json({ error: "Internal server error", requestId });
+  } finally {
+    queryDiagnostics.finishRequest(res.statusCode);
   }
-});
+}
 
 // ─── Last-Value Cache (MQTT subscription + in-memory map) ───────────────────
 
@@ -1106,7 +1180,12 @@ type LastValueEntry = {
 
 const lastValueMap = new Map<string, LastValueEntry>();
 const entityLastValueMap = new EntityLastValueCache<LastValueEntry>();
-const latestLookupCoordinator = new LatestLookupCoordinator<{ entry: LastValueEntry; sql: string }>({ timeoutMs: Math.min(questdb.statementTimeoutMs, 5_000) });
+const latestLookupCoordinator = new LatestLookupCoordinator<{ entry: LastValueEntry; sql: string }>({
+  timeoutMs: Math.min(questdb.statementTimeoutMs, 5_000),
+  runLookup: (lookupId, load) => queryDiagnostics.runRecovery(lookupId, load),
+  onJoin: lookupId => queryDiagnostics.joinRecovery(lookupId),
+  onThrottle: () => queryDiagnostics.cache("throttled"),
+});
 let lvMqttInput: UnsMqttProxy | undefined;
 let lvActiveTopics: string[] = [];
 let triggerService: TriggerService | undefined;
@@ -1326,8 +1405,8 @@ async function initLastValueCache(): Promise<void> {
 
   // Seed cache from QuestDB — fetch last known value for each topic so the
   // cache is warm even after a restart (before MQTT delivers new messages).
-  seedCacheFromQuestDb(lvActiveTopics).catch(err => {
-    logger.warn(`[last-value-cache] QuestDB seed failed: ${err instanceof Error ? err.message : err}`);
+  queryDiagnostics.runBackground("cache-seed", () => seedCacheFromQuestDb(lvActiveTopics)).catch(err => {
+    logger.warn("[last-value-cache] QuestDB seed failed; inspect correlated recovery diagnostics.");
   });
 
   logger.info("[last-value-cache] Initialized.");
@@ -1510,7 +1589,7 @@ async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
           seeded++;
         }
       } catch (error) {
-        logger.debug(`[last-value-cache] Seed unavailable: ${error instanceof Error ? error.message : 'lookup failed'}`);
+        logger.debug("[last-value-cache] Seed unavailable; inspect correlated recovery diagnostics.");
       }
     }
   }));
@@ -1694,7 +1773,7 @@ async function tryQuestDbLastRowFallback(topic: string): Promise<{ entry: LastVa
     const { source, schema } = combineHistorySchemas(tables, await Promise.all(tables.map(table => readHistory([table], "schema", () => getTableSchema(questdb, table, signal)))));
     const temporal = resolveTemporalStrategy(schema.columns, 'auto');
     const sql = buildLatestHistorySql(source, topic, schema, temporal);
-    const result = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, signal));
+    const result = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, signal, "latest-fallback"));
     const scanRows = extractScanRowCount(result.raw);
     if (scanRows !== null && scanRows > questdb.maxScanRows) throw new LatestLookupError("Latest-value recovery exceeds maxScanRows.", 413);
     if (Buffer.byteLength(JSON.stringify(result), 'utf8') > questdb.maxResponseBytes) throw new LatestLookupError('Latest-value response exceeds the configured byte limit.', 413);
@@ -1731,6 +1810,7 @@ async function resolveBatchLastResults(topics: string[], options: BatchLastOptio
     const topic = topics[i]!;
     const entry = lastValueMap.get(topic);
     if (entry) {
+      queryDiagnostics.cache("cacheHits");
       try { results[i] = buildBatchLastResult(topic, entry, "cache", null, now, options); }
       catch (error) { results[i] = failedBatchLastResult(topic, error); }
       continue;
@@ -1747,6 +1827,7 @@ async function resolveBatchLastResults(topics: string[], options: BatchLastOptio
       sql: null,
       counter: null,
     };
+    queryDiagnostics.cache("cacheMisses");
     misses.push({ topic, idx: i });
   }
 
@@ -2375,13 +2456,14 @@ async function fetchQuestDbMappings(cfg: MappingResolverConfig, signal: AbortSig
     ["dataGroup", "suffix", "questdbUrl", "processName", "packageName", "version", "updatedAt"].every(field => entry[field as keyof QuestDbMappingEntry] == null || typeof entry[field as keyof QuestDbMappingEntry] === "string"));
 }
 
-function parseProjectExtras(config: { questdb?: unknown; catchAll?: unknown; lastValueCache?: unknown; dataSources?: unknown }): {
+function parseProjectExtras(config: { authorization?: unknown; questdb?: unknown; catchAll?: unknown; lastValueCache?: unknown; dataSources?: unknown }): {
+  authorization: ProjectExtras["authorization"];
   questdb: QuestDbConfig;
   catchAll: CatchAllConfig;
   lastValueCache: ProjectExtras["lastValueCache"];
   dataSources: DataSourceConfig[];
 } {
-  const parsed = projectExtrasSchema.safeParse({ questdb: config.questdb, catchAll: config.catchAll, lastValueCache: config.lastValueCache, dataSources: config.dataSources });
+  const parsed = projectExtrasSchema.safeParse({ authorization: config.authorization, questdb: config.questdb, catchAll: config.catchAll, lastValueCache: config.lastValueCache, dataSources: config.dataSources });
   if (!parsed.success) {
     const details = parsed.error.issues
       .map(issue => `${issue.path.join(".") || "config"}: ${issue.message}`)
@@ -2617,42 +2699,7 @@ function deriveBucketMs(range: TimeRange, maxPoints: number): number {
 }
 
 function resolveTemporalStrategy(columns: Set<string>, preference: TimeFieldPreference): TemporalStrategy {
-  const pointTimeColumn = resolvePointTimeColumn(columns);
-  const hasInterval = columns.has("intervalStart") && columns.has("intervalEnd");
-
-  if (preference === "interval" && !hasInterval) {
-    throw new HttpError(400, "Requested timeField=interval, but table does not contain intervalStart and intervalEnd columns.");
-  }
-  if (preference === "timestamp" && !pointTimeColumn) {
-    throw new HttpError(400, "Requested timeField=timestamp, but table does not contain a time or timestamp column.");
-  }
-
-  if (preference === "interval" && hasInterval) {
-    if (!pointTimeColumn) {
-      return {
-        mode: "interval",
-        fromColumn: "intervalStart",
-        toColumn: "intervalEnd",
-        orderBy: `"intervalStart" DESC`,
-      };
-    }
-    return {
-      mode: "interval",
-      fromColumn: "intervalStart",
-      toColumn: "intervalEnd",
-      orderBy: `"intervalStart" DESC, ${quoteIdentifier(pointTimeColumn)} DESC`,
-    };
-  }
-
-  if (!pointTimeColumn) {
-    throw new HttpError(400, "Table does not contain a time or timestamp column required for time filtering.");
-  }
-  return {
-    mode: "timestamp",
-    fromColumn: pointTimeColumn,
-    toColumn: pointTimeColumn,
-    orderBy: `${quoteIdentifier(pointTimeColumn)} DESC`,
-  };
+  return resolveTemporalStrategyFromSchema({ columns, orderedColumns: [], columnTypes: new Map() }, preference);
 }
 
 function resolvePointTimeColumn(columns: Set<string>): "time" | "timestamp" | null {
@@ -3113,64 +3160,8 @@ function buildCounterDeltaBucketSql(
   `;
 }
 
-async function queryQuestDb(
-  cfg: QuestDbConfig,
-  sql: string,
-  signal?: AbortSignal,
-): Promise<{ data: unknown[]; raw: Record<string, unknown> }> {
-  const compactSql = sql.replace(/\s+/g, " ").trim();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error("QuestDB request timed out")), cfg.statementTimeoutMs);
-
-  try {
-    const url = new URL("/exec", cfg.url);
-    url.searchParams.set("query", compactSql);
-    url.searchParams.set("timings", "true");
-    url.searchParams.set("count", "true");
-
-    const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString("base64");
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        Authorization: `Basic ${auth}`,
-        Accept: "application/json",
-      },
-      signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
-    });
-
-    const rawText = await response.text();
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch {
-      parsed = rawText;
-    }
-
-    if (!response.ok) {
-      const parsedObject = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
-      const detailedError =
-        (parsedObject?.["error"] as string | undefined) ??
-        (parsedObject?.["message"] as string | undefined) ??
-        (typeof parsed === "string" ? parsed : undefined);
-      throw new QuestDbRequestError("response", response.status, detailedError);
-    }
-
-    const dataset =
-      typeof parsed === "object" && parsed !== null && "dataset" in (parsed as Record<string, unknown>)
-        ? ((parsed as { dataset?: unknown[] }).dataset ?? [])
-        : Array.isArray(parsed)
-          ? parsed
-          : undefined;
-
-    const rawWithQuery = stripDatasetFromQuestDbResponse(parsed, compactSql);
-
-    return { data: dataset ?? [], raw: rawWithQuery };
-  } catch (error) {
-    if (error instanceof QuestDbRequestError) throw error;
-    throw new QuestDbRequestError(controller.signal.aborted || signal?.aborted ? "timeout" : "unavailable");
-  } finally {
-    clearTimeout(timer);
-  }
+async function queryQuestDb(cfg: QuestDbConfig, sql: string, signal?: AbortSignal, purpose = "history"): Promise<{ data: unknown[]; raw: Record<string, unknown> }> {
+  return queryQuestDbHttp(queryDiagnostics, cfg, sql, purpose, signal);
 }
 
 async function getTableSchema(cfg: QuestDbConfig, table: string, signal?: AbortSignal): Promise<TableSchema> {
@@ -3180,7 +3171,7 @@ async function getTableSchema(cfg: QuestDbConfig, table: string, signal?: AbortS
     return cached.schema;
   }
 
-  const result = await queryQuestDb(cfg, `SHOW COLUMNS FROM ${quoteIdentifier(table)}`, signal);
+  const result = await queryQuestDb(cfg, `SHOW COLUMNS FROM ${quoteIdentifier(table)}`, signal, "schema");
   const columns = new Set<string>();
   const orderedColumns: string[] = [];
   const columnTypes = new Map<string, string>();
@@ -3217,32 +3208,6 @@ async function getTableColumns(cfg: QuestDbConfig, table: string): Promise<Set<s
   return schema.columns;
 }
 
-function stripDatasetFromQuestDbResponse(parsed: unknown, query: string): Record<string, unknown> {
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    const clone: Record<string, unknown> = { ...(parsed as Record<string, unknown>) };
-    delete clone["dataset"];
-    clone["query"] = query;
-    return clone;
-  }
-
-  if (Array.isArray(parsed)) {
-    return { query, format: "array", rowCount: parsed.length };
-  }
-
-  if (typeof parsed === "string") {
-    return { query, message: parsed };
-  }
-
-  return { query };
-}
-
-function resolveRequestId(headerValue: unknown): string {
-  if (typeof headerValue === "string" && headerValue.trim().length > 0) return headerValue.trim();
-  if (Array.isArray(headerValue) && typeof headerValue[0] === "string" && headerValue[0].trim().length > 0) {
-    return headerValue[0].trim();
-  }
-  return randomUUID();
-}
 
 async function validateCatchAllAccess(
   req: UnsEvents["apiGetEvent"]["req"],
@@ -3273,7 +3238,14 @@ async function resolveCatchAllAccessRules(
     throw new HttpError(401, "Missing or invalid Authorization header");
   }
 
-  const claims = await verifyTokenClaims(token, authCfg);
+  let claims = verifiedRequestClaims.get(req);
+  if (!claims) {
+    claims = await verifyTokenClaims(token, authCfg);
+    queryDiagnostics.authenticate(claims);
+    await authorizationStatus.check(token);
+    verifiedRequestClaims.set(req, claims);
+  }
+  queryDiagnostics.authenticate(claims);
   const scopes = extractScopeSet(claims);
   if (!(scopes.has("read:uns") || scopes.has("uns:read") || scopes.has("read:*") || scopes.has("*"))) {
     throw new HttpError(403, "Missing required token scope: read:uns");

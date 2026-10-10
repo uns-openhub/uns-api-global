@@ -78,7 +78,33 @@ or replacement of a development machine token; they are not part of either commi
 configuration profile. None of the committed profiles requires an email or password.
 
 For API authentication, configure `uns.jwksWellKnownUrl` (recommended). A local
-standalone setup can alternatively provide `UNS_API_JWT_SECRET`.
+standalone setup can alternatively provide `UNS_API_JWT_SECRET`; when those
+HMAC tokens are not issued by the controller, explicitly choose the offline mode
+described below. The controller status endpoint accepts controller-verifiable JWTs.
+
+### Caller revocation (upgrade candidate)
+
+Catch-all data reads, batch reads and protected runtime/diagnostic endpoints first
+verify JWT signature and expiry on every request. They then check the caller's own
+status with `POST <uns.rest>/auth/token-status`. This contract requires controller
+**2.1.145 or newer**; upgrading the API alone against an older controller fails
+closed with HTTP 503. Roll out the controller before this API candidate.
+
+`authorization.mode` defaults to `controller`, with `statusCacheMs: 5000` (allowed
+250–30000 ms). A cached positive status can remain usable until its expiry after a
+revocation; JWT expiry still applies immediately. Concurrent requests using the
+same token share one status check. Checks have a 1500 ms timeout, at most four
+concurrent calls, no waiting queue, 1024 cached token digests and a one-second
+failure cooldown. Expired positive status is never reused on authority errors.
+Revoked/deleted/inactive principals or changed machine token versions are denied.
+The endpoint returns only self-status; it cannot inspect another identity.
+
+Explicit `authorization.mode: "offline"` supports standalone JWT validation and
+emits a startup warning. It cannot enforce identity revocation before JWT expiry.
+There is no automatic offline fallback on timeout, 404, bad JSON or database error.
+The administrator diagnostics response includes non-secret authorization counters
+and limits, without tokens or cache digests. These checks do not control MQTT
+shutdown or the independent microservice lifecycle.
 
 ## Configuration
 
@@ -86,6 +112,7 @@ Project-specific configuration is defined in
 `src/config/project.config.extension.ts` and documented by
 `config.schema.json`.
 
+- `authorization` sets controller status checking or explicit offline JWT mode.
 - `questdb` configures the QuestDB HTTP endpoint and safety limits.
 - `dataSources` limits which MQTT topic filters may be queried or cached.
 - `catchAll` controls the public paths and OpenAPI labels.

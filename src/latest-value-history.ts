@@ -1,4 +1,5 @@
-import {HistoryReadError} from "./history-source-diagnostics.js";
+import { randomUUID } from "node:crypto";
+import { HistoryReadError } from "./history-source-diagnostics.js";
 import {
   buildDataColumnList,
   buildSourceSql,
@@ -257,7 +258,11 @@ export function preserveConcurrentCacheValue<T>(
 
 /** Coalesce seed/lazy reads; only misses/errors are throttled, with bounded storage. */
 export class LatestLookupCoordinator<T> {
-  private readonly pending = new Map<string, Promise<T | null>>();
+  private waiters = 0;
+  private readonly pending = new Map<
+    string,
+    { lookupId: string; promise: Promise<T | null> }
+  >();
   private readonly failures = new Map<
     string,
     { at: number; error?: unknown }
@@ -269,6 +274,13 @@ export class LatestLookupCoordinator<T> {
       cooldownMs?: number;
       maxFailures?: number;
       maxPending?: number;
+      maxWaiters?: number;
+      runLookup?: (
+        lookupId: string,
+        load: () => Promise<T | null>,
+      ) => Promise<T | null>;
+      onJoin?: (lookupId: string) => void;
+      onThrottle?: () => void;
     } = {},
   ) {}
   get failureCount(): number {
@@ -279,10 +291,25 @@ export class LatestLookupCoordinator<T> {
     load: (signal: AbortSignal) => Promise<T | null>,
   ): Promise<T | null> {
     const pending = this.pending.get(topic);
-    if (pending) return pending;
+    if (pending) {
+      if (this.waiters >= (this.options.maxWaiters ?? 64)) {
+        this.options.onThrottle?.();
+        throw new LatestLookupError(
+          "Latest-value recovery is busy. Retry shortly.",
+        );
+      }
+      this.options.onJoin?.(pending.lookupId);
+      this.waiters++;
+      try {
+        return structuredClone(await pending.promise);
+      } finally {
+        this.waiters--;
+      }
+    }
     const now = (this.options.now ?? Date.now)();
     const previous = this.failures.get(topic);
     if (previous && now - previous.at < (this.options.cooldownMs ?? 5_000)) {
+      this.options.onThrottle?.();
       if (previous.error) throw previous.error;
       return null;
     }
@@ -292,7 +319,8 @@ export class LatestLookupCoordinator<T> {
       );
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const promise = (async () => {
+    const lookupId = randomUUID();
+    const run = async () => {
       try {
         const result = await Promise.race([
           Promise.resolve().then(() => load(controller.signal)),
@@ -329,10 +357,13 @@ export class LatestLookupCoordinator<T> {
       } finally {
         if (timer) clearTimeout(timer);
       }
-    })().finally(() => {
+    };
+    const promise = (
+      this.options.runLookup ? this.options.runLookup(lookupId, run) : run()
+    ).finally(() => {
       this.pending.delete(topic);
     });
-    this.pending.set(topic, promise);
+    this.pending.set(topic, { lookupId, promise });
     return promise;
   }
   private remember(

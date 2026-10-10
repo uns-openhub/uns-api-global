@@ -1970,9 +1970,108 @@
           ],
           "additionalProperties": false
         },
+        "authorization": {
+          "default": {
+            "mode": "controller",
+            "statusCacheMs": 5000
+          },
+          "type": "object",
+          "properties": {
+            "mode": {
+              "default": "controller",
+              "description": "Controller status validation is required by default; offline mode has no immediate identity revocation guarantee",
+              "type": "string",
+              "enum": [
+                "controller",
+                "offline"
+              ]
+            },
+            "statusCacheMs": {
+              "default": 5000,
+              "description": "Maximum age of a caller authorization status in milliseconds; expired status is never reused on error",
+              "type": "integer",
+              "minimum": 250,
+              "maximum": 30000
+            }
+          }
+        },
         "questdb": {
           "type": "object",
           "properties": {
+            "queryDiagnostics": {
+              "default": {
+                "databaseLabel": "questdb",
+                "failureCooldownMs": 5000,
+                "maxConcurrent": 4,
+                "maxQueued": 64,
+                "queueTimeoutMs": 1000,
+                "slowQueryMs": 1000
+              },
+              "type": "object",
+              "properties": {
+                "databaseLabel": {
+                  "default": "questdb",
+                  "description": "Non-secret logical database label, for example history-replica",
+                  "type": "string",
+                  "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$"
+                },
+                "failureCooldownMs": {
+                  "default": 5000,
+                  "description": "Pause new queries after dependency timeouts, connection failures or HTTP 5xx",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 60000
+                },
+                "deploymentBudget": {
+                  "description": "Static allocation across a declared maximum API instance count; not a distributed semaphore",
+                  "type": "object",
+                  "properties": {
+                    "totalMaxConcurrent": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4096
+                    },
+                    "maxInstances": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 256
+                    }
+                  },
+                  "required": [
+                    "totalMaxConcurrent",
+                    "maxInstances"
+                  ]
+                },
+                "maxConcurrent": {
+                  "default": 4,
+                  "description": "Maximum simultaneous QuestDB queries in this API process",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 64
+                },
+                "maxQueued": {
+                  "default": 64,
+                  "description": "Bounded waiting queue; excess work returns 503",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 1000
+                },
+                "queueTimeoutMs": {
+                  "default": 1000,
+                  "description": "Maximum queue wait before 503",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 60000
+                },
+                "slowQueryMs": {
+                  "default": 1000,
+                  "description": "Slow-query diagnostic threshold in milliseconds",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                }
+              }
+            },
             "url": {
               "anyOf": [
                 {

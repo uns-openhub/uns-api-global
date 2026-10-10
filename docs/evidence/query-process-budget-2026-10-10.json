@@ -1,0 +1,8 @@
+{
+  "scope": "two OS processes; synthetic HTTP sink; not two deployed APIs",
+  "processes": 2,
+  "requests": 12,
+  "peak": 2,
+  "perProcess": 1,
+  "configuredTotal": 2
+}
