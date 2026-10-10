@@ -1970,6 +1970,31 @@
           ],
           "additionalProperties": false
         },
+        "authorization": {
+          "default": {
+            "mode": "controller",
+            "statusCacheMs": 5000
+          },
+          "type": "object",
+          "properties": {
+            "mode": {
+              "default": "controller",
+              "description": "Controller status validation is required by default; offline mode has no immediate identity revocation guarantee",
+              "type": "string",
+              "enum": [
+                "controller",
+                "offline"
+              ]
+            },
+            "statusCacheMs": {
+              "default": 5000,
+              "description": "Maximum age of a caller authorization status in milliseconds; expired status is never reused on error",
+              "type": "integer",
+              "minimum": 250,
+              "maximum": 30000
+            }
+          }
+        },
         "questdb": {
           "type": "object",
           "properties": {
@@ -1996,6 +2021,26 @@
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 60000
+                },
+                "deploymentBudget": {
+                  "description": "Static allocation across a declared maximum API instance count; not a distributed semaphore",
+                  "type": "object",
+                  "properties": {
+                    "totalMaxConcurrent": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4096
+                    },
+                    "maxInstances": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 256
+                    }
+                  },
+                  "required": [
+                    "totalMaxConcurrent",
+                    "maxInstances"
+                  ]
                 },
                 "maxConcurrent": {
                   "default": 4,

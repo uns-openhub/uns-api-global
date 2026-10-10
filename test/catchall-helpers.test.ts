@@ -44,6 +44,7 @@ import {
   isSwaggerDefinitionRequest,
   mapQuestDbRowsToObjects,
   normalizeBasePath,
+  isQueryDiagnosticsRequest,
   normalizeIsoTimestamp,
   normalizeRange,
   normalizeRequestPath,
@@ -875,6 +876,16 @@ test("request path helpers recognize swagger routes and numeric type support", (
   assert.equal(isNumericQuestDbType("BOOLEAN"), false);
 });
 
+test("query diagnostics recognizes controller rebasing without classifying topic suffixes", () => {
+  for (const path of ["/diagnostics/queries", "/api/diagnostics/queries", "/api/catchall/diagnostics/queries", "/catchall/diagnostics/queries", "api//diagnostics/queries/"]) {
+    assert.equal(isQueryDiagnosticsRequest(path, "/api/catchall"), true);
+  }
+  assert.equal(isQueryDiagnosticsRequest("/custom/diagnostics/queries", "/custom/"), true);
+  for (const path of ["/enterprise/site/diagnostics/queries", "/api/catchall/enterprise/diagnostics/queries", "/api/diagnostics/query", "/api/catchall/diagnostics/queries/extra"]) {
+    assert.equal(isQueryDiagnosticsRequest(path, "/api/catchall"), false);
+  }
+});
+
 
 test("Capture session restriction is validated and ANDed before raw limits", () => {
   const schema = makeSchema([["topic"], ["sessionId"], ["timestamp", "TIMESTAMP"]]);
@@ -887,4 +898,15 @@ test("Capture session restriction is validated and ANDed before raw limits", () 
   for (const invalid of ["", " a", "a' OR 1=1", "a\n", "a".repeat(129), [], 5]) assert.throws(() => parseCaptureSessionId(invalid), /sessionId/);
   assert.throws(() => captureSessionPredicate("safe", new Set(["timestamp", "topic"])), /sessionId column/);
   assert.throws(() => buildWhere({fullPath:"no-path",captureSessionId:"safe"}, {}, temporal, makeSchema([["sessionId"],["timestamp"]])), /UNS path columns/);
+});
+
+
+test("auto resolves interval-only history without changing point-time preference", () => {
+  const schema = makeSchema([["topic", "SYMBOL"], ["intervalStart", "TIMESTAMP"], ["intervalEnd", "TIMESTAMP"]]);
+  assert.deepEqual(resolveTemporalStrategy(schema, "auto"), {
+    mode: "interval", fromColumn: "intervalStart", toColumn: "intervalEnd", orderBy: '\"intervalStart\" DESC',
+  });
+  assert.deepEqual(resolveTemporalStrategy(schema, "auto"), resolveTemporalStrategy(schema, "interval"));
+  assert.throws(() => resolveTemporalStrategy(schema, "timestamp"), (error: unknown) => error instanceof HttpError && error.status === 400);
+  assert.throws(() => resolveTemporalStrategy(makeSchema([["intervalStart", "TIMESTAMP"]]), "auto"), (error: unknown) => error instanceof HttpError && error.status === 400);
 });

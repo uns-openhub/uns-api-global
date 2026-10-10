@@ -1,3 +1,6 @@
+import { RouteOwnerRegistration, routeRegistrationEnvironment } from "./route-owner-registration.js";
+import { AuthorizationStatus, AuthorizationStatusError } from "./authorization-status.js";
+import { resolveQueryDeploymentBudget } from "./query-deployment-budget.js";
 import * as apiRequestLogging from "@uns-kit/api/request-log.js";
 import { requireSafeRequestLogging } from "./query-diagnostics-prerequisites.js";
 import { QueryDiagnostics, QueryWorkloadError } from "./query-diagnostics.js";
@@ -65,7 +68,9 @@ import {
   computeCounterDeltaValue,
   counterBoundarySourceRange,
   isTopicAllowedByAccessRules,
+  isQueryDiagnosticsRequest,
   resolvePointTimeColumn as resolvePointTimeColumnFromSchema,
+  resolveTemporalStrategy as resolveTemporalStrategyFromSchema,
 } from "./catchall-helpers.js";
 
 type TimeRange = { from?: string; to?: string; note?: string; toExclusive?: boolean };
@@ -149,10 +154,11 @@ const NON_VALUE_COLUMNS = new Set([
 
 requireSafeRequestLogging(apiRequestLogging);
 const config = await ConfigFile.loadConfig();
-const { questdb, catchAll, lastValueCache: lastValueCacheConfig, dataSources } = parseProjectExtras(config);
+const { authorization: authorizationConfig, questdb, catchAll, lastValueCache: lastValueCacheConfig, dataSources } = parseProjectExtras(config);
 const verifiedRequestClaims = new WeakMap<object, JwtClaims>();
 const queryDiagnostics = new QueryDiagnostics({
   ...questdb.queryDiagnostics,
+  ...resolveQueryDeploymentBudget(questdb.queryDiagnostics),
   emit: event => {
     const log = { ...event, component: "questdb-query-diagnostics", message: "QuestDB workload diagnostics" };
     if (event["slow"] || event["outcome"] === "failed" || event["outcome"] === "timeout") logger.warn(log);
@@ -163,6 +169,8 @@ const apiBasePath = normalizeBasePath(catchAll.apiBasePath ?? "/api/catchall");
 const catchAllSwaggerPath = catchAll.swaggerPath ?? "/uns-api-global/general-api/catchall-swagger.json";
 const controllerGraphqlUrl = typeof config.uns?.graphql === "string" ? config.uns.graphql.replace(/\/+$/, "") : null;
 const controllerRestUrl = typeof config.uns?.rest === "string" ? config.uns.rest.replace(/\/+$/, "") : null;
+const authorizationStatus = new AuthorizationStatus({ controllerRest: controllerRestUrl, mode: authorizationConfig.mode, cacheMs: authorizationConfig.statusCacheMs });
+if (authorizationConfig.mode === "offline") logger.warn("Authorization status checks are explicitly disabled; offline JWT mode does not enforce immediate identity revocation.");
 let legacyAuthClient: Promise<AuthClient | null> | undefined;
 const legacyAuthFallback: AccessTokenProvider = {
   async getAccessToken(): Promise<string | undefined> {
@@ -825,6 +833,22 @@ const catchAllTopicFilters = Array.from(
   ),
 );
 
+const routeEnvironment = routeRegistrationEnvironment(process.env);
+const routeOwnerRegistration = routeEnvironment ? new RouteOwnerRegistration({ ...routeEnvironment,
+  processName: config.uns.processName,
+  onState: ready => {
+    if (ready) logger.info("Runtime route ownership registered with the owning controller.");
+    else logger.warn("Runtime route ownership registration unavailable; retrying in the background.");
+  },
+  onReady: async () => {
+    for (const filter of catchAllTopicFilters.length ? catchAllTopicFilters : ["#"]) await apiInput.registerCatchAll(filter, catchAllRegistrationOptions);
+  },
+}) : undefined;
+apiInput.event.on("unsProxyProducedApiCatchAll", event => {
+  try { routeOwnerRegistration?.observe(event.producedCatchall); }
+  catch { logger.warn("Route ownership registration received inconsistent runtime origins."); }
+});
+
 for (const topicFilter of catchAllTopicFilters.length ? catchAllTopicFilters : ["#"]) {
   await apiInput.registerCatchAll(topicFilter, catchAllRegistrationOptions);
 }
@@ -846,7 +870,7 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
 
   const pathForDiagnostics = normalizeRequestPath(req.path ?? "");
   const operation = isBatchRequest(req) ? (resolveBatchMode(req, req.body) === "range" ? "batch-range" : "batch-last")
-    : pathForDiagnostics.endsWith("/diagnostics/queries") ? "query-diagnostics"
+    : isQueryDiagnosticsRequest(pathForDiagnostics, apiBasePath) ? "query-diagnostics"
     : pathForDiagnostics.endsWith("/triggers/runtime") ? "trigger-runtime"
     : pathForDiagnostics.endsWith("/captures/runtime") ? "capture-runtime"
     : isSwaggerDefinitionRequest(pathForDiagnostics, catchAll.swaggerPath) ? "swagger" : "history";
@@ -871,8 +895,9 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
     const bearer = extractBearerToken(req?.headers?.["authorization"]);
     if (!bearer) throw new HttpError(401, "Missing Authorization header");
     const authenticatedClaims = await verifyTokenClaims(bearer, catchAllAuth);
-    verifiedRequestClaims.set(req, authenticatedClaims);
     queryDiagnostics.authenticate(authenticatedClaims);
+    await authorizationStatus.check(bearer);
+    verifiedRequestClaims.set(req, authenticatedClaims);
 
     // Stage 4b — admin-only runtime inspection endpoint.  Returns
     // per-trigger live state (lastSeenValue, lastFiredAt, fireCount,
@@ -919,11 +944,11 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
       return;
     }
 
-    const isQueryDiagnostics = requestPath === "/diagnostics/queries" || requestPath === `${apiBasePath}/diagnostics/queries`;
+    const isQueryDiagnostics = isQueryDiagnosticsRequest(requestPath, apiBasePath);
     if (isQueryDiagnostics) {
       const claims = authenticatedClaims;
       if (!Array.isArray(claims["roles"]) || !claims["roles"].includes("admin")) throw new HttpError(403, "Administrator role required");
-      res.status(200).json(queryDiagnostics.snapshot());
+      res.status(200).json({ ...queryDiagnostics.snapshot(), authorization: authorizationStatus.snapshot() });
       return;
     }
 
@@ -1124,7 +1149,7 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
 
     res.status(200).json(payload);
   } catch (error) {
-    if (error instanceof HttpError || error instanceof CatchallParameterError || error instanceof HistorySourceError || error instanceof HistoryReadError || error instanceof QueryWorkloadError || error instanceof QuestDbQueryError) {
+    if (error instanceof AuthorizationStatusError || error instanceof HttpError || error instanceof CatchallParameterError || error instanceof HistorySourceError || error instanceof HistoryReadError || error instanceof QueryWorkloadError || error instanceof QuestDbQueryError) {
       res.status(error.status).json({ error: error.message, requestId, ...(error instanceof HistoryReadError ? { diagnostic: error.diagnostic } : {}) });
       return;
     }
@@ -2431,13 +2456,14 @@ async function fetchQuestDbMappings(cfg: MappingResolverConfig, signal: AbortSig
     ["dataGroup", "suffix", "questdbUrl", "processName", "packageName", "version", "updatedAt"].every(field => entry[field as keyof QuestDbMappingEntry] == null || typeof entry[field as keyof QuestDbMappingEntry] === "string"));
 }
 
-function parseProjectExtras(config: { questdb?: unknown; catchAll?: unknown; lastValueCache?: unknown; dataSources?: unknown }): {
+function parseProjectExtras(config: { authorization?: unknown; questdb?: unknown; catchAll?: unknown; lastValueCache?: unknown; dataSources?: unknown }): {
+  authorization: ProjectExtras["authorization"];
   questdb: QuestDbConfig;
   catchAll: CatchAllConfig;
   lastValueCache: ProjectExtras["lastValueCache"];
   dataSources: DataSourceConfig[];
 } {
-  const parsed = projectExtrasSchema.safeParse({ questdb: config.questdb, catchAll: config.catchAll, lastValueCache: config.lastValueCache, dataSources: config.dataSources });
+  const parsed = projectExtrasSchema.safeParse({ authorization: config.authorization, questdb: config.questdb, catchAll: config.catchAll, lastValueCache: config.lastValueCache, dataSources: config.dataSources });
   if (!parsed.success) {
     const details = parsed.error.issues
       .map(issue => `${issue.path.join(".") || "config"}: ${issue.message}`)
@@ -2673,42 +2699,7 @@ function deriveBucketMs(range: TimeRange, maxPoints: number): number {
 }
 
 function resolveTemporalStrategy(columns: Set<string>, preference: TimeFieldPreference): TemporalStrategy {
-  const pointTimeColumn = resolvePointTimeColumn(columns);
-  const hasInterval = columns.has("intervalStart") && columns.has("intervalEnd");
-
-  if (preference === "interval" && !hasInterval) {
-    throw new HttpError(400, "Requested timeField=interval, but table does not contain intervalStart and intervalEnd columns.");
-  }
-  if (preference === "timestamp" && !pointTimeColumn) {
-    throw new HttpError(400, "Requested timeField=timestamp, but table does not contain a time or timestamp column.");
-  }
-
-  if (preference === "interval" && hasInterval) {
-    if (!pointTimeColumn) {
-      return {
-        mode: "interval",
-        fromColumn: "intervalStart",
-        toColumn: "intervalEnd",
-        orderBy: `"intervalStart" DESC`,
-      };
-    }
-    return {
-      mode: "interval",
-      fromColumn: "intervalStart",
-      toColumn: "intervalEnd",
-      orderBy: `"intervalStart" DESC, ${quoteIdentifier(pointTimeColumn)} DESC`,
-    };
-  }
-
-  if (!pointTimeColumn) {
-    throw new HttpError(400, "Table does not contain a time or timestamp column required for time filtering.");
-  }
-  return {
-    mode: "timestamp",
-    fromColumn: pointTimeColumn,
-    toColumn: pointTimeColumn,
-    orderBy: `${quoteIdentifier(pointTimeColumn)} DESC`,
-  };
+  return resolveTemporalStrategyFromSchema({ columns, orderedColumns: [], columnTypes: new Map() }, preference);
 }
 
 function resolvePointTimeColumn(columns: Set<string>): "time" | "timestamp" | null {
@@ -3247,7 +3238,13 @@ async function resolveCatchAllAccessRules(
     throw new HttpError(401, "Missing or invalid Authorization header");
   }
 
-  const claims = verifiedRequestClaims.get(req) ?? await verifyTokenClaims(token, authCfg);
+  let claims = verifiedRequestClaims.get(req);
+  if (!claims) {
+    claims = await verifyTokenClaims(token, authCfg);
+    queryDiagnostics.authenticate(claims);
+    await authorizationStatus.check(token);
+    verifiedRequestClaims.set(req, claims);
+  }
   queryDiagnostics.authenticate(claims);
   const scopes = extractScopeSet(claims);
   if (!(scopes.has("read:uns") || scopes.has("uns:read") || scopes.has("read:*") || scopes.has("*"))) {

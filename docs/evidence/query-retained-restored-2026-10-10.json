@@ -1,0 +1,165 @@
+{
+  "directQuestDb": true,
+  "testConfigRestored": true,
+  "archiverPidUnchanged": true,
+  "oldArchiverStopped": true,
+  "rows": 12830,
+  "distinctEventIds": 12830,
+  "importStatusReachable": true,
+  "runtime": {
+    "GetRttNodes": [
+      {
+        "rttNode": "uns-api-global",
+        "versions": [
+          {
+            "version": "v4.1.13",
+            "instances": [
+              {
+                "id": "p2-test",
+                "processName": "uns-api-global",
+                "desiredRunning": true,
+                "processes": [
+                  {
+                    "pid": 42145,
+                    "status": "online",
+                    "restarts": 0
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "processes": [
+          {
+            "pid": 42145,
+            "version": "v4.1.13",
+            "instanceId": "p2-test",
+            "status": "online",
+            "restarts": 0
+          }
+        ]
+      },
+      {
+        "rttNode": "uns-archiver",
+        "versions": [
+          {
+            "version": "v5.2.20",
+            "instances": [
+              {
+                "id": "p4b-test",
+                "processName": "uns-archiver",
+                "desiredRunning": true,
+                "processes": [
+                  {
+                    "pid": 72864,
+                    "status": "online",
+                    "restarts": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "version": "v5.2.17",
+            "instances": [
+              {
+                "id": "p4b-test",
+                "processName": "uns-archiver",
+                "desiredRunning": false,
+                "processes": [
+                  {
+                    "pid": 0,
+                    "status": "stopped",
+                    "restarts": 0
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "processes": [
+          {
+            "pid": 0,
+            "version": "v5.2.17",
+            "instanceId": "p4b-test",
+            "status": "stopped",
+            "restarts": 0
+          },
+          {
+            "pid": 72864,
+            "version": "v5.2.20",
+            "instanceId": "p4b-test",
+            "status": "online",
+            "restarts": 0
+          }
+        ]
+      }
+    ]
+  },
+  "completedImports": 9,
+  "services": [
+    {
+      "descriptor": {
+        "id": "uns-archiver"
+      },
+      "state": "healthy",
+      "healthy": true
+    },
+    {
+      "descriptor": {
+        "id": "uns-api-global"
+      },
+      "state": "healthy",
+      "healthy": true
+    },
+    {
+      "descriptor": {
+        "id": "uns-bridge-opcua"
+      },
+      "state": "missing",
+      "healthy": false
+    },
+    {
+      "descriptor": {
+        "id": "uns-bridge-mqtt"
+      },
+      "state": "missing",
+      "healthy": false
+    },
+    {
+      "descriptor": {
+        "id": "uns-rag"
+      },
+      "state": "missing",
+      "healthy": false
+    },
+    {
+      "descriptor": {
+        "id": "uns-assistant-runtime"
+      },
+      "state": "missing",
+      "healthy": false
+    },
+    {
+      "descriptor": {
+        "id": "uns-graphql"
+      },
+      "state": "missing",
+      "healthy": false
+    },
+    {
+      "descriptor": {
+        "id": "triggers"
+      },
+      "state": "healthy",
+      "healthy": true
+    },
+    {
+      "descriptor": {
+        "id": "captures"
+      },
+      "state": "healthy",
+      "healthy": true
+    }
+  ]
+}

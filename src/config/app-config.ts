@@ -156,12 +156,23 @@ export interface ProjectAppConfig {
         organization: string;
         project?: string | undefined;
     } | undefined;
+    authorization?: {
+        /** Controller status validation is required by default; offline mode has no immediate identity revocation guarantee */
+        mode?: "controller" | "offline";
+        /** Maximum age of a caller authorization status in milliseconds; expired status is never reused on error */
+        statusCacheMs?: number;
+    };
     questdb: {
         queryDiagnostics?: {
             /** Non-secret logical database label, for example history-replica */
             databaseLabel?: string;
             /** Pause new queries after dependency timeouts, connection failures or HTTP 5xx */
             failureCooldownMs?: number;
+            /** Static allocation across a declared maximum API instance count; not a distributed semaphore */
+            deploymentBudget?: {
+                totalMaxConcurrent: number;
+                maxInstances: number;
+            } | undefined;
             /** Maximum simultaneous QuestDB queries in this API process */
             maxConcurrent?: number;
             /** Bounded waiting queue; excess work returns 503 */

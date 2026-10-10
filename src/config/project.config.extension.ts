@@ -39,6 +39,10 @@ const questDbUrlSchema = secretValueSchema.refine(
 );
 
 export const projectExtrasSchema = z.object({
+  authorization: z.object({
+    mode: z.enum(["controller", "offline"]).default("controller").describe("Controller status validation is required by default; offline mode has no immediate identity revocation guarantee"),
+    statusCacheMs: z.number().int().min(250).max(30000).default(5000).describe("Maximum age of a caller authorization status in milliseconds; expired status is never reused on error"),
+  }).default({ mode: "controller", statusCacheMs: 5000 }),
   questdb: z.object({
     queryDiagnostics: z
       .object({
@@ -58,6 +62,12 @@ export const projectExtrasSchema = z.object({
           .describe(
             "Pause new queries after dependency timeouts, connection failures or HTTP 5xx",
           ),
+        deploymentBudget: z.object({
+          totalMaxConcurrent: z.number().int().min(1).max(4096),
+          maxInstances: z.number().int().min(1).max(256),
+        }).refine(value => value.totalMaxConcurrent >= value.maxInstances, {
+          message: "Deployment budget must allocate at least one slot per planned API instance.",
+        }).optional().describe("Static allocation across a declared maximum API instance count; not a distributed semaphore"),
         maxConcurrent: z
           .number()
           .int()

@@ -1,0 +1,56 @@
+{
+  "date": "2026-10-10",
+  "slice": "P2b",
+  "scope": "real local retained MQTT mappings, QuestDB and public proxy",
+  "scenarios": {
+    "deployment-allocation": {
+      "perProcess": 1,
+      "plannedInstances": 2,
+      "plannedTotal": 2,
+      "observedCountNotClaimed": true
+    },
+    "retained-union-raw-oracle": {
+      "rows": 6,
+      "tables": 2,
+      "preservedOverlaps": true,
+      "originalTimes": true,
+      "sourceProvenance": true,
+      "oracle": true
+    },
+    "interval-deduplication-oracle": {
+      "pointDedupeRows": 2,
+      "values": [
+        20,
+        30
+      ],
+      "pointOracle": true,
+      "dedupeWithinEachPhysicalSource": true,
+      "intervalRows": 4,
+      "intervalOracle": true,
+      "latestValue": 44,
+      "latestUsesStartAndEndOrdering": true
+    },
+    "retained-latest-and-counter-boundary": {
+      "latestValue": 30,
+      "originalTimestamp": true,
+      "deltaAcrossPublishersStatus": 409,
+      "explicitTableRows": 3
+    },
+    "honest-conflicts": {
+      "equalTimeContradictionItemStatus": 409,
+      "incompatibleSchemasStatus": 409
+    },
+    "mqtt-during-real-fallback": {
+      "mqttWon": true,
+      "originalMqttTime": true,
+      "fallbackDataExecutions": 1,
+      "cacheFollowupExecutions": 0
+    },
+    "privacy": {
+      "redaction": true,
+      "boundedRecent": 57,
+      "active": 0,
+      "queued": 0
+    }
+  }
+}

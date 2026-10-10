@@ -106,6 +106,16 @@ export function normalizeBasePath(pathValue: string): string {
   return withLeadingSlash.replace(/\/+$/, "") || "/";
 }
 
+/** The toolkit router mounts at /api; the controller also rebases catch-all paths. */
+export function isQueryDiagnosticsRequest(rawPath: string, apiBasePath: string): boolean {
+  const path = normalizeRequestPath(rawPath);
+  const base = normalizeBasePath(apiBasePath);
+  return path === "/diagnostics/queries" ||
+    path === "/api/diagnostics/queries" ||
+    path === `${base}/diagnostics/queries` ||
+    (base.startsWith("/api/") && path === `${base.slice(4)}/diagnostics/queries`);
+}
+
 export function normalizeTopicPath(rawPath: string, basePath: string): string {
   const stripLeading = (value: string) => value.replace(/^\/+/, "");
   const base = stripLeading(basePath);
@@ -297,7 +307,7 @@ export function resolveTemporalStrategy(schema: TableSchema, preference: TimeFie
     throw new HttpError(400, "Requested timeField=timestamp, but table does not contain a time or timestamp column.");
   }
 
-  if (preference === "interval" && hasInterval) {
+  if (hasInterval && (preference === "interval" || (preference === "auto" && !pointTimeColumn))) {
     if (!pointTimeColumn) {
       return {
         mode: "interval",

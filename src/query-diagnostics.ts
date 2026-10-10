@@ -1,3 +1,4 @@
+import type { QueryBudgetPlan } from "./query-deployment-budget.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
@@ -131,6 +132,7 @@ export class QueryDiagnostics {
       slowQueryMs: number;
       failureCooldownMs: number;
       databaseLabel: string;
+      deploymentBudget?: QueryBudgetPlan | undefined;
       emit: (event: DiagnosticEvent) => void;
     },
   ) {}
@@ -257,6 +259,7 @@ export class QueryDiagnostics {
       limits: {
         maxConcurrent: this.options.maxConcurrent,
         maxQueued: this.options.maxQueued,
+        ...(this.options.deploymentBudget ? { deploymentBudget: this.options.deploymentBudget } : {}),
       },
       totals: { ...this.total },
       activeQueries: [...this.activeQueries.values()].map((q) => ({

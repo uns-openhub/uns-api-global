@@ -188,3 +188,40 @@ administrator-only Swagger endpoint, partial batch failures and representative
 multi-source/interval history. Then approve a coordinated production upgrade,
 compare caller/query-family rates and replica metrics, and tune from evidence.
 Keep the prior controller/API artifact pair together for rollback.
+
+
+## Local Runtime acceptance follow-up
+
+P2a now verifies the normal controller-issued identity and Caddy proxy path,
+real history/latest SQL oracles, query/lookup attribution, bounded overload,
+cooldown and timeout recovery. The mounted diagnostics route bug was fixed.
+See [Runtime acceptance](query-diagnostics-runtime-acceptance.md) for measured
+results, controller worker-preload fix and remaining multi-source/replica work.
+This follow-up is uncommitted candidate evidence, not an issued release or
+production load test; it supersedes the earlier no-live-acceptance statement
+only for the explicit P2a scope.
+
+
+## Optional deployment allocation (P2b, not yet released)
+
+```json
+{"questdb":{"queryDiagnostics":{"maxConcurrent":4,"maxQueued":8,
+  "deploymentBudget":{"totalMaxConcurrent":2,"maxInstances":2}}}}
+```
+
+The effective per-process limit is the smaller of maxConcurrent and
+floor(totalMaxConcurrent/maxInstances). totalMaxConcurrent must be at least
+maxInstances; invalid or zero-slot allocations reject startup. Without this
+optional object the existing per-process defaults remain. Diagnostics expose the
+static plan/per-process limit and observedProcessCount:null. Every deployed API
+must use the same declared plan and the operator must cap instance count,
+including overlapping handover processes. Older APIs and other DB clients do
+not participate. This is not a distributed semaphore or automatic enforcement.
+Per-process maxQueued remains unchanged; plannedMaxQueued reports its product
+with the declared maximum. No GraphQL change is required for this option.
+
+[Retained history and MQTT Runtime acceptance](query-retained-runtime-acceptance.md)
+records216 tests/typecheck/build, actual local interval-only bug/fix and restored
+Runtime state. Two OS processes verify the compiled limiter against a synthetic
+HTTP sink; `node scripts/test-query-budget-processes.mjs` runs after build.
+Production replica capacity and old-binary auth compatibility remain rollout gates.

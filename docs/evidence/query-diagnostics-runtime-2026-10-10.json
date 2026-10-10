@@ -1,0 +1,445 @@
+{
+  "baseline": {
+    "apiVersion": "4.1.13",
+    "controllerVersion": "2.1.144",
+    "rows": 48000,
+    "processLimits": {
+      "maxConcurrent": 2,
+      "maxQueued": 8
+    },
+    "priorArchiverRows": 7918
+  },
+  "scenarios": {
+    "proxy-auth-oracle": {
+      "historyStatus": 200,
+      "rows": 20,
+      "designatedTimeColumn": "time",
+      "independentSqlOracle": true,
+      "requestId": "3dcd479d-076e-4bd9-9be5-6b370320604a",
+      "callerId": "d06d9235-d706-428b-ae6a-bb408e3b67a9",
+      "forbiddenTopic": 403,
+      "nonadminDiagnostics": 403,
+      "invalidToken": 401
+    },
+    "latest-coalescing": {
+      "httpRequests": 40,
+      "uniqueRequestIds": 40,
+      "requestIds": [
+        "51808f2d-d879-4d6b-a046-db9109887e20",
+        "69efac1a-ce79-4cc7-8128-1f24b3347543",
+        "b62f0441-e861-4972-9331-503b0f23fb4e",
+        "fbc89f1f-a671-49b3-bb17-74766f976456",
+        "9cd7d5e6-013f-4f29-8a66-3ce3379094cd",
+        "c0325c57-f9d3-41f5-af55-3df1df917832",
+        "8f8985f0-c36b-4081-b6fb-68fead3a21de",
+        "9ba32898-da7f-40a3-a99e-c2dbc7547aa9",
+        "44ef5317-1ed1-4a41-91a5-2189a1c99639",
+        "e591ba81-8f59-4482-8791-1f96b0ed31d1",
+        "943b0b61-4638-4b66-b1af-f9f69470f6cf",
+        "4a536073-4907-4d3a-b7d9-e3b268d6da19",
+        "8ae8242c-1279-4edf-ac31-fe2419cfb238",
+        "d40ad128-f398-43f2-90ad-cfb4e1dedc0a",
+        "bccc85b6-bc37-48df-8f09-1249f3f864f5",
+        "f738813c-af07-4525-8217-779193ac060c",
+        "1e6459d8-ef61-42ae-afda-de3e14b0e96b",
+        "0e2b69d3-753d-4426-8184-23ec12850487",
+        "6c7ac005-9679-492f-b82c-b10a04a59e7d",
+        "e578e193-2ec1-41b8-b63c-06acbabf9db2",
+        "0f924dbd-604f-49a7-9e4c-4fa94689d975",
+        "e0ded593-d77d-4d42-b9f9-5daff6c6b16a",
+        "722c780b-8739-4b91-84d3-5c6a38ab9ffe",
+        "fd03ae2f-be0c-4677-890b-cd9f15b1516d",
+        "a5bbda0a-36d2-48ef-b512-15f45cfdfa79",
+        "37125ae4-66a0-482d-a58d-bea570b8a9c0",
+        "64ab6f5b-ab5a-4df0-a3e5-9aaaac79c3c3",
+        "b0515a76-3cf4-461a-a067-063af0cfa655",
+        "300f8108-07a4-41f6-b8bb-662acc0d26ce",
+        "4bd64819-f3e3-4c52-adcd-6e3c89fc6154",
+        "81765e45-44dc-44cd-8592-caf039531a55",
+        "9f4f498c-e45b-45ad-a156-44e317cd89c6",
+        "838ed235-0203-4b0e-b135-022484bec7a1",
+        "a6620a57-d907-48da-a832-32d5ef44b887",
+        "77cc5d26-7408-4e16-82c6-ab35f35f802a",
+        "c7228dd5-832c-42d3-a56f-b6f042398b88",
+        "45e92e34-fa83-4fc4-bdab-e646ad91d337",
+        "9988e3fc-6f7e-457e-85e5-f6cb1ca9b450",
+        "1f72e9b5-8e64-4301-bc29-6946ebd81f00",
+        "51c17c71-6cb8-49a0-9475-10def386792d"
+      ],
+      "dataExecutions": 1,
+      "queryId": "7a5d3925-6828-4f1e-9328-a56b59707b3a",
+      "ownerRequestId": "69efac1a-ce79-4cc7-8128-1f24b3347543",
+      "cachedStatus": 200,
+      "cacheDatabaseExecutions": 0
+    },
+    "history-sharing-and-overload": {
+      "requests": 30,
+      "statuses": {
+        "200": 9,
+        "503": 21
+      },
+      "databaseExecutions": 1,
+      "latestOnExecutions": 1,
+      "peak": 1,
+      "latestOnResultCorrect": true,
+      "requestIds": [
+        "a77aec51-c89c-411b-8c9e-d5fa8556c154",
+        "6fe6a39b-f6d0-420c-b00f-da767ac0f6c7",
+        "23ea590b-efd3-4145-b4ed-b4e0a1db41c2",
+        "a9fb1c93-1a1f-4957-96a0-a7916d161e57",
+        "27119d6e-d141-4652-87e2-3cb34cf8bf17",
+        "b8351111-340e-40c9-b74a-3915b2a77729",
+        "1d3da8b7-cc09-46da-a260-1d3bd078b453",
+        "bc18bb37-3c8f-447a-a296-35ca5f9568e8",
+        "cc7ff7eb-4212-42fc-bfdb-38bf5dd07eb8",
+        "01406320-9be2-4304-ad11-f44fd650b504",
+        "070817f7-8acd-4ec5-9299-721a84b7be00",
+        "d9c1fcd8-12a4-4053-b384-b482ca9dd747",
+        "960cfc89-9449-44cd-bae2-14349e592794",
+        "d3d01d5d-39f0-4868-997e-5ab3d7b22224",
+        "682574b6-9985-44c0-8621-cebbe7a5703d",
+        "8385ca74-18a2-4d4d-8cf1-548c0d7a58aa",
+        "20bf7b1f-ddb9-4ba0-8e99-ad55dc9b1141",
+        "01af1145-69e9-4bb5-91a1-95081bc93a4a",
+        "efcec72b-dd9f-45ed-84ce-6d82eb734c6f",
+        "be086618-01a7-4d67-a243-0db6d378786e",
+        "6bed0c82-93e5-435d-a49e-114ec499991a",
+        "30be96a7-2132-4b52-a4d8-d17502f2230d",
+        "69710078-076b-451a-9c0e-38e98adc2662",
+        "b3ddd059-9195-4877-b8ee-786756409cfe",
+        "b4d8abef-4e17-4b12-97ba-424adcd409dd",
+        "ebb5112e-acb9-4451-ae08-ebb2b15aeeb5",
+        "6467f521-4339-44ee-bfad-f320973c7785",
+        "692b85f7-7d9e-47f6-8d17-e4dbae5d5f97",
+        "72cb918f-8a73-4649-9a06-b12a1e1dcce5",
+        "74366a7b-7767-45d8-9081-818346e1b984"
+      ],
+      "queryIds": [
+        "33d86ea1-414f-4c66-a5d9-803b5e17c1f7"
+      ]
+    },
+    "latest-follower-cap": {
+      "requests": 100,
+      "httpStatus": 200,
+      "unavailableItems": 35,
+      "successfulItems": 65,
+      "dataExecutions": 1,
+      "queryIds": [
+        "7ef7b1ec-d268-4a28-a925-5634adb6b3d9",
+        "e14dfbf0-056e-41d4-a41f-2c190d0d72fb"
+      ]
+    },
+    "distinct-query-budget": {
+      "requests": 24,
+      "statuses": {
+        "200": 4,
+        "503": 20
+      },
+      "databaseExecutions": 4,
+      "peak": 2,
+      "activeAfter": 0,
+      "queuedAfter": 0,
+      "rejectedTotal": 41
+    },
+    "dependency-failure-cooldown": {
+      "failedStatus": 503,
+      "repeatedRequests": 20,
+      "additionalDatabaseExecutions": 0,
+      "cooldownObserved": true,
+      "partialBatchHttpStatus": 200,
+      "partialItems": [
+        {
+          "value": 2000
+        },
+        {
+          "status": 503
+        }
+      ],
+      "recoveredStatus": 200
+    },
+    "statement-timeout": {
+      "status": 503,
+      "durationMs": 2013,
+      "coordinatorActiveAfter": 0,
+      "upstreamActiveAfter": 1,
+      "cooldownObserved": true,
+      "recovered": true,
+      "serverSqlCancellationProven": false
+    },
+    "client-disconnect": {
+      "clientAbort": true,
+      "activeShortlyAfterDisconnect": 1,
+      "activeAfter": 0,
+      "queuedAfter": 0,
+      "serverSqlCancellationProven": false
+    },
+    "privacy-and-correlation": {
+      "events": 441,
+      "verifiedMachine": true,
+      "lookupJoined": 39,
+      "lateCacheHits": 0,
+      "latestCompleted": 40,
+      "historyCoalesced": 8,
+      "slowQueries": 8,
+      "noSensitiveMarkers": true,
+      "snapshotRecentBound": 128
+    }
+  },
+  "final": {
+    "archiverRows": 7918,
+    "processes": {
+      "GetRttNodes": [
+        {
+          "rttNode": "uns-api-global",
+          "versions": [
+            {
+              "version": "v4.1.13",
+              "instances": [
+                {
+                  "id": "p2-test",
+                  "processName": "uns-api-global",
+                  "desiredRunning": true,
+                  "processes": [
+                    {
+                      "pid": 52215,
+                      "status": "online",
+                      "restarts": 0
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "processes": [
+            {
+              "pid": 52215,
+              "version": "v4.1.13",
+              "instanceId": "p2-test",
+              "status": "online",
+              "restarts": 0
+            }
+          ]
+        },
+        {
+          "rttNode": "uns-archiver",
+          "versions": [
+            {
+              "version": "v5.2.20",
+              "instances": [
+                {
+                  "id": "p4b-test",
+                  "processName": "uns-archiver",
+                  "desiredRunning": true,
+                  "processes": [
+                    {
+                      "pid": 32291,
+                      "status": "online",
+                      "restarts": 0
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "version": "v5.2.17",
+              "instances": [
+                {
+                  "id": "p4b-test",
+                  "processName": "uns-archiver",
+                  "desiredRunning": false,
+                  "processes": [
+                    {
+                      "pid": 0,
+                      "status": "stopped",
+                      "restarts": 0
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "processes": [
+            {
+              "pid": 0,
+              "version": "v5.2.17",
+              "instanceId": "p4b-test",
+              "status": "stopped",
+              "restarts": 0
+            },
+            {
+              "pid": 32291,
+              "version": "v5.2.20",
+              "instanceId": "p4b-test",
+              "status": "online",
+              "restarts": 0
+            }
+          ]
+        }
+      ]
+    },
+    "snapshot": {
+      "capturedAt": "2026-10-09T21:59:03.731Z",
+      "database": "local-p2-relay",
+      "active": 0,
+      "queued": 0,
+      "coalescedWaiters": 0,
+      "cooldownRemainingMs": 0,
+      "limits": {
+        "maxConcurrent": 2,
+        "maxQueued": 8
+      },
+      "totals": {
+        "executed": 18,
+        "coalesced": 8,
+        "lookupCoalesced": 103,
+        "rejected": 62,
+        "failed": 2
+      }
+    }
+  },
+  "restoration": {
+    "restoredAt": "2026-10-09T22:01:12.470Z",
+    "diagnosticsStatus": 200,
+    "historyStatus": 200,
+    "defaultLimits": {
+      "maxConcurrent": 4,
+      "maxQueued": 64
+    },
+    "workerLaunchErrors": false,
+    "archiverRows": 7918,
+    "apiRows": 48000,
+    "processes": {
+      "GetRttNodes": [
+        {
+          "rttNode": "uns-api-global",
+          "versions": [
+            {
+              "version": "v4.1.13",
+              "instances": [
+                {
+                  "id": "p2-test",
+                  "processName": "uns-api-global",
+                  "desiredRunning": true,
+                  "processes": [
+                    {
+                      "pid": 54559,
+                      "status": "online",
+                      "restarts": 0
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "processes": [
+            {
+              "pid": 54559,
+              "version": "v4.1.13",
+              "instanceId": "p2-test",
+              "status": "online",
+              "restarts": 0
+            }
+          ]
+        },
+        {
+          "rttNode": "uns-archiver",
+          "versions": [
+            {
+              "version": "v5.2.20",
+              "instances": [
+                {
+                  "id": "p4b-test",
+                  "processName": "uns-archiver",
+                  "desiredRunning": true,
+                  "processes": [
+                    {
+                      "pid": 32291,
+                      "status": "online",
+                      "restarts": 0
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "version": "v5.2.17",
+              "instances": [
+                {
+                  "id": "p4b-test",
+                  "processName": "uns-archiver",
+                  "desiredRunning": false,
+                  "processes": [
+                    {
+                      "pid": 0,
+                      "status": "stopped",
+                      "restarts": 0
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "processes": [
+            {
+              "pid": 0,
+              "version": "v5.2.17",
+              "instanceId": "p4b-test",
+              "status": "stopped",
+              "restarts": 0
+            },
+            {
+              "pid": 32291,
+              "version": "v5.2.20",
+              "instanceId": "p4b-test",
+              "status": "online",
+              "restarts": 0
+            }
+          ]
+        }
+      ]
+    },
+    "health": [
+      {
+        "url": "http://localhost:3200/api/healthcheck",
+        "status": 200
+      },
+      {
+        "url": "http://localhost:8180/api/healthcheck",
+        "status": 200
+      }
+    ]
+  },
+  "source": {
+    "apiHead": "911bda4c128fd47ce806087a839635e6c56ee412",
+    "apiBranch": "aljosavister/api-global-4.1.13-release",
+    "apiDirtyDelta": [
+      "src/catchall-helpers.ts",
+      "src/index.ts",
+      "test/catchall-helpers.test.ts"
+    ],
+    "controllerHead": "c694570",
+    "controllerDirtyDelta": [
+      "assets/rtt/handover-exit-guard.mjs",
+      "src/rtt-manager/handover-source-guard.test.ts"
+    ],
+    "kit": {
+      "api": "3.0.22",
+      "core": "3.0.22"
+    },
+    "verification": {
+      "apiTests": 211,
+      "apiTypecheck": true,
+      "apiBuild": true,
+      "controllerTargetedTests": 46,
+      "controllerTypecheck": true
+    }
+  },
+  "limits": {
+    "fixture": "48000 synthetic rows in 24 topics; prior archiver 7918 rows preserved",
+    "faultModel": "HTTP relay delays/503; real QuestDB underneath; not replica CPU/I/O saturation",
+    "scope": "process-local limits, no cluster-wide budget or production rollout",
+    "clientDisconnect": "SQL may continue after HTTP abort/timeout; no database-side cancellation claim",
+    "broaderP2": "multi-source/interval oracle, MQTT-during-fallback race, replica workload and deployment budgets remain open",
+    "noNewRelease": true
+  }
+}
