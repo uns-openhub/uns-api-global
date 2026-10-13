@@ -6,6 +6,8 @@ export class QuestDbRequestError extends Error {
 export type HistoryDiagnostic = {
   code: string; scope: 'source' | 'database' | 'request'; phase: 'schema' | 'query';
   tables: string[]; action: string;
+  currentTable?: string | null;
+  conflicts?: Array<{column: string; sources: Array<{table: string; type: string | null}>}>;
 };
 export class HistoryReadError extends Error {
   constructor(readonly status: number, message: string, readonly diagnostic: HistoryDiagnostic) { super(message); }

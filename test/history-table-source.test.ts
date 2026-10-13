@@ -70,3 +70,47 @@ test('counter delta refuses unproven cross-publisher continuity; explicit source
  assert.throws(()=>assertHistoryTransform({tables:['old','new'],columns:[]},'delta'),/continuity/);
  assert.doesNotThrow(()=>assertHistoryTransform('old','delta'));
 });
+
+const enriched = () => {
+ const s=schema();
+ for(const column of ['fullTopic','stableEntityId','entityTypeKey','identityResolution','identityTimeBasis','identityBindingRevision','identityBindingDigest']) {
+  s.columns.add(column);s.orderedColumns.push(column);s.columnTypes.set(column,column==='fullTopic'||column==='identityBindingDigest'?'VARCHAR':'SYMBOL');
+ }
+ return s;
+};
+test('legacy and identity-enriched schemas preserve all metadata with typed NULLs',()=>{
+ for(const ss of [[schema(),enriched()],[enriched(),schema()]]) {
+  const result=combineHistorySchemas(['a','b'],ss);
+  assert.equal(result.schema.columnTypes.get('stableEntityId'),'STRING');
+  assert.ok(result.schema.columns.has('identityBindingDigest'));
+  const sql=historyTableRelation(result.source,'"stableEntityId" IS NULL AND "topic" = \'synthetic\'','timestamp');
+  assert.match(sql,/CAST\(NULL AS STRING\) AS "stableEntityId"/);
+  assert.match(sql,/CAST\("stableEntityId" AS STRING\) AS "stableEntityId"/);
+  assert.match(sql,/FROM \(SELECT .*\) WHERE "stableEntityId" IS NULL/);
+ }
+});
+test('unknown payload, path/time/value/unit/session and partial identity differences never disappear',()=>{
+ for(const column of ['extraTableField','asset','time','intervalStart','uom','sessionId','identityBindingId']) {
+  const s=schema();s.columns.add(column);s.orderedColumns.push(column);s.columnTypes.set(column,column==='asset'?'DOUBLE':'STRING');
+  assert.throws(()=>combineHistorySchemas(['a','b'],[schema(),s]),HistorySourceError);
+ }
+ const partial=schema();partial.columns.add('stableEntityId');partial.orderedColumns.push('stableEntityId');partial.columnTypes.set('stableEntityId','STRING');
+ assert.throws(()=>combineHistorySchemas(['a','b'],[schema(),partial]),HistorySourceError);
+ const numeric=enriched();numeric.columnTypes.set('identityBindingRevision','LONG');
+ assert.throws(()=>combineHistorySchemas(['a','b'],[schema(),numeric]),HistorySourceError);
+});
+test('conflict recommends only a unique explicitly active registered table',()=>{
+ const changed=schema();changed.columnTypes.set('numberValue','STRING');
+ const active={...mappings[0]!,tableName:'a',historyId:'1',retiredAt:null};
+ const old={...mappings[1]!,tableName:'b',historyId:'2',retiredAt:'2026-10-13T12:00Z'};
+ for(const [entries,current] of [[[active,old],'a'],[[active,{...old,retiredAt:null}],null],[[active,{...old,historyId:undefined}],null],[[],null]] as const){
+  try { combineHistorySchemas(['a','b'],[schema(),changed],[...entries]);assert.fail('must reject'); }
+  catch(e){assert.ok(e instanceof HistorySourceError);assert.equal(e.diagnostic?.currentTable,current);assert.equal(e.diagnostic?.conflicts?.[0]?.column,'numberValue');assert.deepEqual(e.diagnostic?.tables,['a','b']);assert.ok(!JSON.stringify(e.diagnostic).includes('http://'));}
+ }
+});
+test('text storage representations are losslessly aligned; numeric precision is never cast',()=>{
+ const symbol=schema(),varchar=schema();symbol.columnTypes.set('topic','SYMBOL');varchar.columnTypes.set('topic','VARCHAR');
+ const result=combineHistorySchemas(['a','b'],[symbol,varchar]);assert.equal(result.schema.columnTypes.get('topic'),'STRING');assert.match(historyTableRelation(result.source),/CAST\("topic" AS STRING\)/);
+ for(const type of ['LONG','FLOAT']) {const changed=schema();changed.columnTypes.set('numberValue',type);assert.throws(()=>combineHistorySchemas(['a','b'],[schema(),changed]),HistorySourceError);}
+ const unknown=enriched();unknown.columnTypes.delete('stableEntityId');assert.throws(()=>combineHistorySchemas(['a','b'],[schema(),unknown]),HistorySourceError);
+});
