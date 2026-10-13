@@ -1008,7 +1008,7 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
     );
 
     const parsedPath = { ...parseUnsPath(topic), captureSessionId: parseCaptureSessionId(query?.["sessionId"]) };
-    const { source, schema: tableSchema } = combineHistorySchemas(tables, await Promise.all(tables.map(name => readHistory([name], "schema", () => getTableSchema(questdb, name)))));
+    const { source, schema: tableSchema } = combineHistorySchemas(tables, await Promise.all(tables.map(name => readHistory([name], "schema", () => getTableSchema(questdb, name)))), mappings);
     assertHistoryTransform(source, transform);
     const tableColumns = tableSchema.columns;
     const temporal = resolveTemporalStrategy(tableColumns, timeField);
@@ -1150,7 +1150,7 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
     res.status(200).json(payload);
   } catch (error) {
     if (error instanceof AuthorizationStatusError || error instanceof HttpError || error instanceof CatchallParameterError || error instanceof HistorySourceError || error instanceof HistoryReadError || error instanceof QueryWorkloadError || error instanceof QuestDbQueryError) {
-      res.status(error.status).json({ error: error.message, requestId, ...(error instanceof HistoryReadError ? { diagnostic: error.diagnostic } : {}) });
+      res.status(error.status).json({ error: error.message, requestId, ...((error instanceof HistoryReadError || error instanceof HistorySourceError) && error.diagnostic ? { diagnostic: error.diagnostic } : {}) });
       return;
     }
 
@@ -1761,7 +1761,7 @@ function buildBatchLastResult(
 }
 
 function failedBatchLastResult(topic: string, error: unknown): BatchLastResult {
-  return { topic, value: null, values: null, uom: null, timestamp: null, dataGroup: null, ageMs: null, source: "miss", sql: null, counter: null, status: error instanceof HistorySourceError || error instanceof LatestLookupError || error instanceof HistoryReadError ? error.status : 503, error: error instanceof HistorySourceError || error instanceof LatestLookupError || error instanceof HistoryReadError ? error.message : "Latest-value recovery failed.", ...(error instanceof HistoryReadError ? { diagnostic: error.diagnostic } : {}) };
+  return { topic, value: null, values: null, uom: null, timestamp: null, dataGroup: null, ageMs: null, source: "miss", sql: null, counter: null, status: error instanceof HistorySourceError || error instanceof LatestLookupError || error instanceof HistoryReadError ? error.status : 503, error: error instanceof HistorySourceError || error instanceof LatestLookupError || error instanceof HistoryReadError ? error.message : "Latest-value recovery failed.", ...((error instanceof HistoryReadError || error instanceof HistorySourceError) && error.diagnostic ? { diagnostic: error.diagnostic } : {}) };
 }
 
 async function tryQuestDbLastRowFallback(topic: string): Promise<{ entry: LastValueEntry; sql: string } | null> {
@@ -1770,7 +1770,7 @@ async function tryQuestDbLastRowFallback(topic: string): Promise<{ entry: LastVa
     const mappings = await resolveHistoryFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider });
     const tables = override ? [override] : validateHistoryMappings(mappings);
     if (!tables.length) return null;
-    const { source, schema } = combineHistorySchemas(tables, await Promise.all(tables.map(table => readHistory([table], "schema", () => getTableSchema(questdb, table, signal)))));
+    const { source, schema } = combineHistorySchemas(tables, await Promise.all(tables.map(table => readHistory([table], "schema", () => getTableSchema(questdb, table, signal)))), mappings);
     const temporal = resolveTemporalStrategy(schema.columns, 'auto');
     const sql = buildLatestHistorySql(source, topic, schema, temporal);
     const result = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, signal, "latest-fallback"));
@@ -2104,7 +2104,7 @@ async function handleBatchRange(
         }
 
         const parsedPath = { ...parseUnsPath(topic), captureSessionId };
-        const { source, schema: tableSchema } = combineHistorySchemas(tables, await Promise.all(tables.map(name => readHistory([name], "schema", () => getTableSchema(questdb, name)))));
+        const { source, schema: tableSchema } = combineHistorySchemas(tables, await Promise.all(tables.map(name => readHistory([name], "schema", () => getTableSchema(questdb, name)))), mappings);
         assertHistoryTransform(source, transform);
         const tableColumns = tableSchema.columns;
         const entityStorage = detectEntityStorageSchema(tableColumns);
@@ -2276,7 +2276,7 @@ async function handleBatchRange(
         };
       } catch (err) {
         const message = err instanceof HttpError || err instanceof CatchallParameterError || err instanceof HistorySourceError || err instanceof HistoryReadError ? err.message : "History query failed.";
-        return { ...queryRequest, topic, error: message, data: null, columns: null, sql: null, stats: null, status: err instanceof HttpError || err instanceof CatchallParameterError || err instanceof HistorySourceError || err instanceof HistoryReadError ? err.status : 500, ...(err instanceof HistoryReadError ? { diagnostic: err.diagnostic } : {}) };
+        return { ...queryRequest, topic, error: message, data: null, columns: null, sql: null, stats: null, status: err instanceof HttpError || err instanceof CatchallParameterError || err instanceof HistorySourceError || err instanceof HistoryReadError ? err.status : 500, ...((err instanceof HistoryReadError || err instanceof HistorySourceError) && err.diagnostic ? { diagnostic: err.diagnostic } : {}) };
       }
     }),
   );
