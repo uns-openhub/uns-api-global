@@ -618,7 +618,13 @@ export function buildEntitySourceSql(
     const operator = range.toExclusive ? "<" : "<=";
     rangeParts.push(`${quoteIdentifier(temporal.fromColumn)} ${operator} ${escapeLiteral(range.to)}`);
   }
-  const where = `(((${identityWhere}) OR (${quoteIdentifier("stableEntityId")} IS NULL AND ${legacyPathWhere})))${rangeParts.length ? ` AND ${rangeParts.join(" AND ")}` : ""}`;
+  // A nested Asset can be parsed differently after its legacy row is archived
+  // and rediscovered. Prefer the persisted full path for legacy rows too; retain
+  // tuple fallback only for older rows without a fullTopic value.
+  const legacySourceWhere = schema.columns.has("fullTopic")
+    ? `(${exactSourceWhere} OR (${quoteIdentifier("fullTopic")} IS NULL AND ${legacyPathWhere}))`
+    : legacyPathWhere;
+  const where = `(((${identityWhere}) OR (${quoteIdentifier("stableEntityId")} IS NULL AND ${legacySourceWhere})))${rangeParts.length ? ` AND ${rangeParts.join(" AND ")}` : ""}`;
   const tableId = historyTableRelation(table, where, temporal.fromColumn);
   const canDedupe = canApplyDedupe(dedupe, schema);
   const pointTimeColumn = resolvePointTimeColumn(schema);
