@@ -596,10 +596,21 @@ export function buildEntitySourceSql(
     throw new HttpError(400, "Identity-aware table schema cannot distinguish the requested relative attribute path.");
   }
   const legacyPathWhere = buildWhere(parsed, {}, temporal, schema);
+  // A stable ID can be present at two paths during a verified handover.
+  // Scope resolved rows to this interval's concrete source as well; otherwise
+  // overlapping intervals read each other's rows and sampled sums double count.
+  const exactSourceWhere = schema.columns.has("fullTopic")
+    ? `${quoteIdentifier("fullTopic")} = ${escapeLiteral(parsed.fullPath)}`
+    : ["topic", "asset", "objectType", "objectId", "attribute"].every(column => schema.columns.has(column))
+      ? legacyPathWhere
+      : null;
+  if (!exactSourceWhere) {
+    throw new HttpError(400, "Identity-aware table schema cannot distinguish the exact source path.");
+  }
   const identityWhere = [
     `${quoteIdentifier("stableEntityId")} = ${escapeLiteral(stableEntityId)}`,
     `${quoteIdentifier("identityResolution")} = 'resolved'`,
-    ...relativeParts,
+    exactSourceWhere,
   ].join(" AND ");
   const rangeParts: string[] = [];
   if (range.from) rangeParts.push(`${quoteIdentifier(temporal.toColumn)} >= ${escapeLiteral(range.from)}`);
@@ -1239,4 +1250,11 @@ export function isSwaggerDefinitionRequest(requestPath: string, configuredSwagge
   }
 
   return normalizedRequest.endsWith("/catchall-swagger.json");
+}
+
+/** Explicit fresh authority for restored identity views. Cached mode preserves legacy readers. */
+export function parseBindingConsistency(value: unknown): 'cached' | 'current' {
+  if (value === undefined || value === null || value === 'cached') return 'cached';
+  if (value === 'current') return 'current';
+  throw new HttpError(400, 'bindingConsistency must be cached or current.');
 }

@@ -143,6 +143,21 @@ Raw mode returns tuple rows with column metadata. `summaryOnly=true` returns a
 full-range summary. `bucketMs` or `maxPoints` returns an ascending sampled
 series, with `aggregate=avg|min|max|last|sum|count`.
 
+### Identity history consistency
+
+Batch range requests can address an Asset with `entitySelectors` containing its
+`stableEntityId` and exact relative `attributePath`. A saved identity view should
+send `bindingConsistency: "current"`: the API then obtains current temporal
+bindings from the controller, bypassing both fresh-cache and stale-on-error
+fallback. It still checks caller access to every resolved path before reading.
+The bounded response acknowledges `stats.bindingConsistency: "current"` and
+`stats.bindingSource: "controller"`. A controller outage fails the request.
+
+Omitted/`cached` consistency preserves existing cache behavior. A client requiring
+current authority must reject an absent or different acknowledgement from an
+older runtime. This concerns identity binding consistency; it does not guarantee
+that upstream observations have already reached the archive.
+
 ## Development
 
 ```bash
@@ -189,3 +204,11 @@ Tag pushes run an automated manifest/version check before normal verification.
 ## License
 
 MIT © Aljoša Vister. See [LICENSE](LICENSE).
+
+Data Catalog identity current-value cards also use `bindingConsistency: "current"`
+on batch/last. It bypasses binding-plan cache and stale fallback and acknowledges
+the same controller authority. Entity latest-value cache entries must be within
+the original binding validity interval; the two-millisecond current-plan lookup
+window is not the observation's validity window. A previous occupant's value
+before a reused path's new binding is not reassigned to the new Asset. This does
+not claim a fresh measurement: the response retains observation timestamp/age.

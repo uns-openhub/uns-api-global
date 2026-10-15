@@ -4,6 +4,8 @@ export type EntityLastSelector = {
 };
 
 export type EntityLastBinding = {
+  validFrom?: string;
+  validTo?: string | null;
   topic: string;
   bindingRevision: string;
   bindingDigest: string;
@@ -19,6 +21,11 @@ function selectorKey(selector: EntityLastSelector): string {
 
 function bindingKey(binding: EntityLastBinding): string {
   return `${binding.topic}\0${binding.bindingRevision}\0${binding.bindingDigest}`;
+}
+
+function withinBinding(binding:EntityLastBinding,timestamp:string|null):boolean {
+  const at=timestamp ? Date.parse(timestamp) : NaN;
+  return Number.isFinite(at) && (!binding.validFrom || at>=Date.parse(binding.validFrom)) && (!binding.validTo || at<Date.parse(binding.validTo));
 }
 
 export class EntityLastValueCache<T extends { timestamp: string | null }> {
@@ -44,7 +51,7 @@ export class EntityLastValueCache<T extends { timestamp: string | null }> {
     }
 
     const cached = this.values.get(key);
-    if (cached && !next.has(bindingKey(cached))) this.values.delete(key);
+    if (cached && (!next.has(bindingKey(cached)) || !withinBinding(next.get(bindingKey(cached))!,cached.value.timestamp))) this.values.delete(key);
   }
 
   updateTopic(topic: string, value: T): void {
@@ -53,7 +60,7 @@ export class EntityLastValueCache<T extends { timestamp: string | null }> {
       const binding = Array.from(this.bindingsBySelector.get(key)?.values() ?? [])
         .filter((candidate) => candidate.topic === topic)
         .sort((left, right) => right.bindingRevision.localeCompare(left.bindingRevision))[0];
-      if (!binding) continue;
+      if (!binding || !withinBinding(binding,value.timestamp)) continue;
       const current = this.values.get(key);
       if (
         current?.value.timestamp

@@ -910,3 +910,36 @@ test("auto resolves interval-only history without changing point-time preference
   assert.throws(() => resolveTemporalStrategy(schema, "timestamp"), (error: unknown) => error instanceof HttpError && error.status === 400);
   assert.throws(() => resolveTemporalStrategy(makeSchema([["intervalStart", "TIMESTAMP"]]), "auto"), (error: unknown) => error instanceof HttpError && error.status === 400);
 });
+
+test('explicit identity binding consistency rejects unsupported values', async () => {
+  const {parseBindingConsistency}=await import('../src/catchall-helpers.js');
+  assert.equal(parseBindingConsistency(undefined),'cached');assert.equal(parseBindingConsistency('cached'),'cached');assert.equal(parseBindingConsistency('current'),'current');
+  for(const value of [true,1,{},'fresh','']) assert.throws(()=>parseBindingConsistency(value),/bindingConsistency/);
+});
+
+
+test("resolved identity rows remain scoped to the concrete source during overlapping bindings", () => {
+  const schema = makeSchema(["topic", "asset", "objectType", "objectId", "attribute", "numberValue", "time",
+    "stableEntityId", "identityResolution", "identityTimeBasis", "identityBindingDigest"].map(column => [column]));
+  for (const line of ["line-a", "line-b"]) {
+    const sql = buildEntitySourceSql("uns_data", "11111111-1111-4111-8111-111111111111",
+      parseUnsPath(`enterprise/site/${line}/PRESS-14/equipment/main/temperature`),
+      {from:"2026-09-01T00:00:00.000Z",to:"2026-09-02T00:00:00.000Z",toExclusive:true},
+      false, schema, resolveTemporalStrategy(schema,"auto"),["numberValue"]).replace(/\s+/g," ").trim();
+    const resolvedBranch=sql.split(" OR ")[0]!;
+    assert(resolvedBranch.includes(`"topic" = 'enterprise/site/${line}'`));
+    assert(resolvedBranch.includes(`"asset" = 'PRESS-14'`));
+    assert(sql.includes(`"time" < '2026-09-02T00:00:00.000Z'`));
+    assert(!sql.includes(line==='line-a'?'line-b':'line-a'));
+  }
+});
+
+test("identity-enriched fullTopic identifies the exact interval source and insufficient schemas fail closed", () => {
+  const path="enterprise/site/line-a/PRESS-14/equipment/main/temperature";
+  const columns=["topic","asset","objectType","objectId","attribute","numberValue","time","stableEntityId","identityResolution"];
+  const schema=makeSchema([...columns,"fullTopic"].map(column=>[column]));
+  const sql=buildEntitySourceSql("uns_data","11111111-1111-4111-8111-111111111111",parseUnsPath(path),{},false,schema,resolveTemporalStrategy(schema,"auto"),["numberValue"]);
+  assert(sql.split(" OR ")[0]!.includes(`"fullTopic" = '${path}'`));
+  const insufficient=makeSchema(columns.filter(column=>column!=="topic").map(column=>[column]));
+  assert.throws(()=>buildEntitySourceSql("uns_data","11111111-1111-4111-8111-111111111111",parseUnsPath(path),{},false,insufficient,resolveTemporalStrategy(insufficient,"auto"),["numberValue"]),/exact source path/);
+});
