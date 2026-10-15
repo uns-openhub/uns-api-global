@@ -294,6 +294,9 @@ test("outbox: capacity preserves evidence and storage failure pauses recording u
     { maxSessions: 1 },
   );
   await box.enqueue(event);
+  // Finish the automatic initial send before moving its directory. Otherwise
+  // the later flush can join that older send instead of retrying storage.
+  await box.flush();
   await assert.rejects(box.enqueue({ ...event, sessionId: "other" }));
   assert.equal(box.canRecord(), false);
   assert.equal((await fs.readdir(directory)).length, 1);

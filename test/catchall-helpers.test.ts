@@ -943,3 +943,14 @@ test("identity-enriched fullTopic identifies the exact interval source and insuf
   const insufficient=makeSchema(columns.filter(column=>column!=="topic").map(column=>[column]));
   assert.throws(()=>buildEntitySourceSql("uns_data","11111111-1111-4111-8111-111111111111",parseUnsPath(path),{},false,insufficient,resolveTemporalStrategy(insufficient,"auto"),["numberValue"]),/exact source path/);
 });
+
+test("nested Asset legacy observations prefer exact fullTopic when tuple parsing changes after a return move", () => {
+  const path="enterprise/site/store/cassette/upper-roll/equipment/main/temperature";
+  const schema=makeSchema(["topic","asset","objectType","objectId","attribute","numberValue","timestamp","fullTopic","stableEntityId","identityResolution"].map(c=>[c]));
+  const parsed={...parseUnsPath(path),topic:"enterprise/site/store/cassette/upper-roll",asset:undefined};
+  const sql=buildEntitySourceSql("uns_data","11111111-1111-4111-8111-111111111111",parsed,{},false,schema,resolveTemporalStrategy(schema,"auto"),["numberValue"]).replace(/\s+/g," ");
+  assert(sql.includes(`"stableEntityId" IS NULL AND ("fullTopic" = '${path}' OR ("fullTopic" IS NULL AND `));
+  assert.equal(sql.split(`"fullTopic" = '${path}'`).length-1,2,"Both resolved and legacy rows must use the exact source path");
+  assert(sql.includes(`"stableEntityId" = '11111111-1111-4111-8111-111111111111'`));
+  assert(!sql.includes("lower-roll"));
+});
