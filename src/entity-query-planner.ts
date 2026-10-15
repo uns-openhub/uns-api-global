@@ -30,6 +30,8 @@ export function parseEntityHistorySelectors(value: unknown): EntityHistorySelect
 }
 
 export type EntityHistoryPathInterval = {
+  bindingValidFrom?: string;
+  bindingValidTo?: string | null;
   topic: string;
   from: string;
   to: string;
@@ -156,6 +158,8 @@ function planIntervals(
       if (new Date(clippedFrom).getTime() >= new Date(clippedTo).getTime()) return null;
       return {
         topic: interval.topic,
+        bindingValidFrom: interval.validFrom,
+        bindingValidTo: interval.validTo,
         from: clippedFrom,
         to: clippedTo,
         bindingRevision: interval.revision,
@@ -180,6 +184,7 @@ export async function planEntityHistoryBindings(
   reader: EntityIntervalReader,
   selectors: EntityHistorySelector[],
   range: { from: string | Date; to: string | Date },
+  options: {requireCurrent?: boolean} = {},
 ): Promise<EntityHistoryPlan> {
   if (!selectors.length) throw new TypeError("at least one entity selector is required");
   if (selectors.length > MAX_ENTITY_HISTORY_SELECTORS) {
@@ -196,7 +201,9 @@ export async function planEntityHistoryBindings(
 
   const responses = await Promise.all(entityIds.map(async (stableEntityId) => ({
     stableEntityId,
-    result: await reader.listIntervals(stableEntityId, from, to),
+    result: await (options.requireCurrent
+      ? reader.listIntervals(stableEntityId, from, to, undefined, {requireCurrent:true})
+      : reader.listIntervals(stableEntityId, from, to)),
   })));
   const byEntity = new Map(responses.map((entry) => [entry.stableEntityId, entry.result.intervals]));
   const sources = new Set(responses.map((entry) => entry.result.source));
@@ -220,13 +227,14 @@ export async function planEntityCurrentBindings(
   reader: EntityIntervalReader,
   selectors: EntityHistorySelector[],
   asOf: string | Date = new Date(),
+  options: {requireCurrent?:boolean} = {},
 ): Promise<EntityHistoryPlan> {
   const instant = asOf instanceof Date ? asOf : new Date(asOf);
   if (Number.isNaN(instant.getTime())) throw new TypeError("asOf must be a valid timestamp");
   return planEntityHistoryBindings(reader, selectors, {
     from: new Date(instant.getTime() - 1),
     to: new Date(instant.getTime() + 1),
-  });
+  },options);
 }
 
 const NON_PAYLOAD_COLUMNS = new Set([

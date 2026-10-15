@@ -316,6 +316,7 @@ export class ControllerEntityBindingClient {
     from: string | Date,
     to: string | Date,
     limit = MAX_ENTITY_BINDING_TOPICS,
+    options: {requireCurrent?: boolean} = {},
   ): Promise<{ intervals: EntityBindingInterval[]; source: "cache" | "controller" | "stale-cache" }> {
     const entityId = stableEntityId.trim().toLowerCase();
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(entityId)) {
@@ -332,7 +333,7 @@ export class ControllerEntityBindingClient {
     const key = `${entityId}\0${normalizedFrom}\0${normalizedTo}\0${limit}`;
     const now = this.now();
     const cached = this.intervalCache.get(key);
-    if (cached && now - cached.fetchedAt <= this.cacheTtlMs) {
+    if (!options.requireCurrent && cached && now - cached.fetchedAt <= this.cacheTtlMs) {
       return { intervals: cached.intervals, source: "cache" };
     }
     try {
@@ -363,7 +364,7 @@ export class ControllerEntityBindingClient {
       this.intervalCache.set(key, { intervals, fetchedAt: now });
       return { intervals, source: "controller" };
     } catch (error) {
-      if (cached && now - cached.fetchedAt <= this.staleIfErrorMs) {
+      if (!options.requireCurrent && cached && now - cached.fetchedAt <= this.staleIfErrorMs) {
         return { intervals: cached.intervals, source: "stale-cache" };
       }
       throw error;

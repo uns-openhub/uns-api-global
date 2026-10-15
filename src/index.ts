@@ -1,3 +1,4 @@
+import { parseBindingConsistency } from "./catchall-helpers.js";
 import { RouteOwnerRegistration, routeRegistrationEnvironment } from "./route-owner-registration.js";
 import { AuthorizationStatus, AuthorizationStatusError } from "./authorization-status.js";
 import { resolveQueryDeploymentBudget } from "./query-deployment-budget.js";
@@ -511,6 +512,7 @@ const swaggerDoc = {
                       },
                     },
                   },
+                  bindingConsistency: {type:"string",enum:["cached","current"],default:"cached",description:"Current bypasses cached/stale entity binding plans and acknowledges controller authority."},
                   transform: {
                     type: "string",
                     enum: ["raw", "delta"],
@@ -657,6 +659,7 @@ const swaggerDoc = {
                       },
                     },
                   },
+                  bindingConsistency: {type:"string",enum:["cached","current"],default:"cached",description:"Current resolves entity intervals from the controller for this request and fails instead of using a cached/stale binding. Required by saved identity history views."},
                   sessionId: { type: "string", maxLength: 128, description: "Exact Capture session restriction with explicit topics. Not supported for entitySelectors or latest-value mode; requires a sessionId history column." },
                   from: { type: "string", description: `ISO start time (default: last ${questdb.defaultLookbackHours}h)` },
                   to: { type: "string", description: "ISO end time (default: now)" },
@@ -1656,7 +1659,9 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
     if (body?.sessionId !== undefined) throw new HttpError(400, "sessionId requires range history; latest-value cache is not session filtered.");
     const transform = parseHistoryTransformMode(body?.transform);
     const counterResetPolicy = parseCounterResetPolicy(body?.counterResetPolicy ?? body?.resetPolicy);
-    await handleBatchLast(topics, entitySelectors, res, { transform, counterResetPolicy }, accessRules);
+    const bindingConsistency=parseBindingConsistency(body?.bindingConsistency);
+    if(bindingConsistency==='current'&&!entitySelectors.length) throw new HttpError(400,'Current binding consistency requires entitySelectors.');
+    await handleBatchLast(topics, entitySelectors, res, { transform, counterResetPolicy, bindingConsistency }, accessRules);
   } else {
     await handleBatchRange(topics, entitySelectors, body, res, accessRules);
   }
@@ -1675,6 +1680,7 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
 const BATCH_LAST_FALLBACK_LIMIT = 20;
 
 type BatchLastOptions = {
+  bindingConsistency?: "cached" | "current";
   transform: HistoryTransformMode;
   counterResetPolicy: CounterResetPolicy;
 };
@@ -1877,7 +1883,7 @@ async function handleBatchLast(
   let entityPlan: Awaited<ReturnType<typeof planEntityCurrentBindings>> | null = null;
   if (entitySelectors.length) {
     try {
-      entityPlan = await planEntityCurrentBindings(entityBindingClient!, entitySelectors);
+      entityPlan = await planEntityCurrentBindings(entityBindingClient!, entitySelectors, new Date(), {requireCurrent:options.bindingConsistency==="current"});
     } catch (error) {
       throw new HttpError(503, `Entity binding resolution failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1894,6 +1900,8 @@ async function handleBatchLast(
     }
     for (const selector of entityPlan.selectors) {
       entityLastValueMap.replaceBindings(selector, selector.intervals.map((interval) => ({
+        ...(interval.bindingValidFrom ? {validFrom:interval.bindingValidFrom} : {}),
+        ...(interval.bindingValidTo!==undefined ? {validTo:interval.bindingValidTo} : {}),
         topic: interval.topic,
         bindingRevision: interval.bindingRevision,
         bindingDigest: interval.bindingDigest,
@@ -1970,6 +1978,7 @@ async function handleBatchLast(
       entityHits: entityResults.filter(r => r.source !== "miss").length,
       entityMisses: entityResults.filter(r => r.source === "miss").length,
       bindingSource: entityPlan?.bindingSource ?? null,
+      bindingConsistency:options.bindingConsistency ?? "cached",
       cacheSize: lastValueMap.size,
       entityCacheSize: entityLastValueMap.size,
       transform: options.transform,
@@ -2023,6 +2032,9 @@ async function handleBatchRange(
     sampledRequested ? questdb.maxSampleLookbackHours : undefined,
   );
 
+  const bindingConsistency = parseBindingConsistency(body?.bindingConsistency);
+  if (bindingConsistency === 'current' && !entitySelectors.length) throw new HttpError(400, 'Current binding consistency requires entitySelectors.');
+
   // Check topic filtering
   for (const topic of topics) {
     if (!isHistoryAllowed(dataSources, topic)) {
@@ -2039,7 +2051,7 @@ async function handleBatchRange(
       entityPlan = await planEntityHistoryBindings(entityBindingClient!, entitySelectors, {
         from: requestedRange.from!,
         to: requestedRange.to!,
-      });
+      }, {requireCurrent: bindingConsistency === "current"});
     } catch (error) {
       throw new HttpError(503, `Entity binding resolution failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -2352,6 +2364,7 @@ async function handleBatchRange(
       failedEntities: entityResults.filter(r => r.error !== null).length,
       unresolvedEntities: entityResults.filter(r => r.status === "not-found").length,
       bindingSource: entityPlan?.bindingSource ?? null,
+      bindingConsistency: entityPlan ? bindingConsistency : null,
       from: requestedRange.from,
       to: requestedRange.to,
       transform,

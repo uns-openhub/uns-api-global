@@ -275,3 +275,14 @@ test("uses only bounded stale interval evidence while the controller is unavaila
   now += 1_000;
   await assert.rejects(() => client.listIntervals(...args), /controller unavailable/);
 });
+
+test('current interval reads bypass both fresh and stale caches after an Asset move', async () => {
+  let request=0,unavailable=false;
+  const client=new ControllerEntityBindingClient({graphqlUrl:'http://controller/graphql',tokenProvider:{getAccessToken:async()=>'local-test-token'},now:()=>1000,
+    fetchImpl:async()=>{request++;if(unavailable)throw Error('Controller unavailable');return jsonResponse({data:{ListEntityObservationBindingIntervals:[{topic:`site/line-${request}/asset/equipment/main/value`,stableEntityId:'11111111-1111-4111-8111-111111111111',entityTypeKey:'openhub.asset',bindingKind:'attribute-topic',validFrom:'2026-10-14T09:00:00Z',validTo:null,timeBasis:'source-event-time',sourceCount:1,revision:String(request),digest:`sha256:${'2'.repeat(64)}`} ]}});}});
+  const args=['11111111-1111-4111-8111-111111111111','2026-10-14T09:00:00Z','2026-10-14T10:00:00Z'] as const;
+  await client.listIntervals(...args);assert.equal((await client.listIntervals(...args)).source,'cache');assert.equal(request,1);
+  const fresh=await client.listIntervals(...args,undefined,{requireCurrent:true});assert.equal(fresh.source,'controller');assert.equal(fresh.intervals[0]?.revision,'2');assert.equal(request,2);
+  unavailable=true;await assert.rejects(client.listIntervals(...args,undefined,{requireCurrent:true}),/Controller unavailable/);
+  assert.equal((await client.listIntervals(...args)).source,'cache');
+});

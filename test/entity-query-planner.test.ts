@@ -414,3 +414,21 @@ test("preserves adjacent revisions when one source replaces another on the same 
   assert.deepEqual(plan.selectors[0]?.intervals.map((interval) => interval.bindingRevision), ["8", "9"]);
   assert.deepEqual(plan.selectors[0]?.intervals.map((interval) => interval.bindingDigest), ["source-a", "source-b"]);
 });
+
+test('forwards explicit fresh authority once per unique Asset rather than per Attribute', async () => {
+  const calls:unknown[][]=[];
+  const reader={listIntervals:async(...args:unknown[])=>{calls.push(args);return {intervals:[],source:'controller' as const};}};
+  const id='11111111-1111-4111-8111-111111111111';
+  await planEntityHistoryBindings(reader,[{stableEntityId:id,attributePath:'equipment/main/temperature'},{stableEntityId:id,attributePath:'equipment/main/pressure'}],{from:'2026-10-14T09:00:00Z',to:'2026-10-14T10:00:00Z'},{requireCurrent:true});
+  assert.equal(calls.length,1);assert.deepEqual(calls[0]?.slice(3),[undefined,{requireCurrent:true}]);
+});
+
+
+test('latest current authority forwards freshness and preserves original binding validity',async()=>{
+ const calls:unknown[][]=[];
+ const reader={listIntervals:async(...args:unknown[])=>{calls.push(args);return {intervals:[{topic:'site/asset/equipment/main/state',validFrom:'2026-10-14T08:00:00Z',validTo:null,revision:'1',digest:'a',timeBasis:'source-event-time'}],source:'controller' as const};}};
+ const plan=await planEntityCurrentBindings(reader as any,[{stableEntityId,attributePath:'equipment/main/state'}],'2026-10-14T09:00:00Z',{requireCurrent:true});
+ assert.deepEqual(calls[0]?.slice(3),[undefined,{requireCurrent:true}]);
+ assert.equal(plan.selectors[0]?.intervals[0]?.bindingValidFrom,'2026-10-14T08:00:00Z');
+ assert.equal(plan.selectors[0]?.intervals[0]?.bindingValidTo,null);
+});

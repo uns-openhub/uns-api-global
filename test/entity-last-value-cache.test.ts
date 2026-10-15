@@ -39,3 +39,13 @@ test("invalidates a cached value when its binding revision is no longer current"
   ]);
   assert.equal(cache.get(selector), null);
 });
+
+
+test('does not assign a previous occupant value to a newly bound Asset',()=>{
+ const cache=new EntityLastValueCache<{timestamp:string|null;value:number}>();
+ const selector={stableEntityId:'11111111-1111-4111-8111-111111111111',attributePath:'equipment/main/state'};
+ const binding={topic:'site/reused/asset/equipment/main/state',bindingRevision:'2',bindingDigest:'new',validFrom:'2026-10-14T09:00:00Z',validTo:null};
+ cache.replaceBindings(selector,[binding]);cache.updateTopic(binding.topic,{timestamp:'2026-10-14T08:59:59Z',value:999});assert.equal(cache.get(selector),null);
+ cache.updateTopic(binding.topic,{timestamp:'2026-10-14T09:00:00Z',value:10});assert.equal(cache.get(selector)?.value.value,10);
+ cache.replaceBindings(selector,[{...binding,validTo:'2026-10-14T09:00:00Z'}]);assert.equal(cache.get(selector),null);
+});
