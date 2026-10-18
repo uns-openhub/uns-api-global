@@ -1,3 +1,4 @@
+import { ControllerServiceRegistration } from './controller-service-registration.js';
 import { parseBindingConsistency } from "./catchall-helpers.js";
 import { RouteOwnerRegistration, routeRegistrationEnvironment } from "./route-owner-registration.js";
 import { AuthorizationStatus, AuthorizationStatusError } from "./authorization-status.js";
@@ -324,10 +325,15 @@ async function registerApiGlobalService(): Promise<void> {
       processName: config.uns.processName,
     },
   });
-  if (registration) {
-    logger.info(`Registered controller-managed service ${registration.service.rttNode}/${registration.service.instanceId}.`);
-  }
+  if (!registration) throw new Error("Missing controller-managed service registration receipt.");
 }
+
+const managedService = !!process.env["RTT_NODE"]?.trim() && !!process.env["RTT_INSTANCE_ID"]?.trim();
+if (managedService && !controllerClient) throw new Error("Controller-managed UNS API Global requires config.uns.rest for service registration.");
+const controllerServiceRegistration = managedService ? new ControllerServiceRegistration(registerApiGlobalService, ready => {
+  if (ready) logger.info("Controller-managed service registration confirmed.");
+  else logger.warn("Controller-managed service registration unavailable; initialization continues and registration will retry.");
+}) : undefined;
 
 async function refreshAndPublishQuestDbHealth() {
   const previousHealthy = latestQuestDbHealth?.healthy;
@@ -857,9 +863,10 @@ for (const topicFilter of catchAllTopicFilters.length ? catchAllTopicFilters : [
 }
 
 await publishApiGlobalServiceMetadata();
-await registerApiGlobalService();
+await controllerServiceRegistration?.refresh();
 
 setInterval(() => {
+  void controllerServiceRegistration?.refresh();
   refreshAndPublishQuestDbHealth().catch((error) => {
     logger.warn(`Failed to publish QuestDB dependency health: ${error instanceof Error ? error.message : String(error)}`);
   });
