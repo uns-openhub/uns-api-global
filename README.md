@@ -212,3 +212,21 @@ the original binding validity interval; the two-millisecond current-plan lookup
 window is not the observation's validity window. A previous occupant's value
 before a reused path's new binding is not reassigned to the new Asset. This does
 not claim a fresh measurement: the response retains observation timestamp/age.
+
+
+### Bounded cold-cache recovery (4.1.19)
+
+Latest-value batch recovery rotates through cache misses within the existing
+20-candidate per-request budget. Empty leading paths therefore do not repeatedly
+exclude later archived values in a stable batch. Interleaved authorized request
+lists have independent cursors, with a bounded 256-entry LRU of fingerprints;
+no topic strings, caller identities, tokens or values are stored in that scheduler.
+An evicted cursor restarts, so this is not a liveness guarantee under unbounded
+request churn. Authorization, query throttling/coalescing, database concurrency,
+row/range/response limits and raw tuple columns remain unchanged.
+
+This also helps Controller 2.2.13 recover complete material operation declarations
+from archive after startup. The API treats their scalar JSON as opaque data; it
+does not approve relationships or infer missing outputs. Demo 6.1.23 requires the
+Controller's manifest-aware reader even when the API is upgraded first. API
+4.1.19 keeps its existing Controller compatibility range (>=2.1.145 <3).

@@ -1,3 +1,4 @@
+import { BudgetedFallbackRotation } from "./budgeted-fallback-rotation.js";
 import { ControllerServiceRegistration } from './controller-service-registration.js';
 import { parseBindingConsistency } from "./catchall-helpers.js";
 import { RouteOwnerRegistration, routeRegistrationEnvironment } from "./route-owner-registration.js";
@@ -1685,6 +1686,7 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
 // A short-lived throttle map prevents us from re-querying the same
 // permanently-empty topic on every tick.
 const BATCH_LAST_FALLBACK_LIMIT = 20;
+const batchLastFallbackRotation = new BudgetedFallbackRotation(BATCH_LAST_FALLBACK_LIMIT);
 
 type BatchLastOptions = {
   bindingConsistency?: "cached" | "current";
@@ -1848,7 +1850,7 @@ async function resolveBatchLastResults(topics: string[], options: BatchLastOptio
   // we don't hammer the database on repeat requests for permanently-empty
   // topics. Successful lookups are inserted into lastValueMap so the next
   // batch call hits the fast path.
-  const eligible = misses.slice(0, BATCH_LAST_FALLBACK_LIMIT);
+  const eligible = batchLastFallbackRotation.select(misses, topics);
 
   if (eligible.length > 0) {
     await Promise.all(eligible.map(async ({ topic, idx }) => {
