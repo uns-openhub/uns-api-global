@@ -230,3 +230,30 @@ from archive after startup. The API treats their scalar JSON as opaque data; it
 does not approve relationships or infer missing outputs. Demo 6.1.23 requires the
 Controller's manifest-aware reader even when the API is upgraded first. API
 4.1.19 keeps its existing Controller compatibility range (>=2.1.145 <3).
+
+
+### Bounded complete Raw exports
+
+Since 4.1.20, the `exportWindow=half-open` option on GET `/api/catchall/<topic>`
+uses `[from,to)` UTC point-time bounds. Supply explicit ISO `from`/`to`,
+`dedupe=false` and a bounded `limit`. It cannot be combined with sampling,
+summary or delta transformation. Fractional bounds retain their precision.
+`stats.exportWindow=half-open` confirms this contract; `stats.truncated` uses
+one-row SQL lookahead while returning at most the configured maxLimit. A
+truncation reported by the upstream response also marks the window incomplete.
+Existing access, range, scan, response size, timeout and query budgets apply.
+Disconnecting the response cancels that export request's active read.
+
+Clients can collect disjoint bounded windows and split incomplete windows,
+retaining only complete pages. Preserve all equal-time observations; do not use
+`last timestamp + 1ms` as a cursor. An unsplittable full timestamp group must
+fail explicitly rather than download an incomplete result. These separate reads
+are not a transactionally frozen database snapshot; keep historical data stable
+during export. Existing non-export requests retain their inclusive time bounds.
+
+Deploy this API capability before a Controller that requires its completeness
+proof for Raw Excel export. An older Controller remains compatible.
+
+Version 4.1.20 uses UNS Kit 3.0.25. Controller 2.2.15 Raw Excel export requires
+this API version or newer; deploy the API before using that export. The existing
+Controller compatibility range remains unchanged for other consumers.

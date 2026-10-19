@@ -1,3 +1,4 @@
+import { rawExportRange, completeRawExportPage, cancelRawExportOnDisconnect } from './raw-export-window.js';
 import { BudgetedFallbackRotation } from "./budgeted-fallback-rotation.js";
 import { ControllerServiceRegistration } from './controller-service-registration.js';
 import { parseBindingConsistency } from "./catchall-helpers.js";
@@ -412,7 +413,12 @@ const swaggerDoc = {
             in: "query",
             required: false,
             schema: { type: "number" },
-            description: `Raw row limit (default ${questdb.defaultLimit}, max ${questdb.maxLimit})`,
+            description: `Raw row limit (default ${questdb.defaultLimit}, max ${questdb.maxLimit}); exportWindow=half-open supports bounded complete Raw exports`,
+          },
+          {
+            name: "exportWindow", in: "query", required: false,
+            schema: { type: "string", enum: ["half-open"] },
+            description: "Raw export opt-in: from inclusive, to exclusive, timestamp mode, dedupe=false. Explicit UTC bounds retain fractional precision. Response proves half-open semantics and uses one-row lookahead for exact truncation. All normal query/scan/byte/time limits remain enforced.",
           },
           {
             name: "maxPoints",
@@ -791,7 +797,11 @@ const catchAllRegistrationOptions: Parameters<typeof apiInput.registerCatchAll>[
       name: "limit",
       type: "number",
       required: false,
-      description: `Raw row limit (default ${questdb.defaultLimit}, max ${questdb.maxLimit})`,
+      description: `Raw row limit (default ${questdb.defaultLimit}, max ${questdb.maxLimit}); exportWindow=half-open supports bounded complete Raw exports`,
+    },
+    {
+      name: "exportWindow", type: "string", required: false,
+      description: "half-open: complete Raw window reads with exclusive To and precise UTC bounds; requires dedupe=false. Existing limits remain enforced.",
     },
     {
       name: "maxPoints",
@@ -890,6 +900,7 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
 
 async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: string): Promise<void> {
   const { req, res } = event;
+  let rawExportCancellation: ReturnType<typeof cancelRawExportOnDisconnect> | undefined;
   try {
     // Intercept POST /api/catchall/batch before the normal GET handler
     if (isBatchRequest(req)) {
@@ -1018,11 +1029,16 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
       sampledRequested ? questdb.maxSampleLookbackHours : undefined,
     );
 
+    const exportRange = rawExportRange(query, range, { summary: summaryOnly, sampled: sampledRequested, transform, dedupe: dedupeRequested, maxLookbackHours: questdb.maxLookbackHours });
+    if (exportRange) {
+      Object.assign(range, exportRange);
+      rawExportCancellation = cancelRawExportOnDisconnect(res);
+    }
     const parsedPath = { ...parseUnsPath(topic), captureSessionId: parseCaptureSessionId(query?.["sessionId"]) };
-    const { source, schema: tableSchema } = combineHistorySchemas(tables, await Promise.all(tables.map(name => readHistory([name], "schema", () => getTableSchema(questdb, name)))), mappings);
+    const { source, schema: tableSchema } = combineHistorySchemas(tables, await Promise.all(tables.map(name => readHistory([name], "schema", () => getTableSchema(questdb, name, rawExportCancellation?.signal)))), mappings);
     assertHistoryTransform(source, transform);
     const tableColumns = tableSchema.columns;
-    const temporal = resolveTemporalStrategy(tableColumns, timeField);
+    const temporal = resolveTemporalStrategy(tableColumns, exportRange ? "timestamp" : timeField);
     const dedupeApplied = canApplyDedupe(dedupeRequested, tableColumns);
     let sampling: HistorySamplingInfo;
     let sql: string;
@@ -1092,11 +1108,11 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
         sql = buildCounterDeltaRawSql(deltaSourceSql, limit);
       } else {
         sampling = { mode: "raw", transform };
-        sql = buildDataSql(source, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
+        sql = buildDataSql(source, parsedPath, range, exportRange ? limit + 1 : limit, dedupeRequested, tableColumns, temporal);
       }
     }
 
-    const rawResult = await readHistory(tables, "query", () => queryQuestDb(questdb, sql));
+    const rawResult = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, rawExportCancellation?.signal));
     const result = sampling.mode === "bucketed" && sampling.transform === "delta"
       ? buildBoundaryCounterDeltaResponse(
           rawResult,
@@ -1118,7 +1134,9 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
       );
     }
 
+    const exportPage = exportRange ? completeRawExportPage(result, limit) : null;
     const stats = {
+      ...(exportRange ? { exportWindow: "half-open" } : {}),
       table: tables.length === 1 ? table : null,
       history: historySourceMetadata(tables, mappings),
       limit,
@@ -1134,7 +1152,7 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
       dedupeRequested,
       dedupeApplied,
       note: range.note,
-      rowCount: result.data?.length ?? 0,
+      rowCount: exportPage ? exportPage.data.length : result.data?.length ?? 0,
       scanRowCount,
       sampling: sampling.mode === "bucketed"
         ? { ...sampling, returnedPoints: result.data?.length ?? 0 }
@@ -1147,8 +1165,8 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
           stats: { ...stats, raw: result.raw },
         }
       : {
-          data: result.data,
-          stats: { ...stats, raw: result.raw, truncated: sampling.mode === "raw" && (result.data?.length ?? 0) >= limit },
+          data: exportPage ? exportPage.data : result.data,
+          stats: { ...stats, raw: result.raw, truncated: exportPage ? exportPage.truncated : sampling.mode === "raw" && (result.data?.length ?? 0) >= limit },
         };
     const payloadBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
     if (payloadBytes > questdb.maxResponseBytes) {
@@ -1160,6 +1178,7 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
 
     res.status(200).json(payload);
   } catch (error) {
+    if (rawExportCancellation?.signal.aborted) return;
     if (error instanceof AuthorizationStatusError || error instanceof HttpError || error instanceof CatchallParameterError || error instanceof HistorySourceError || error instanceof HistoryReadError || error instanceof QueryWorkloadError || error instanceof QuestDbQueryError) {
       res.status(error.status).json({ error: error.message, requestId, ...((error instanceof HistoryReadError || error instanceof HistorySourceError) && error.diagnostic ? { diagnostic: error.diagnostic } : {}) });
       return;
@@ -1168,6 +1187,7 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
     logger.error({ component: "questdb-query-diagnostics", event: "http.failed", requestId, message: "Catch-all request failed; inspect correlated query diagnostics." });
     res.status(500).json({ error: "Internal server error", requestId });
   } finally {
+    rawExportCancellation?.dispose();
     queryDiagnostics.finishRequest(res.statusCode);
   }
 }
