@@ -1,3 +1,4 @@
+import { BoundedTopicRefresh, topicSubscriptionDelta } from "./bounded-topic-refresh.js";
 import { rawExportRange, completeRawExportPage, cancelRawExportOnDisconnect } from './raw-export-window.js';
 import { BudgetedFallbackRotation } from "./budgeted-fallback-rotation.js";
 import { ControllerServiceRegistration } from './controller-service-registration.js';
@@ -1266,30 +1267,25 @@ function buildSeedCounterState(value: unknown): LastValueEntry["counter"] | unde
   };
 }
 
-async function fetchActiveTopicsFromController(): Promise<string[]> {
+const activeTopicDiscovery = new BoundedTopicRefresh(async signal => {
   if (!controllerGraphqlUrl) return [];
-  try {
-    const token = await controllerTokenProvider.getAccessToken();
-    const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
-    const document = gql`
-      query GetUnsNodes {
-        GetUnsNodes {
-          id
-          type
-          fullTopic
-        }
-      }
-    `;
-    const result: any = await request(controllerGraphqlUrl, document, undefined, headers);
-    const nodes: any[] = result?.GetUnsNodes ?? [];
-    return nodes
-      .filter((n: any) => n.type === "Attribute" && typeof n.fullTopic === "string")
-      .map((n: any) => sanitizeTopic(n.fullTopic))
-      .filter((topic: string) => isCacheAllowed(dataSources, topic));
-  } catch (err) {
-    logger.warn(`[last-value-cache] Failed to fetch topics from controller: ${err instanceof Error ? err.message : err}`);
-    return lvActiveTopics; // keep previous set on failure
-  }
+  const token = await controllerTokenProvider.getAccessToken();
+  signal.throwIfAborted();
+  const document = gql`query GetUnsNodes { GetUnsNodes { id type fullTopic } }`;
+  const result: any = await request({
+    url: controllerGraphqlUrl, document, signal,
+    ...(token ? { requestHeaders: { Authorization: `Bearer ${token}` } } : {}),
+  });
+  const nodes: any[] = result?.GetUnsNodes ?? [];
+  return nodes.filter((n: any) => n.type === "Attribute" && typeof n.fullTopic === "string")
+    .map((n: any) => sanitizeTopic(n.fullTopic))
+    .filter((topic: string) => isCacheAllowed(dataSources, topic));
+}, 5000, ready => {
+  if (!ready) logger.warn("[last-value-cache] Controller topic discovery unavailable; keeping current subscriptions and retrying after the active request ends.");
+});
+
+async function fetchActiveTopicsFromController(): Promise<string[]> {
+  return await activeTopicDiscovery.refresh() ?? lvActiveTopics;
 }
 
 function updateLastValue(topic: string, mqttMessage: string): void {
@@ -1404,18 +1400,18 @@ async function initLastValueCache(): Promise<void> {
   // Periodic topic refresh
   setInterval(async () => {
     const newTopics = await fetchActiveTopicsFromController();
-    if (JSON.stringify(newTopics) === JSON.stringify(lvActiveTopics)) return;
+    const change = topicSubscriptionDelta(lvActiveTopics, newTopics);
+    if (!change.added.length && !change.removed.length) return;
 
-    const oldTopics = lvActiveTopics;
-    lvActiveTopics = newTopics;
+    const oldCount = lvActiveTopics.length;
+    lvActiveTopics = change.topics;
 
     if (lvMqttInput) {
-      const toUnsub = oldTopics.filter(Boolean);
-      if (toUnsub.length > 0) lvMqttInput.unsubscribeAsync(toUnsub);
-      if (newTopics.length > 0) lvMqttInput.subscribeAsync(newTopics);
+      if (change.removed.length > 0) lvMqttInput.unsubscribeAsync(change.removed);
+      if (change.added.length > 0) lvMqttInput.subscribeAsync(change.added);
     }
 
-    logger.info(`[last-value-cache] Topic refresh: ${oldTopics.length} → ${newTopics.length} topics.`);
+    logger.info(`[last-value-cache] Topic refresh: ${oldCount} → ${lvActiveTopics.length} topics.`);
   }, lastValueCacheConfig.topicRefreshIntervalMs);
 
   // Periodic stale eviction

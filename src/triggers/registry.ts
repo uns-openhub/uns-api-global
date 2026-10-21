@@ -164,6 +164,10 @@ export class TriggerRegistry {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.deps.requestTimeoutMs ?? 5000);
     const abort = new Promise<never>((_resolve, reject) => controller.signal.addEventListener("abort", () => reject(new Error("Registry timeout")), { once: true }));
+    // Every race must settle, including early auth/status/generation returns.
+    // Unread fetch bodies and their abort/reaction graphs otherwise stay alive.
+    void abort.catch(() => undefined);
+    let response: Response | undefined;
     const current = () => generation === this.generation;
     try {
       let token: string | null;
@@ -178,7 +182,6 @@ export class TriggerRegistry {
         await this.applyRows([], "authorizationUnavailable");
         return;
       }
-      let response: Response;
       try {
         response = await Promise.race([this.fetchImpl(`${this.deps.controllerRestUrl.replace(/\/+$/, "")}/triggers`, {
           method: "GET", headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }, signal: controller.signal,
@@ -201,7 +204,13 @@ export class TriggerRegistry {
       await this.applyRows(payload.triggers);
     } catch {
       if (current()) { this.health.transportFailure(); this.executionAllowed(); }
-    } finally { clearTimeout(timeout); }
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+      if (response?.body && !response.bodyUsed) {
+        try { await response.body.cancel(); } catch { /* Aborted/locked bodies are already being released. */ }
+      }
+    }
   }
 
   private async applyRows(rows: TriggerApiRow[], reason?: string): Promise<void> {
