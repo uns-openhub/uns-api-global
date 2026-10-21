@@ -118,6 +118,21 @@ Project-specific configuration is defined in
 - `catchAll` controls the public paths and OpenAPI labels.
 - `lastValueCache` controls MQTT-backed current-value caching.
 
+Controller topic discovery shares one active refresh, with a five-second transport
+deadline. Timeout or discovery failure keeps the previous subscriptions; a late
+response cannot replace them. A still-pending credential/transport operation holds
+the gate rather than accumulating new requests on each timer tick. Normal refresh
+resumes after it settles. Reordered discovery rows do not change subscriptions;
+only added or removed topics are sent to MQTT. Diagnostics report state transitions without raw server
+response bodies or credentials.
+
+Trigger/Capture registry refreshes also release their request signals and unread
+response bodies on every outcome, including authorization denial. Denied access
+still clears executable definitions. An optional synthetic loopback diagnostic is
+available after building: `node --expose-gc scripts/test-registry-retention-local.mjs`.
+It reports retained heap after 2,000 requests; it is not a CI memory threshold or
+a production stability guarantee.
+
 Regenerate the schema after changing the configuration contract:
 
 ```bash
