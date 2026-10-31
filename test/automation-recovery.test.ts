@@ -286,6 +286,9 @@ test("outbox: old acknowledgement cannot delete a newer close checkpoint", async
   assert.equal(box.pendingCount(), 0);
 });
 test("outbox: capacity preserves evidence and storage failure pauses recording until recovery", async (t) => {
+  // Drive each retry explicitly. A queued background flush must not race the
+  // deliberate removal and restoration of the checkpoint directory.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const { box, directory } = await outbox(
     t,
     async () => {
