@@ -11,8 +11,9 @@
       "unhealthyAfterMs": 60000,
       "restartCooldownMs": 300000
     },
-    "instanceMode": "wait",
+    "instanceMode": "handover",
     "handover": true,
+    "handoverProtocol": "correlated-v2",
     "jwksWellKnownUrl": "http://localhost:3200/api/.well-known/jwks.json",
     "kidWellKnownUrl": "http://localhost:3200/api/.well-known/kid",
     "env": "prod"

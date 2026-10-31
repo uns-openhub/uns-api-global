@@ -90,6 +90,14 @@ export class CaptureRegistry {
     }
   }
 
+  pauseForHandover(): void {
+    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    this.refreshTimer = null;
+    this.started = false;
+    this.generation++;
+    this.refreshPromise = null;
+  }
+
   stop(): void {
     if (this.refreshTimer) {
       clearInterval(this.refreshTimer);

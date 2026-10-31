@@ -1,3 +1,4 @@
+import { triggerMigrationState } from "../migration-state.js";
 // src/triggers/service.ts
 //
 // Orchestrator for the Stage 1 trigger module.  Stitches together:
@@ -16,7 +17,7 @@
 // state) but does NOT survive process restarts — that's the
 // admin-confirmed "no replay on restart" behaviour.
 
-import { logger } from "@uns-kit/core";
+import { logger, ProcessWork } from "@uns-kit/core";
 import { evaluateTrigger } from "./evaluator.js";
 import type { LastValueAccessor } from "./evaluator.js";
 import { resolveTriggerOutputUom, type TriggerPublisher } from "./publisher.js";
@@ -102,6 +103,25 @@ export type TriggerFireEvent = {
 };
 
 export class TriggerService {
+  private readonly accepted = new ProcessWork();
+  pauseForHandover(): void { this.registry.pauseForHandover(); }
+  async prepareForHandover(): Promise<void> { await this.registry.start(); this.registry.pauseForHandover(); }
+  async drainForHandover(): Promise<void> { await this.accepted.drain(); }
+  exportMigrationState() { return { definitions: this.registry.list(), state: [...this.state], metrics: [...this.metrics] }; }
+  validateMigrationState(value: unknown): void {
+    const state = triggerMigrationState.parse(value);
+    if (JSON.stringify(state.definitions) !== JSON.stringify(this.registry.list())) throw Error("Trigger definitions changed during handover");
+  }
+  importMigrationState(value: unknown): void {
+    this.validateMigrationState(value);
+    const state = triggerMigrationState.parse(value);
+    this.state.clear(); this.metrics.clear();
+    for (const [id, item] of state.state) this.state.set(id, { lastSeenValue: item.lastSeenValue, lastFiredAt: item.lastFiredAt,
+      ...(item.lastComparisonResult !== undefined ? { lastComparisonResult: item.lastComparisonResult } : {}),
+      ...(item.lastCompositeResult !== undefined ? { lastCompositeResult: item.lastCompositeResult } : {}) });
+    for (const [id, item] of state.metrics) this.metrics.set(id, item);
+  }
+
   private readonly registry: TriggerRegistry;
   private readonly publisher: TriggerPublisher;
   private readonly now: () => number;
@@ -171,7 +191,7 @@ export class TriggerService {
     if (result.firedValue === null) return;
     const outputUom = resolveTriggerOutputUom(trig, ctx.uom);
     if (this.onFire) {
-      Promise.resolve(
+      this.accepted.track(Promise.resolve(
         this.onFire({
           trigger: trig,
           value: result.firedValue,
@@ -179,7 +199,7 @@ export class TriggerService {
           sourceTimestamp: ctx.sourceTimestamp,
           firedAtMs: now,
         }),
-      ).catch((err) => {
+      )).catch((err) => {
         logger.warn(
           `[triggers] onFire hook failed for trigger=${trig.id} (${trig.name}): ${
             err instanceof Error ? err.message : err
@@ -197,7 +217,7 @@ export class TriggerService {
     // Publish is fire-and-forget — failures are logged but never
     // propagate up into the MQTT handler (that would block other
     // triggers / topics on a single broker hiccup).
-    Promise.resolve(this.publisher.fire(fireReq)).catch((err) => {
+    this.accepted.track(Promise.resolve(this.publisher.fire(fireReq))).catch((err) => {
       logger.warn(
         `[triggers] publish failed for trigger=${trig.id} (${trig.name}): ${
           err instanceof Error ? err.message : err
