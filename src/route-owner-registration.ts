@@ -9,7 +9,7 @@ export class RouteOwnerRegistration {
   constructor(private readonly options: {
     controllerBase: string; tokenFile: string; controllerName: string; instanceId: string;
     version: string; processName: string; launchId: string;
-    token?: () => Promise<string>; fetch?: typeof fetch; onReady?: () => Promise<void>; onState?: (ready: boolean) => void;
+    active?: () => boolean; token?: () => Promise<string>; fetch?: typeof fetch; onReady?: () => Promise<void>; onState?: (ready: boolean) => void;
   }) {}
   observe(mappings: readonly { apiBase: string }[]): void {
     const origins = new Set(mappings.map(m => {
@@ -23,6 +23,7 @@ export class RouteOwnerRegistration {
     void this.renew();
   }
   renew(): Promise<boolean> {
+    if (this.options.active && !this.options.active()) return Promise.resolve(false);
     if (this.pending) return this.pending;
     if (!this.origin) return Promise.resolve(false);
     this.pending = this.perform().finally(() => { this.pending = undefined; });
@@ -58,6 +59,7 @@ export class RouteOwnerRegistration {
   private reportState(ready: boolean): void {
     if (this.reportedState !== ready) { this.reportedState = ready; this.options.onState?.(ready); }
   }
+  async drain(): Promise<void> { await this.pending; }
   stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
 }
 

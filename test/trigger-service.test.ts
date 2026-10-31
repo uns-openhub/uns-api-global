@@ -673,3 +673,19 @@ test("getRuntimeStates: clears lastSuppressedReason when the most recent outcome
   assert.equal(v.metrics.lastSuppressedReason, null, "fire wipes the last reason");
   service.stop();
 });
+
+test("live migration keeps the armed edge and cooldown instead of firing it twice", async () => {
+  const source = makeServices([HIGH_TRIGGER]); const target = makeServices([HIGH_TRIGGER]);
+  try {
+    await source.service.start();
+    source.service.onMessage({ topic: HIGH_TRIGGER.sourceTopic, value: 1000, uom: "C", sourceTimestamp: "2026-01-01T00:00:00.000Z" });
+    source.service.onMessage({ topic: HIGH_TRIGGER.sourceTopic, value: 1200, uom: "C", sourceTimestamp: "2026-01-01T00:00:01.000Z" });
+    source.service.pauseForHandover(); await source.service.drainForHandover();
+    await target.service.prepareForHandover(); target.service.importMigrationState(source.service.exportMigrationState());
+    await target.service.start();
+    target.service.onMessage({ topic: HIGH_TRIGGER.sourceTopic, value: 1200, uom: "C", sourceTimestamp: "2026-01-01T00:00:02.000Z" });
+    await target.service.drainForHandover();
+    assert.equal(source.publishCalls.length, 1); assert.equal(target.publishCalls.length, 0);
+    assert.equal(target.service.getRuntimeStates()[0]!.metrics.fireCount, 1);
+  } finally { source.service.stop(); target.service.stop(); }
+});

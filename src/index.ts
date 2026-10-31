@@ -1,3 +1,4 @@
+import { apiMigrationState, automationCacheTopics } from "./migration-state.js";
 import { BoundedTopicRefresh, topicSubscriptionDelta } from "./bounded-topic-refresh.js";
 import { rawExportRange, completeRawExportPage, cancelRawExportOnDisconnect } from './raw-export-window.js';
 import { BudgetedFallbackRotation } from "./budgeted-fallback-rotation.js";
@@ -16,6 +17,8 @@ import { HISTORY_SOURCE_COLUMN, HistorySourceError, historyTableRelation, combin
 import { QuestDbMappingCache, QUESTDB_HISTORY_MAPPINGS_QUERY, type QuestDbMappingEntry } from "./questdb-mapping-cache.js";
 import {
   AuthClient,
+  ProcessWork,
+  createApplicationHandoverContract,
   UnsProxyProcess,
   ConfigFile,
   logger,
@@ -219,8 +222,66 @@ const catchAllAuth: CatchAllAuthConfig = config.uns?.jwksWellKnownUrl
     }
   : { jwtSecret: envJwtSecret };
 
+const acceptedWork = new ProcessWork();
+const backgroundTimers: ReturnType<typeof setInterval>[] = [];
+let captureAuditOutbox: CaptureAuditOutbox | undefined;
+let ownershipPrepared = false;
+const statefulMigration = config.uns.handoverProtocol === "correlated-v2";
 const unsProxyProcess = new UnsProxyProcess(infraChannel.host, {
   processName: config.uns.processName,
+  ...(config.uns.handoverProtocol ? { handoverProtocol: config.uns.handoverProtocol } : {}),
+  deferHandoverUntilReady: true,
+  handoverShutdown: {
+    onRelease: () => {
+      ownershipPrepared = false;
+      backgroundTimers.forEach(clearInterval);
+      if (automationHealthTimer) clearTimeout(automationHealthTimer);
+      routeOwnerRegistration?.stop();
+      triggerService?.pauseForHandover();
+      captureService?.pauseForHandover();
+    },
+    drain: async () => {
+      await acceptedWork.drain();
+      await triggerService?.drainForHandover();
+      await captureService?.drainForHandover();
+      await routeOwnerRegistration?.drain();
+      await captureAuditOutbox?.flush();
+      if (captureAuditOutbox?.pendingCount()) throw Error("Capture audit remains unconfirmed; migration is blocked");
+      await captureAuditOutbox?.stop();
+    },
+    onActivate: async () => {
+      ownershipPrepared = true;
+      await triggerService?.start();
+      await captureService?.start();
+      await publishApiGlobalServiceMetadata();
+      await controllerServiceRegistration?.refresh();
+      await routeOwnerRegistration?.renew();
+    },
+  },
+  handoverState: {
+    contract: createApplicationHandoverContract("data-api-cache-automation-v1", JSON.parse(JSON.stringify({ catchAll, dataSources, lastValueCacheConfig }))),
+    exportState: () => {
+      const triggers = triggerService?.exportMigrationState() ?? null;
+      const captures = captureService?.exportMigrationState() ?? null;
+      const cacheTopics = automationCacheTopics([triggers?.definitions, captures?.definitions]);
+      const cache = cacheTopics.flatMap(topic => lastValueMap.has(topic) ? [[topic, lastValueMap.get(topic)]] : []);
+      return JSON.parse(JSON.stringify({ cacheTopics, cache, triggers, captures }));
+    },
+    validateState: validateMigrationState,
+    importState: async value => {
+      // A target cache seed admitted before ownership may still finish. Settle
+      // it before applying the exact source operands, including absent values.
+      await acceptedWork.drain();
+      const state = validateMigrationState(value);
+      for (const topic of state.cacheTopics) lastValueMap.delete(topic);
+      for (const [topic, entry] of state.cache) {
+        lastValueMap.set(topic, entry as LastValueEntry);
+        entityLastValueMap.updateTopic(topic, entry as LastValueEntry);
+      }
+      if (state.triggers) triggerService!.importMigrationState(state.triggers);
+      if (state.captures) captureService!.importMigrationState(state.captures);
+    },
+  },
   ...mqttChannelParameters(infraChannel),
 }) as UnsProxyProcessWithApi;
 
@@ -244,7 +305,8 @@ function reportAutomationHealth(health: RegistryHealth): void {
   if (automationHealthTimer) return;
   automationHealthTimer = setTimeout(() => {
     automationHealthTimer = null;
-    void publishApiGlobalServiceMetadata().catch(() => logger.warn("Automation dependency health publication failed."));
+    if (!unsProxyProcess.isActive()) return;
+    void acceptedWork.track(publishApiGlobalServiceMetadata().catch(() => logger.warn("Automation dependency health publication failed.")));
   }, 250);
   automationHealthTimer.unref?.();
 }
@@ -856,6 +918,7 @@ const catchAllTopicFilters = Array.from(
 
 const routeEnvironment = routeRegistrationEnvironment(process.env);
 const routeOwnerRegistration = routeEnvironment ? new RouteOwnerRegistration({ ...routeEnvironment,
+  active: () => !statefulMigration || ownershipPrepared,
   processName: config.uns.processName,
   onState: ready => {
     if (ready) logger.info("Runtime route ownership registered with the owning controller.");
@@ -874,15 +937,18 @@ for (const topicFilter of catchAllTopicFilters.length ? catchAllTopicFilters : [
   await apiInput.registerCatchAll(topicFilter, catchAllRegistrationOptions);
 }
 
-await publishApiGlobalServiceMetadata();
-await controllerServiceRegistration?.refresh();
+if (!statefulMigration) {
+  await publishApiGlobalServiceMetadata();
+  await controllerServiceRegistration?.refresh();
+}
 
-setInterval(() => {
-  void controllerServiceRegistration?.refresh();
-  refreshAndPublishQuestDbHealth().catch((error) => {
-    logger.warn(`Failed to publish QuestDB dependency health: ${error instanceof Error ? error.message : String(error)}`);
-  });
-}, QUESTDB_HEALTHCHECK_INTERVAL);
+backgroundTimers.push(setInterval(() => {
+  if (!unsProxyProcess.isActive()) return;
+  void acceptedWork.track(Promise.all([
+    controllerServiceRegistration?.refresh(),
+    refreshAndPublishQuestDbHealth().catch(() => logger.warn("QuestDB dependency health refresh failed.")),
+  ]));
+}, QUESTDB_HEALTHCHECK_INTERVAL));
 
 apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
   const { req, res } = event;
@@ -1350,16 +1416,14 @@ async function initLastValueCache(): Promise<void> {
   }
 
   // Create MQTT input proxy
-  const lvProcess = new UnsProxyProcess(infraChannel.host, {
-    processName: `${config.uns.processName}-lvc`,
-    ...mqttChannelParameters(infraChannel),
-  });
+  const lvProcess = unsProxyProcess;
   lvMqttInput = await lvProcess.createUnsMqttProxy(
     inputChannel.host,
     "lastValueCacheInput",
     config.uns.instanceMode ?? "wait",
-    false, // no handover — passive listener
+    config.uns.handover ?? true,
     {
+      handoverStateContract: "api-cache-input-v1",
       ...mqttChannelParameters(inputChannel),
       mqttSubToTopics: lvActiveTopics.length > 0 ? lvActiveTopics : ["$none"],
       subscribeThrottlingDelay: 0,
@@ -1387,10 +1451,10 @@ async function initLastValueCache(): Promise<void> {
     if (captureService) {
       const entry = lastValueMap.get(topic);
       if (entry) {
-        void captureService.onMessage({
+        void acceptedWork.track(captureService.onMessage({
           topic,
           sourceTimestamp: entry.timestamp,
-        }).catch((err) => {
+        })).catch((err) => {
           logger.warn(`[captures] onMessage failed: ${err instanceof Error ? err.message : err}`);
         });
       }
@@ -1398,7 +1462,9 @@ async function initLastValueCache(): Promise<void> {
   });
 
   // Periodic topic refresh
-  setInterval(async () => {
+  backgroundTimers.push(setInterval(() => {
+    if (!unsProxyProcess.isActive()) return;
+    void acceptedWork.track((async () => {
     const newTopics = await fetchActiveTopicsFromController();
     const change = topicSubscriptionDelta(lvActiveTopics, newTopics);
     if (!change.added.length && !change.removed.length) return;
@@ -1407,16 +1473,19 @@ async function initLastValueCache(): Promise<void> {
     lvActiveTopics = change.topics;
 
     if (lvMqttInput) {
-      if (change.removed.length > 0) lvMqttInput.unsubscribeAsync(change.removed);
-      if (change.added.length > 0) lvMqttInput.subscribeAsync(change.added);
+      if (change.removed.length > 0) await lvMqttInput.unsubscribeAsync(change.removed);
+      if (change.added.length > 0) await lvMqttInput.subscribeAsync(change.added);
     }
 
     logger.info(`[last-value-cache] Topic refresh: ${oldCount} → ${lvActiveTopics.length} topics.`);
-  }, lastValueCacheConfig.topicRefreshIntervalMs);
+
+    })().catch(() => logger.warn("Last-value topic refresh failed.")));
+  }, lastValueCacheConfig.topicRefreshIntervalMs));
 
   // Periodic stale eviction
   const evictionInterval = Math.max(lastValueCacheConfig.staleTtlMs / 4, 60_000);
-  setInterval(() => {
+  backgroundTimers.push(setInterval(() => {
+    if (!unsProxyProcess.isActive()) return;
     const cutoff = Date.now() - lastValueCacheConfig.staleTtlMs;
     let evicted = 0;
     for (const [key, entry] of lastValueMap) {
@@ -1428,13 +1497,13 @@ async function initLastValueCache(): Promise<void> {
     if (evicted > 0) {
       logger.info(`[last-value-cache] Evicted ${evicted} stale entries (${lastValueMap.size} remaining).`);
     }
-  }, evictionInterval);
+  }, evictionInterval));
 
   // Seed cache from QuestDB — fetch last known value for each topic so the
   // cache is warm even after a restart (before MQTT delivers new messages).
-  queryDiagnostics.runBackground("cache-seed", () => seedCacheFromQuestDb(lvActiveTopics)).catch(err => {
+  void acceptedWork.track(queryDiagnostics.runBackground("cache-seed", () => seedCacheFromQuestDb(lvActiveTopics)).catch(err => {
     logger.warn("[last-value-cache] QuestDB seed failed; inspect correlated recovery diagnostics.");
-  });
+  }));
 
   logger.info("[last-value-cache] Initialized.");
 }
@@ -1455,16 +1524,14 @@ async function initTriggerService(): Promise<void> {
     return;
   }
   // Dedicated proxy (handover off — passive publisher only).
-  const trProcess = new UnsProxyProcess(infraChannel.host, {
-    processName: `${config.uns.processName}-triggers`,
-    ...mqttChannelParameters(infraChannel),
-  });
+  const trProcess = unsProxyProcess;
   triggerOutputProxy = await trProcess.createUnsMqttProxy(
     outputChannel.host,
     "triggerOutput",
     config.uns.instanceMode ?? "wait",
-    false, // no handover — fires never need cluster handoff
+    config.uns.handover ?? true,
     {
+      handoverStateContract: "api-trigger-output-v1",
       ...mqttChannelParameters(outputChannel),
       // No subscriptions — this proxy only publishes.
       mqttSubToTopics: ["$none"],
@@ -1487,11 +1554,12 @@ async function initTriggerService(): Promise<void> {
   const publisher = new TriggerPublisher({
     publish: async ({ outputTopic, payload }) => {
       try {
-        await triggerOutputProxy!.publishMessage(outputTopic, payload);
+        await acceptedWork.track(triggerOutputProxy!.publishMessage(outputTopic, payload));
       } catch (err) {
         logger.warn(
           `[triggers] publish to ${outputTopic} failed: ${err instanceof Error ? err.message : err}`,
         );
+        throw err;
       }
     },
   });
@@ -1514,14 +1582,15 @@ async function initTriggerService(): Promise<void> {
       };
     },
     onFire: (event) => {
-      void captureService?.onTriggerFire({
+      if (!captureService) return;
+      return acceptedWork.track(captureService.onTriggerFire({
         triggerId: event.trigger.id,
         triggerName: event.trigger.name,
         firedAt: new Date(event.firedAtMs).toISOString(),
-      });
+      }));
     },
   });
-  await triggerService.start();
+  await triggerService.prepareForHandover();
   logger.info("[triggers] Initialized.");
 }
 
@@ -1531,16 +1600,14 @@ async function initCaptureService(): Promise<void> {
     return;
   }
   const captureProcessName = `${config.uns.processName}-captures`;
-  const captureProcess = new UnsProxyProcess(infraChannel.host, {
-    processName: captureProcessName,
-    ...mqttChannelParameters(infraChannel),
-  });
+  const captureProcess = unsProxyProcess;
   captureOutputProxy = await captureProcess.createUnsMqttProxy(
     outputChannel.host,
     "captureOutput",
     config.uns.instanceMode ?? "wait",
-    false,
+    config.uns.handover ?? true,
     {
+      handoverStateContract: "api-capture-output-v1",
       ...mqttChannelParameters(outputChannel),
       mqttSubToTopics: ["$none"],
       subscribeThrottlingDelay: 0,
@@ -1562,7 +1629,7 @@ async function initCaptureService(): Promise<void> {
   const publisher = new CapturePublisher({
     publish: async ({ outputTopic, payload }) => {
       try {
-        await captureOutputProxy!.publishMessage(outputTopic, payload);
+        await acceptedWork.track(captureOutputProxy!.publishMessage(outputTopic, payload));
       } catch (err) {
         logger.warn(
           `[captures] publish to ${outputTopic} failed: ${err instanceof Error ? err.message : err}`,
@@ -1576,6 +1643,7 @@ async function initCaptureService(): Promise<void> {
     onHealthChange: reportAutomationHealth,
     send: event => sendCaptureAudit({controllerRestUrl, getAccessToken: () => controllerTokenProvider.getAccessToken(), event}),
   });
+  captureAuditOutbox = auditOutbox;
   await auditOutbox.start();
   captureService = new CaptureService({
     registry,
@@ -1594,7 +1662,7 @@ async function initCaptureService(): Promise<void> {
       };
     },
   });
-  await captureService.start();
+  await captureService.prepareForHandover();
   logger.info("[captures] Initialized.");
 }
 
@@ -2405,25 +2473,7 @@ async function handleBatchRange(
   res.status(200).json(payload);
 }
 
-// Start last-value cache (non-blocking — errors logged, not thrown)
-initLastValueCache().catch(err => {
-  logger.error(`[last-value-cache] Init failed: ${err instanceof Error ? err.message : err}`);
-});
-
-// Start trigger service (non-blocking — errors logged, not thrown).
-// Independent of the last-value cache init; safe even when cache is
-// disabled, since the input handler already sets up correctly.
-initTriggerService().catch(err => {
-  logger.error(`[triggers] Init failed: ${err instanceof Error ? err.message : err}`);
-});
-
-// Start capture service (non-blocking — errors logged, not thrown).
-// It depends on the same last-value cache path as triggers; if the
-// cache is disabled, runtime registration still works but no MQTT
-// messages will drive sessions.
-initCaptureService().catch(err => {
-  logger.error(`[captures] Init failed: ${err instanceof Error ? err.message : err}`);
-});
+// Owned runtime initialization is awaited after all module-level declarations.
 
 // ─── End Last-Value Cache ───────────────────────────────────────────────────
 
@@ -3459,3 +3509,23 @@ function isSwaggerDefinitionRequest(requestPath: string, configuredSwaggerPath: 
 
   return normalizedRequest.endsWith("/catchall-swagger.json");
 }
+
+
+function validateMigrationState(value: unknown) {
+  const state = apiMigrationState.parse(value);
+  if (!!state.triggers !== !!triggerService || !!state.captures !== !!captureService) throw Error("Automation capability set differs");
+  if (state.triggers) triggerService!.validateMigrationState(state.triggers);
+  if (state.captures) captureService!.validateMigrationState(state.captures);
+  const expectedTopics = automationCacheTopics([state.triggers?.definitions, state.captures?.definitions]);
+  if (JSON.stringify(state.cacheTopics) !== JSON.stringify(expectedTopics) || state.cache.some(([topic]) => !state.cacheTopics.includes(topic)))
+    throw Error("Automation cache dependency set differs");
+  return state;
+}
+
+await initLastValueCache();
+await initTriggerService();
+await initCaptureService();
+for (const proxy of [triggerOutputProxy, captureOutputProxy]) proxy?.event.on("error", () => acceptedWork.fail());
+await unsProxyProcess.prepareHandover(config.uns.instanceMode ?? "handover", config.uns.handover ?? true);
+unsProxyProcess.enableMigrationDrain();
+unsProxyProcess.installSignalHandlers();

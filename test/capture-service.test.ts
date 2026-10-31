@@ -919,3 +919,65 @@ test("failed closing summary audits only successful rows and does not strand the
   assert.equal(service.getRuntimeStates()[0]!.active, true);
   service.stop();
 });
+
+test("live migration preserves one open capture, aggregates and remaining timeout", async () => {
+  let now = 5000;
+  const definition = { ...BASE_CAPTURE, captureConfig: { ...BASE_CAPTURE.captureConfig, modes: [{ type: "summary" as const }] } };
+  const source = makeServices([definition], { now: () => now, cache: {
+    "factory/line/furnace/state": { value: "RUNNING" }, "factory/line/furnace/temp": { value: 900 },
+  } });
+  const target = makeServices([definition], { now: () => now, cache: source.cache });
+  try {
+    await source.service.start();
+    source.cache["factory/line/furnace/state"]!.value = "IDLE";
+    await source.service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "2026-01-01T00:00:00.000Z" });
+    source.cache["factory/line/furnace/state"]!.value = "RUNNING";
+    await source.service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "2026-01-01T00:00:01.000Z" });
+    const before = source.service.getRuntimeStates()[0]!;
+    assert.equal(before.active, true);
+    source.service.pauseForHandover(); await source.service.drainForHandover();
+    const snapshot = source.service.exportMigrationState();
+    await target.service.prepareForHandover();
+    target.service.importMigrationState(snapshot);
+    now += 10000;
+    await target.service.start();
+    const resumed = target.service.getRuntimeStates()[0]!;
+    assert.equal(resumed.sessionId, before.sessionId);
+    assert.equal(resumed.startedAt, before.startedAt);
+    assert.equal(resumed.rowCount, before.rowCount);
+    const remaining = target.timers.timeouts.filter(t => !t.cleared);
+    assert.equal(remaining.length, 1); assert.equal(remaining[0]!.ms, 50000);
+    source.cache["factory/line/furnace/state"]!.value = "COMPLETE";
+    await target.service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "2026-01-01T00:01:00.000Z" });
+    assert.equal(target.publishCalls.length, 1);
+    assert.equal(target.service.getRuntimeStates()[0]!.active, false);
+  } finally { source.service.stop(); target.service.stop(); }
+});
+
+test("changed capture definition and corrupt session state reject before import", async () => {
+  const source = makeServices([BASE_CAPTURE]);
+  const target = makeServices([{ ...BASE_CAPTURE, name: "changed" }]);
+  try {
+    await source.service.prepareForHandover(); await target.service.prepareForHandover();
+    assert.throws(() => target.service.importMigrationState(source.service.exportMigrationState()), /definitions changed/);
+    assert.throws(() => source.service.importMigrationState({ ...source.service.exportMigrationState(), sessions: [{ id: "bad" }] }));
+  } finally { source.service.stop(); target.service.stop(); }
+});
+
+
+test("accepted source input may open a session during release without rearming timers", async () => {
+  const source = makeServices([BASE_CAPTURE], { cache: {
+    "factory/line/furnace/state": { value: "IDLE" }, "factory/line/furnace/temp": { value: 900 },
+  } });
+  try {
+    await source.service.start();
+    await source.service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "2026-01-01T00:00:00.000Z" });
+    source.service.pauseForHandover();
+    source.cache["factory/line/furnace/state"]!.value = "RUNNING";
+    await source.service.onMessage({ topic: "factory/line/furnace/state", sourceTimestamp: "2026-01-01T00:00:01.000Z" });
+    await source.service.drainForHandover();
+    assert.equal(source.service.exportMigrationState().sessions.length, 1);
+    assert.equal(source.timers.timeouts.filter(t => !t.cleared).length, 0);
+    assert.equal(source.timers.intervals.filter(t => !t.cleared).length, 0);
+  } finally { source.service.stop(); }
+});

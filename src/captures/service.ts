@@ -1,3 +1,4 @@
+import { captureMigrationState } from "../migration-state.js";
 // src/captures/service.ts
 //
 // Stateful runtime for capture definitions.  A capture session opens on a
@@ -5,7 +6,7 @@
 // timeout, and emits table rows according to the configured modes.
 
 import { randomUUID } from "node:crypto";
-import { logger } from "@uns-kit/core";
+import { logger, ProcessWork } from "@uns-kit/core";
 import type { CaptureRegistry } from "./registry.js";
 import type { CapturePublisher } from "./publisher.js";
 import type {
@@ -134,6 +135,49 @@ export type CaptureRuntimeView = {
 };
 
 export class CaptureService {
+  private readonly accepted = new ProcessWork();
+  private handoverPaused = false;
+  async prepareForHandover(): Promise<void> {
+    this.stopped = true; this.handoverPaused = true; await this.registry.start(); this.registry.pauseForHandover();
+  }
+  pauseForHandover(): void {
+    this.handoverPaused = true;
+    for (const session of this.activeSessions.values()) this.clearSessionTimers(session);
+    this.registry.pauseForHandover();
+  }
+  async drainForHandover(): Promise<void> {
+    await Promise.all([...this.opening.values()]);
+    await this.accepted.drain();
+    await Promise.all([...this.activeSessions.values()].map(session => session.publishQueue));
+    this.stopped = true;
+  }
+  exportMigrationState() {
+    return { definitions: this.registry.list(), conditions: [...this.conditionState], metrics: [...this.metrics], diagnostics: [...this.diagnostics],
+      sessions: [...this.activeSessions].map(([id, session]) => ({ id, sessionId: session.sessionId, capture: session.capture,
+        startedAt: session.startedAt, startedAtMs: session.startedAtMs, rowCount: session.rowCount,
+        lastRowAt: session.lastRowAt, aggregates: [...session.aggregates], closing: session.closing })) };
+  }
+  validateMigrationState(value: unknown): void {
+    const state = captureMigrationState.parse(value);
+    if (JSON.stringify(state.definitions) !== JSON.stringify(this.registry.list())) throw Error("Capture definitions changed during handover");
+    for (const session of state.sessions) {
+      const definition = this.registry.list().find(c => c.id === session.id);
+      if (!definition || JSON.stringify(definition) !== JSON.stringify(session.capture)) throw Error("Active capture definition differs");
+    }
+  }
+  importMigrationState(value: unknown): void {
+    this.validateMigrationState(value);
+    const state = captureMigrationState.parse(value);
+    this.conditionState.clear(); this.metrics.clear(); this.diagnostics.clear(); this.activeSessions.clear();
+    for (const [id, item] of state.conditions) this.conditionState.set(id, item);
+    for (const [id, item] of state.metrics) this.metrics.set(id, item);
+    for (const [id, item] of state.diagnostics) this.diagnostics.set(id, item);
+    for (const item of state.sessions) this.activeSessions.set(item.id, {
+      ...item, capture: this.registry.list().find(c => c.id === item.id)!, aggregates: new Map(item.aggregates),
+      intervalTimers: [], timeoutTimer: null, publishQueue: Promise.resolve(),
+    });
+  }
+
   private readonly registry: CaptureRegistry;
   private readonly publisher: CapturePublisher;
   private readonly getLastValue: CaptureLastValueAccessor;
@@ -168,12 +212,16 @@ export class CaptureService {
 
   async start(): Promise<void> {
     this.stopped = false;
+    this.handoverPaused = false;
     if (!this.unsubscribeRegistryRefresh) {
       this.unsubscribeRegistryRefresh = this.registry.onRefresh((event) => {
         return this.handleRegistryRefresh(event.current, event.reason);
       });
     }
     await this.registry.start();
+    for (const session of this.activeSessions.values()) {
+      this.clearSessionTimers(session); this.armSessionTimers(session.capture, session);
+    }
     await this.openAlwaysOnSessions(
       new Map(this.registry.list().map((capture) => [capture.id, capture])),
     );
@@ -373,12 +421,19 @@ export class CaptureService {
       return;
     }
 
+    this.armSessionTimers(capture, session);
+  }
+
+  private armSessionTimers(capture: CaptureDefinition, session: ActiveCaptureSession): void {
+    // Accepted input may open a session while the source is quiescing. Transfer
+    // it, but leave autonomous timers to the confirmed successor.
+    if (this.handoverPaused) return;
     for (const mode of capture.captureConfig.modes) {
       if (mode.type !== "interval") continue;
       const timer = this.timers.setInterval(() => {
         const active = this.activeSessions.get(capture.id);
         if (!active) return;
-        this.publishRow(capture, active, "interval").catch((err) => {
+        this.accepted.track(this.publishRow(capture, active, "interval")).catch((err) => {
           this.recordSuppression(capture.id, `publish_error:${stringifyError(err)}`);
         });
       }, mode.intervalMs);
@@ -390,10 +445,10 @@ export class CaptureService {
       const timeoutTimer = this.timers.setTimeout(() => {
         const active = this.activeSessions.get(capture.id);
         if (!active) return;
-        this.closeSession(capture, active, "timeout").catch((err) => {
+        this.accepted.track(this.closeSession(capture, active, "timeout")).catch((err) => {
           this.recordSuppression(capture.id, `timeout_close_error:${stringifyError(err)}`);
         });
-      }, capture.captureConfig.maxSessionMs);
+      }, Math.max(0, capture.captureConfig.maxSessionMs - (this.now() - session.startedAtMs)));
       unrefTimer(timeoutTimer);
       session.timeoutTimer = timeoutTimer;
     }
@@ -507,6 +562,7 @@ export class CaptureService {
       try {
         await this.publisher.publishRow(capture, row);
       } catch (error) {
+        this.accepted.fail();
         this.recordSuppression(capture.id, `publish_error:${stringifyError(error)}`);
         throw error;
       }
