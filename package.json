@@ -48,6 +48,7 @@
     "sync-uns-metadata": "node ./node_modules/@uns-kit/core/dist/tools/sync-uns-metadata.js",
     "test:catchall:local": "node scripts/test-catchall-local.mjs",
     "test:history-batch:local": "pnpm run build && node scripts/test-history-batch-local.mjs",
+    "test:cache-seed-handover:local": "pnpm run build && node scripts/test-cache-seed-handover-local.mjs",
     "test:identity-writer-rollback:local": "pnpm run build && node scripts/test-identity-writer-rollback-local.mjs",
     "identity:reconciliation-plan": "tsx src/local-tools/identity-reconciliation-plan.ts"
   },
