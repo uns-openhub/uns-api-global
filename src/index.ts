@@ -1,4 +1,5 @@
 import { mapHistoryRequests } from "./history-request-work.js";
+import { BackgroundCacheSeed } from "./background-cache-seed.js";
 import { apiMigrationState, automationCacheTopics } from "./migration-state.js";
 import { BoundedTopicRefresh, topicSubscriptionDelta } from "./bounded-topic-refresh.js";
 import { rawExportRange, completeRawExportPage, cancelRawExportOnDisconnect } from './raw-export-window.js';
@@ -239,6 +240,7 @@ const unsProxyProcess = new UnsProxyProcess(infraChannel.host, {
   handoverShutdown: {
     onRelease: () => {
       ownershipPrepared = false;
+      backgroundCacheSeed.pause();
       backgroundTimers.forEach(clearInterval);
       if (automationHealthTimer) clearTimeout(automationHealthTimer);
       routeOwnerRegistration?.stop();
@@ -261,6 +263,7 @@ const unsProxyProcess = new UnsProxyProcess(infraChannel.host, {
       await publishApiGlobalServiceMetadata();
       await controllerServiceRegistration?.refresh();
       await routeOwnerRegistration?.renew();
+      startCacheSeed();
     },
   },
   handoverState: {
@@ -276,6 +279,7 @@ const unsProxyProcess = new UnsProxyProcess(infraChannel.host, {
     importState: async value => {
       // A target cache seed admitted before ownership may still finish. Settle
       // it before applying the exact source operands, including absent values.
+      backgroundCacheSeed.pause();
       await acceptedWork.drain();
       const state = validateMigrationState(value);
       for (const topic of state.cacheTopics) lastValueMap.delete(topic);
@@ -1515,9 +1519,9 @@ async function initLastValueCache(): Promise<void> {
 
   // Seed cache from QuestDB — fetch last known value for each topic so the
   // cache is warm even after a restart (before MQTT delivers new messages).
-  void acceptedWork.track(queryDiagnostics.runBackground("cache-seed", () => seedCacheFromQuestDb(lvActiveTopics)).catch(err => {
-    logger.warn("[last-value-cache] QuestDB seed failed; inspect correlated recovery diagnostics.");
-  }));
+  // A passive successor must not run a full history fill before importing the
+  // source operands. Its new owner starts disposable recovery after activation.
+  if (!statefulMigration) startCacheSeed();
 
   logger.info("[last-value-cache] Initialized.");
 }
@@ -1680,29 +1684,25 @@ async function initCaptureService(): Promise<void> {
   logger.info("[captures] Initialized.");
 }
 
-async function seedCacheFromQuestDb(topics: string[]): Promise<void> {
-  let next = 0;
-  let seeded = 0;
-  // Four workers keep startup recovery bounded; lazy requests share the same lookup.
-  await Promise.all(Array.from({ length: Math.min(4, topics.length) }, async () => {
-    while (next < topics.length) {
-      const topic = topics[next++]!;
-      if (lastValueMap.has(topic)) continue;
-      try {
-        const fallback = await tryQuestDbLastRowFallback(topic);
-        if (!fallback) continue;
-        const selected = preserveConcurrentCacheValue(lastValueMap.get(topic), fallback.entry);
-        if (selected.inserted) {
-          lastValueMap.set(topic, selected.entry);
-          entityLastValueMap.updateTopic(topic, selected.entry);
-          seeded++;
-        }
-      } catch (error) {
-        logger.debug("[last-value-cache] Seed unavailable; inspect correlated recovery diagnostics.");
-      }
-    }
-  }));
-  logger.info(`[last-value-cache] Seeded ${seeded} entries from QuestDB (${lastValueMap.size} total in cache).`);
+const backgroundCacheSeed = new BackgroundCacheSeed<{ entry: LastValueEntry; sql: string }>({
+  hasValue: topic => lastValueMap.has(topic),
+  load: tryQuestDbLastRowFallback,
+  apply: (topic, fallback) => {
+    const selected = preserveConcurrentCacheValue(lastValueMap.get(topic), fallback.entry);
+    if (!selected.inserted) return false;
+    lastValueMap.set(topic, selected.entry);
+    entityLastValueMap.updateTopic(topic, selected.entry);
+    return true;
+  },
+  onError: () => logger.debug("[last-value-cache] Seed unavailable; inspect correlated recovery diagnostics."),
+});
+
+function startCacheSeed(): void {
+  if (!lastValueCacheConfig.enabled) return;
+  void acceptedWork.track(queryDiagnostics.runBackground("cache-seed", async () => {
+    const result = await backgroundCacheSeed.start(lvActiveTopics);
+    logger.info(`[last-value-cache] Seeded ${result.inserted} entries from QuestDB (${lastValueMap.size} total in cache).`);
+  }).catch(() => logger.warn("[last-value-cache] QuestDB seed failed; inspect correlated recovery diagnostics.")));
 }
 
 // ─── Batch Endpoint (POST /api/catchall/batch) ─────────────────────────────

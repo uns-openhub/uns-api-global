@@ -121,6 +121,13 @@ lockfile. No local SDK overlay is required. An upgrade from SDK versions before
 stop-before-start transition, then use matching compatible peers for hot moves.
 Never bypass a mixed-format refusal by changing the application contract label.
 
+Since 4.1.25, initial last-value cache recovery is disposable background work. A stateful
+successor starts it after importing the source's automation operands and taking
+ownership. Releasing the source stops new seed lookups, waits for the already
+admitted bounded reads, and rejects late seed writes. Existing cache values and
+the shared SDK's accepted-work, ownership and uncertain-write checks remain in
+force. This does not move persistent queues or guarantee an outage-free route.
+
 Project-specific configuration is defined in
 `src/config/project.config.extension.ts` and documented by
 `config.schema.json`.
@@ -228,6 +235,19 @@ row/scan limits, dependency failure, queue timeout, cancellation and recovery.
 It is an HTTP/application regression test, not a test of a real QuestDB engine
 or of migration between two deployed controllers. It creates only temporary
 synthetic local configuration and credentials and removes its fixtures on exit.
+
+The cache-seed handover smoke uses two actual API/SDK processes, loopback MQTT
+and 2,000 synthetic registered topics. It holds initial reads during ownership
+transfer and reverse transfer, checks that passive targets do not seed history,
+waits for source exit0 and verifies a live cached value on both successors:
+
+```bash
+pnpm run test:cache-seed-handover:local
+```
+
+Controller and QuestDB HTTP replies are synthetic. This does not replace a
+native two-controller migration test, real database commit verification or HA
+acceptance. The test removes its local processes and temporary configuration.
 
 The identity-writer rollback smoke needs only a disposable local QuestDB. It
 writes one identity-enriched row, then emulates the previous Archiver writer by
