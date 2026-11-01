@@ -121,7 +121,7 @@ lockfile. No local SDK overlay is required. An upgrade from SDK versions before
 stop-before-start transition, then use matching compatible peers for hot moves.
 Never bypass a mixed-format refusal by changing the application contract label.
 
-Initial last-value cache recovery is disposable background work. A stateful
+Since 4.1.25, initial last-value cache recovery is disposable background work. A stateful
 successor starts it after importing the source's automation operands and taking
 ownership. Releasing the source stops new seed lookups, waits for the already
 admitted bounded reads, and rejects late seed writes. Existing cache values and
