@@ -6,7 +6,7 @@ import http from 'node:http';
 import net from 'node:net';
 import { once } from 'node:events';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { randomBytes, randomUUID } from 'node:crypto';
 import path from 'node:path';
@@ -16,6 +16,7 @@ import jwt from 'jsonwebtoken';
 const require = createRequire(import.meta.resolve('@uns-kit/core'));
 const { connect } = require('mqtt');
 const entry = path.resolve(process.env.CACHE_SEED_ENTRY ?? 'dist/index.js');
+const packageVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
 const before = process.argv.includes('--expect-before');
 const tmp = await mkdtemp(path.join(os.tmpdir(), 'openhub-cache-seed-handover-'));
 const servers = [], children = [], logs = { source: '', target: '' }, origins = {};
@@ -36,7 +37,7 @@ async function launch(owner, quest, controller, mqttPort, returning=false) {
   logs[owner]='';
   delete origins[owner];
   const dir=path.join(tmp,owner);await mkdir(dir,{recursive:true});
-  await writeFile(path.join(dir,'package.json'),JSON.stringify({name:'uns-api-global',version:'4.1.24',type:'module'}));
+  await writeFile(path.join(dir,'package.json'),JSON.stringify({name:'uns-api-global',version:packageVersion,type:'module'}));
   await writeFile(path.join(dir,'config.json'),JSON.stringify({
     uns:{processName:'cache-seed-handover-local',instanceMode:successor?'handover':'force',handover:true,handoverProtocol:'correlated-v2',rest:controller+'/api',graphql:controller+'/graphql',token},
     infra:{host:'127.0.0.1',port:mqttPort,protocol:'mqtt'},
