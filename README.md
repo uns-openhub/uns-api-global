@@ -108,6 +108,19 @@ shutdown or the independent microservice lifecycle.
 
 ## Configuration
 
+Read-only HTTP handlers explicitly track their work with UNS Kit's
+`runReadOnlyRequest`. A disconnected reader does not leave an unknown write
+outcome, but migration still waits for the handler and admitted SQL work to
+settle. This is independent of the HTTP method: POST batch reads are also
+read-only. Authorization, cancellation and query limits continue to apply.
+Unknown effects from undeclared handlers remain blocked by the SDK.
+
+The API pins published `@uns-kit/core` and `@uns-kit/api` 3.0.39 in its registry
+lockfile. No local SDK overlay is required. An upgrade from SDK versions before
+3.0.38 also crosses the documented MQTT format3 boundary: review the initial
+stop-before-start transition, then use matching compatible peers for hot moves.
+Never bypass a mixed-format refusal by changing the application contract label.
+
 Project-specific configuration is defined in
 `src/config/project.config.extension.ts` and documented by
 `config.schema.json`.
@@ -154,6 +167,15 @@ pnpm run sync-uns-metadata
 - `GET /api/catchall/triggers/runtime` reports trigger runtime state.
 - `GET /api/catchall/captures/runtime` reports capture runtime state.
 
+Batch range work follows the effective per-process database allocation, including
+any static deployment budget. Paths retain input order; source schemas are read
+serially per path, and coalesced schema followers respect the waiting limit.
+The shared query semaphore still bounds simultaneous callers. A genuinely full
+or expired waiting queue returns a retryable per-path `503` rather than a generic
+`500`. Existing path permissions, source validation, row/scan/response limits and
+tuple/column response formats remain in effect. Disconnecting a batch cancels its
+active read and prevents unstarted paths from querying the database.
+
 Raw mode returns tuple rows with column metadata. `summaryOnly=true` returns a
 full-range summary. `bucketMs` or `maxPoints` returns an ascending sampled
 series, with `aggregate=avg|min|max|last|sum|count`.
@@ -190,6 +212,22 @@ CATCHALL_TEST_LOGIN_PASSWORD=change-me \
 CATCHALL_TEST_TOPICS='enterprise/site/area/line/motor-1/equipment/main/current,enterprise/site/area/line/motor-1/equipment/main/voltage' \
 pnpm run test:catchall:local
 ```
+
+The standalone batch-history smoke starts the built API and a disposable local
+Mosquitto broker, with synthetic loopback controller and QuestDB HTTP responses.
+It requires `mosquitto` on PATH, or `MOSQUITTO_BIN` pointing at its executable:
+
+```bash
+pnpm run test:history-batch:local
+# After building, also check cold multi-table reads without waiting slots:
+node scripts/test-history-batch-local.mjs --cold-parallel-only
+```
+
+This checks batch/single tuple and column equality, caller access, empty ranges,
+row/scan limits, dependency failure, queue timeout, cancellation and recovery.
+It is an HTTP/application regression test, not a test of a real QuestDB engine
+or of migration between two deployed controllers. It creates only temporary
+synthetic local configuration and credentials and removes its fixtures on exit.
 
 The identity-writer rollback smoke needs only a disposable local QuestDB. It
 writes one identity-enriched row, then emulates the previous Archiver writer by

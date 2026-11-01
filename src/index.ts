@@ -1,3 +1,4 @@
+import { mapHistoryRequests } from "./history-request-work.js";
 import { apiMigrationState, automationCacheTopics } from "./migration-state.js";
 import { BoundedTopicRefresh, topicSubscriptionDelta } from "./bounded-topic-refresh.js";
 import { rawExportRange, completeRawExportPage, cancelRawExportOnDisconnect } from './raw-export-window.js';
@@ -164,9 +165,13 @@ requireSafeRequestLogging(apiRequestLogging);
 const config = await ConfigFile.loadConfig();
 const { authorization: authorizationConfig, questdb, catchAll, lastValueCache: lastValueCacheConfig, dataSources } = parseProjectExtras(config);
 const verifiedRequestClaims = new WeakMap<object, JwtClaims>();
+const queryBudget = resolveQueryDeploymentBudget(questdb.queryDiagnostics);
+// Identical cold-schema reads also consume coalesced waiting slots. Keep
+// those followers within the waiting bound, including maxQueued=0.
+const historyRequestConcurrency = Math.min(4, queryBudget.maxConcurrent, questdb.queryDiagnostics.maxQueued + 1);
 const queryDiagnostics = new QueryDiagnostics({
   ...questdb.queryDiagnostics,
-  ...resolveQueryDeploymentBudget(questdb.queryDiagnostics),
+  ...queryBudget,
   emit: event => {
     const log = { ...event, component: "questdb-query-diagnostics", message: "QuestDB workload diagnostics" };
     if (event["slow"] || event["outcome"] === "failed" || event["outcome"] === "timeout") logger.warn(log);
@@ -962,7 +967,16 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
     : pathForDiagnostics.endsWith("/triggers/runtime") ? "trigger-runtime"
     : pathForDiagnostics.endsWith("/captures/runtime") ? "capture-runtime"
     : isSwaggerDefinitionRequest(pathForDiagnostics, catchAll.swaggerPath) ? "swagger" : "history";
-  await queryDiagnostics.runRequest(requestId, operation, () => handleApiRequest(event, requestId));
+  const handle = () => queryDiagnostics.runRequest(requestId, operation, () => handleApiRequest(event, requestId));
+  // This service's GET/HEAD handlers and POST batch endpoints only read data.
+  // Declare that work explicitly: a disconnected reader must settle its SQL
+  // work before migration, but cannot leave an uncertain external write.
+  const method = String((req as { method?: unknown }).method ?? "").toUpperCase();
+  if (method === "GET" || method === "HEAD" || isBatchRequest(req)) {
+    await apiInput.runReadOnlyRequest(res, handle);
+  } else {
+    await handle();
+  }
 });
 
 async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: string): Promise<void> {
@@ -1102,7 +1116,7 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
       rawExportCancellation = cancelRawExportOnDisconnect(res);
     }
     const parsedPath = { ...parseUnsPath(topic), captureSessionId: parseCaptureSessionId(query?.["sessionId"]) };
-    const { source, schema: tableSchema } = combineHistorySchemas(tables, await Promise.all(tables.map(name => readHistory([name], "schema", () => getTableSchema(questdb, name, rawExportCancellation?.signal)))), mappings);
+    const { source, schema: tableSchema } = combineHistorySchemas(tables, await mapHistoryRequests(tables, 1, name => readHistory([name], "schema", () => getTableSchema(questdb, name, rawExportCancellation?.signal)), rawExportCancellation?.signal), mappings);
     assertHistoryTransform(source, transform);
     const tableColumns = tableSchema.columns;
     const temporal = resolveTemporalStrategy(tableColumns, exportRange ? "timestamp" : timeField);
@@ -1245,7 +1259,7 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
 
     res.status(200).json(payload);
   } catch (error) {
-    if (rawExportCancellation?.signal.aborted) return;
+    if (rawExportCancellation?.signal.aborted || res.destroyed) return;
     if (error instanceof AuthorizationStatusError || error instanceof HttpError || error instanceof CatchallParameterError || error instanceof HistorySourceError || error instanceof HistoryReadError || error instanceof QueryWorkloadError || error instanceof QuestDbQueryError) {
       res.status(error.status).json({ error: error.message, requestId, ...((error instanceof HistoryReadError || error instanceof HistorySourceError) && error.diagnostic ? { diagnostic: error.diagnostic } : {}) });
       return;
@@ -1755,7 +1769,12 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
     if(bindingConsistency==='current'&&!entitySelectors.length) throw new HttpError(400,'Current binding consistency requires entitySelectors.');
     await handleBatchLast(topics, entitySelectors, res, { transform, counterResetPolicy, bindingConsistency }, accessRules);
   } else {
-    await handleBatchRange(topics, entitySelectors, body, res, accessRules);
+    const cancellation = cancelRawExportOnDisconnect(res);
+    try {
+      await handleBatchRange(topics, entitySelectors, body, res, accessRules, cancellation.signal);
+    } finally {
+      cancellation.dispose();
+    }
   }
 }
 
@@ -1869,7 +1888,7 @@ async function tryQuestDbLastRowFallback(topic: string): Promise<{ entry: LastVa
     const mappings = await resolveHistoryFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider });
     const tables = override ? [override] : validateHistoryMappings(mappings);
     if (!tables.length) return null;
-    const { source, schema } = combineHistorySchemas(tables, await Promise.all(tables.map(table => readHistory([table], "schema", () => getTableSchema(questdb, table, signal)))), mappings);
+    const { source, schema } = combineHistorySchemas(tables, await mapHistoryRequests(tables, 1, table => readHistory([table], "schema", () => getTableSchema(questdb, table, signal)), signal), mappings);
     const temporal = resolveTemporalStrategy(schema.columns, 'auto');
     const sql = buildLatestHistorySql(source, topic, schema, temporal);
     const result = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, signal, "latest-fallback"));
@@ -2087,6 +2106,7 @@ async function handleBatchRange(
   body: any,
   res: any,
   accessRules: string[],
+  signal: AbortSignal,
 ): Promise<void> {
   const captureSessionId = parseCaptureSessionId(body?.sessionId);
   if (captureSessionId && entitySelectors.length) throw new HttpError(400, "sessionId requires explicit topic history, not entity selectors.");
@@ -2181,15 +2201,18 @@ async function handleBatchRange(
       }))) ?? []),
   ];
 
-  // Resolve tables + run queries in parallel.  Each result carries the
+  // Resolve paths in bounded parallel work using the effective deployment
+  // allocation. Each path reads schemas serially to avoid nested fan-out.
+  // A batch must not exhaust its own shared query waiting budget.
+  // Each result carries the
   // full multi-line QuestDB SQL that was executed (`sql` field) so the
   // controller can surface it in the Explore dialog's "Show SQL" flow.
   // Pretty-printed form (what `buildDataSql` / `buildSummarySql` emit)
   // rather than the compacted one-liner `queryQuestDb` passes on the
   // wire — pasting into the QuestDB Web Console is the target use case,
   // and the multi-line form is drastically easier to read.
-  const results = await Promise.all(
-    queryRequests.map(async (queryRequest) => {
+  const results = await mapHistoryRequests(
+    queryRequests, historyRequestConcurrency, async (queryRequest) => {
       const { topic, range } = queryRequest;
       try {
         const tableFromDataSource = resolveTablePrefix(dataSources, topic);
@@ -2209,7 +2232,7 @@ async function handleBatchRange(
         }
 
         const parsedPath = { ...parseUnsPath(topic), captureSessionId };
-        const { source, schema: tableSchema } = combineHistorySchemas(tables, await Promise.all(tables.map(name => readHistory([name], "schema", () => getTableSchema(questdb, name)))), mappings);
+        const { source, schema: tableSchema } = combineHistorySchemas(tables, await mapHistoryRequests(tables, 1, name => readHistory([name], "schema", () => getTableSchema(questdb, name, signal)), signal), mappings);
         assertHistoryTransform(source, transform);
         const tableColumns = tableSchema.columns;
         const entityStorage = detectEntityStorageSchema(tableColumns);
@@ -2322,7 +2345,7 @@ async function handleBatchRange(
           }
         }
 
-        const rawResult = await readHistory(tables, "query", () => queryQuestDb(questdb, sql));
+        const rawResult = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, signal));
         const result = sampling.mode === "bucketed" && sampling.transform === "delta"
           ? buildBoundaryCounterDeltaResponse(
               rawResult,
@@ -2380,10 +2403,11 @@ async function handleBatchRange(
           },
         };
       } catch (err) {
-        const message = err instanceof HttpError || err instanceof CatchallParameterError || err instanceof HistorySourceError || err instanceof HistoryReadError ? err.message : "History query failed.";
-        return { ...queryRequest, topic, error: message, data: null, columns: null, sql: null, stats: null, status: err instanceof HttpError || err instanceof CatchallParameterError || err instanceof HistorySourceError || err instanceof HistoryReadError ? err.status : 500, ...((err instanceof HistoryReadError || err instanceof HistorySourceError) && err.diagnostic ? { diagnostic: err.diagnostic } : {}) };
+        const publicError = err instanceof HttpError || err instanceof CatchallParameterError || err instanceof HistorySourceError || err instanceof HistoryReadError || err instanceof QueryWorkloadError || err instanceof QuestDbQueryError;
+        const message = publicError ? err.message : "History query failed.";
+        return { ...queryRequest, topic, error: message, data: null, columns: null, sql: null, stats: null, status: publicError ? err.status : 500, ...((err instanceof HistoryReadError || err instanceof HistorySourceError) && err.diagnostic ? { diagnostic: err.diagnostic } : {}) };
       }
-    }),
+    }, signal,
   );
 
   const topicResults = results

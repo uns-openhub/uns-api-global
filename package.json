@@ -1,6 +1,6 @@
 {
   "name": "uns-api-global",
-  "version": "4.1.23",
+  "version": "4.1.24",
   "private": true,
   "description": "Authenticated REST API for current and historical Unified Namespace data",
   "license": "MIT",
@@ -47,14 +47,17 @@
     "sync-uns-schema": "node ./node_modules/@uns-kit/core/dist/tools/sync-uns-schema.js",
     "sync-uns-metadata": "node ./node_modules/@uns-kit/core/dist/tools/sync-uns-metadata.js",
     "test:catchall:local": "node scripts/test-catchall-local.mjs",
+    "test:history-batch:local": "pnpm run build && node scripts/test-history-batch-local.mjs",
     "test:identity-writer-rollback:local": "pnpm run build && node scripts/test-identity-writer-rollback-local.mjs",
     "identity:reconciliation-plan": "tsx src/local-tools/identity-reconciliation-plan.ts"
   },
   "dependencies": {
-    "@uns-kit/api": "3.0.37",
-    "@uns-kit/core": "3.0.37",
+    "@uns-kit/api": "3.0.39",
+    "@uns-kit/core": "3.0.39",
     "jsonwebtoken": "^9.0.3",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "graphql": "^16.11.0",
+    "graphql-request": "^7.2.0"
   },
   "devDependencies": {
     "@graphql-codegen/cli": "^5.0.7",
@@ -63,8 +66,6 @@
     "@graphql-codegen/typescript-resolvers": "^4.3.1",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.19.1",
-    "graphql": "^16.11.0",
-    "graphql-request": "^7.2.0",
     "prettier": "^3.5.3",
     "rimraf": "^6.1.2",
     "tsx": "^4.20.6",
