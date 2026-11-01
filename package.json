@@ -55,7 +55,7 @@
     "@uns-kit/api": "3.0.39",
     "@uns-kit/core": "3.0.39",
     "jsonwebtoken": "^9.0.3",
-    "zod": "^4.4.3",
+    "zod": "^4.6.6",
     "graphql": "^16.11.0",
     "graphql-request": "^7.2.0"
   },
