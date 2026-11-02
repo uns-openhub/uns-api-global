@@ -16,6 +16,7 @@ const root = process.cwd();
 const entry = path.resolve(root, process.env.HISTORY_BATCH_ENTRY ?? "dist/index.js");
 const expectBefore = process.argv.includes("--expect-before");
 const coldParallel = process.argv.includes("--cold-parallel-only");
+const cacheContention = process.argv.includes("--cache-contention");
 // Zero waiting slots require one path per request: even coalesced schema
 // followers count against the global waiting bound.
 const expectedConcurrency = 1;
@@ -89,7 +90,7 @@ try {
     if (req.url === "/graphql") {
       const request = await jsonBody(req);
       if (request.query?.includes("QuestDBMappings")) return send(res, 200, { data: { QuestDBMappings: ["history_retained", "history_current"].map((tableName, i) => ({ tableName, topicPrefix: "enterprise/#", processName: "local-archiver", packageName: "local-archiver", version: "1", historyId: String(i), historyRevision: "1", retiredAt: i ? null : "2026-10-01T00:00:00Z" })) } });
-      return send(res, 200, { data: { GetUnsNodes: [] } });
+      return send(res, 200, { data: { GetUnsNodes: cacheContention ? Array.from({ length: 100 }, (_, id) => ({ id, type: "Attribute", fullTopic: topics[0].replace("point-0", `point-${100 + id}`) })) : [] } });
     }
     if (req.url?.startsWith("/api/triggers")) return send(res, 200, { triggers: [] });
     if (req.url?.startsWith("/api/captures")) return send(res, 200, { captures: [] });
@@ -114,13 +115,36 @@ try {
     authorization: { mode: "controller", statusCacheMs: 250 },
     questdb: { url: quest, username: "synthetic", password: "local-only", defaultLimit: 5, maxLimit: 5, maxLookbackHours: 24, maxScanRows: 20, maxResponseBytes: 1048576, statementTimeoutMs: 5000,
       queryDiagnostics: { maxConcurrent: 4, maxQueued: coldParallel ? 0 : 8, queueTimeoutMs: 1000, failureCooldownMs: 0, deploymentBudget: { totalMaxConcurrent: coldParallel ? 8 : 2, maxInstances: 2 } } },
-    dataSources: [{ topic: "enterprise/#", history: true, cache: false }], lastValueCache: { enabled: false },
+    dataSources: [{ topic: "enterprise/#", history: true, cache: cacheContention }], lastValueCache: { enabled: cacheContention },
     catchAll: { apiBasePath: "/api/catchall" },
   }));
   api = spawn(process.execPath, [entry], { cwd: tmp, env: { PATH: process.env.PATH, UNS_API_JWT_SECRET: secret }, stdio: ["ignore", "pipe", "pipe"] });
   children.push(api);
   for (const stream of [api.stdout, api.stderr]) stream.on("data", chunk => { apiLogs = (apiLogs + chunk).slice(-100000); const match = /API listening on http:\/\/[^:\s]+:(\d+)/.exec(apiLogs); if (match) apiOrigin = `http://127.0.0.1:${match[1]}`; });
   await waitFor(async () => api.exitCode !== null ? Promise.reject(Error("Built API exited during startup")) : apiOrigin && (await call("/api/catchall/diagnostics/queries", {}, admin)).status === 200, "built API readiness");
+  if (cacheContention) {
+    await waitFor(() => dataCalls > 0, "startup cache recovery SQL");
+    const lastTopics = Array.from({ length: 20 }, (_, i) => topics[0].replace("point-0", `point-${500 + i}`));
+    const latest = call("/api/catchall/batch/last", { method: "POST", body: JSON.stringify({ topics: lastTopics }) });
+    // Let the same request's fallback fan-out reach the database admission gate.
+    await delay(20);
+    const [range, explore, last] = await Promise.all([batch(), single(topics[1]), latest]);
+    if (expectBefore) {
+      assert.ok(range.body.stats.failed > 0 || explore.status === 503);
+      console.log(JSON.stringify({ stage: "before-cache-contention-fix", batchFailed: range.body.stats.failed, singleStatus: explore.status, latestFailed: last.body.stats.failed, peakDatabaseConcurrency: peak }));
+    } else {
+      assert.equal(range.body.stats.succeeded, 8); assert.equal(range.body.stats.failed, 0);
+      assert.equal(explore.status, 200); assert.equal(last.body.stats.failed, 0); assert.equal(last.body.stats.questdbHits, 20);
+      assert.deepEqual(range.body.results[1].data, explore.body.data);
+      for (let i = 0; i < lastTopics.length; i++) assert.equal(last.body.results[i].value, 510 + i);
+      assert.equal(peak, 1);
+      const warm = await call("/api/catchall/batch/last", { method: "POST", body: JSON.stringify({ topics: lastTopics }) });
+      assert.equal(warm.body.stats.hits, 20);
+      const diagnostics = await call("/api/catchall/diagnostics/queries", {}, admin);
+      assert.ok(diagnostics.body.active <= 1 && diagnostics.body.queued <= 8);
+      console.log(JSON.stringify({ stage: "cache-contention-fixed", batchSucceeded: 8, singleStatus: 200, latestSucceeded: 20, subsequentCacheHits: 20, peakDatabaseConcurrency: peak, queueLimit: 8, queueTimeoutMs: 1000, tupleMatches: true, backgroundSeedStillRunning: !apiLogs.includes("Seeded "), scope: "built API/local MQTT; synthetic controller and delayed QuestDB HTTP" }));
+    }
+  } else {
   if (expectBefore) assert.equal((await single(topics[0])).status, 200);
   const grouped = await batch();
   assert.equal(grouped.status, 200);
@@ -173,6 +197,7 @@ try {
     const recovered = await batch({ topics: [topics[0]] }); assert.equal(recovered.body.stats.failed, 0);
     console.log(JSON.stringify({ stage: "fixed", batchSucceeded: 8, singleSucceeded: 8, exactTupleAndColumnMatches: 8, peakDatabaseConcurrency: peak, deniedWithoutDatabaseWork: true, emptyRange: true, configuredLimitsPreserved: true, dependencyFailure503: true, queueTimeout503: true, cancellationStoppedRemainingPaths: true, activeAfterCancel: 0, queuedAfterCancel: 0, recovered: true, scope: "built API and local MQTT; synthetic controller and QuestDB HTTP" }));
     }
+  }
   }
 } catch (error) {
   const redact = text => [secret, reader, denied, admin].reduce((s, key) => s.replaceAll(key, "[local credential]"), text);

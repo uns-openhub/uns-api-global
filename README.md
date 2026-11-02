@@ -180,8 +180,20 @@ serially per path, and coalesced schema followers respect the waiting limit.
 The shared query semaphore still bounds simultaneous callers. A genuinely full
 or expired waiting queue returns a retryable per-path `503` rather than a generic
 `500`. Existing path permissions, source validation, row/scan/response limits and
-tuple/column response formats remain in effect. Disconnecting a batch cancels its
+tuple/column response formats remain in effect. Disconnecting a range batch cancels its
 active read and prevents unstarted paths from querying the database.
+
+Latest-value fallback uses that same bounded per-request concurrency; startup
+cache warming admits one lookup at a time. Waiting interactive history is served
+ahead of cache recovery, with one waiting latest-value recovery admitted after
+two interactive turns to avoid starvation. Background warming uses the remaining
+capacity. A user joining a shared startup lookup promotes that lookup without
+duplicating or cancelling its SQL. Queue-full/queue-timeout failures are not
+cached as a topic's data failure; misses, source conflicts and dependency failures
+retain their cooldown. No query, queue, timeout or deployment limit is raised.
+Already running SQL is not preempted: genuine saturation can still return `503`.
+Disconnecting a latest-value batch prevents new lookups, while an admitted shared
+lookup settles for its other callers and remains subject to its existing timeout.
 
 Raw mode returns tuple rows with column metadata. `summaryOnly=true` returns a
 full-range summary. `bucketMs` or `maxPoints` returns an ascending sampled
@@ -228,6 +240,8 @@ It requires `mosquitto` on PATH, or `MOSQUITTO_BIN` pointing at its executable:
 pnpm run test:history-batch:local
 # After building, also check cold multi-table reads without waiting slots:
 node scripts/test-history-batch-local.mjs --cold-parallel-only
+# Concurrent cold cache warming, 20 latest lookups, batch history and one Explore-style read:
+node scripts/test-history-batch-local.mjs --cache-contention
 ```
 
 This checks batch/single tuple and column equality, caller access, empty ranges,

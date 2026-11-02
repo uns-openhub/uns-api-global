@@ -22,7 +22,9 @@ export class BackgroundCacheSeed<T> {
     let inserted = 0;
     const cycle = { accepting: true, done: undefined as unknown as Promise<{ inserted: number; interrupted: boolean }> };
     this.current = cycle;
-    cycle.done = Promise.all(Array.from({ length: Math.min(4, topics.length) }, async () => {
+    // Disposable startup recovery must not fan out ahead of foreground reads,
+    // particularly when the deployment budget allocates only one SQL slot.
+    cycle.done = (async () => {
       while (cycle.accepting && next < topics.length) {
         const topic = topics[next++]!;
         if (this.options.hasValue(topic)) continue;
@@ -33,7 +35,7 @@ export class BackgroundCacheSeed<T> {
           if (cycle.accepting) this.options.onError();
         }
       }
-    })).then(() => ({ inserted, interrupted: !cycle.accepting })).finally(() => {
+    })().then(() => ({ inserted, interrupted: !cycle.accepting })).finally(() => {
       if (this.current === cycle) this.current = undefined;
     });
     return cycle.done;

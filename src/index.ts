@@ -1762,20 +1762,20 @@ async function handleBatchRequest(req: any, res: any, requestId: string): Promis
     throw new HttpError(400, `Unsupported mode: '${mode}'. Supported: 'last', 'range'.`);
   }
 
-  if (mode === "last") {
-    if (body?.sessionId !== undefined) throw new HttpError(400, "sessionId requires range history; latest-value cache is not session filtered.");
-    const transform = parseHistoryTransformMode(body?.transform);
-    const counterResetPolicy = parseCounterResetPolicy(body?.counterResetPolicy ?? body?.resetPolicy);
-    const bindingConsistency=parseBindingConsistency(body?.bindingConsistency);
-    if(bindingConsistency==='current'&&!entitySelectors.length) throw new HttpError(400,'Current binding consistency requires entitySelectors.');
-    await handleBatchLast(topics, entitySelectors, res, { transform, counterResetPolicy, bindingConsistency }, accessRules);
-  } else {
-    const cancellation = cancelRawExportOnDisconnect(res);
-    try {
+  const cancellation = cancelRawExportOnDisconnect(res);
+  try {
+    if (mode === "last") {
+      if (body?.sessionId !== undefined) throw new HttpError(400, "sessionId requires range history; latest-value cache is not session filtered.");
+      const transform = parseHistoryTransformMode(body?.transform);
+      const counterResetPolicy = parseCounterResetPolicy(body?.counterResetPolicy ?? body?.resetPolicy);
+      const bindingConsistency=parseBindingConsistency(body?.bindingConsistency);
+      if(bindingConsistency==='current'&&!entitySelectors.length) throw new HttpError(400,'Current binding consistency requires entitySelectors.');
+      await handleBatchLast(topics, entitySelectors, res, { transform, counterResetPolicy, bindingConsistency }, accessRules, cancellation.signal);
+    } else {
       await handleBatchRange(topics, entitySelectors, body, res, accessRules, cancellation.signal);
-    } finally {
-      cancellation.dispose();
     }
+  } finally {
+    cancellation.dispose();
   }
 }
 
@@ -1914,7 +1914,7 @@ async function tryQuestDbLastRowFallback(topic: string): Promise<{ entry: LastVa
   });
 }
 
-async function resolveBatchLastResults(topics: string[], options: BatchLastOptions): Promise<BatchLastResult[]> {
+async function resolveBatchLastResults(topics: string[], options: BatchLastOptions, signal?: AbortSignal): Promise<BatchLastResult[]> {
   const now = Date.now();
 
   // First pass: serve everything from the in-memory cache and collect misses.
@@ -1957,9 +1957,11 @@ async function resolveBatchLastResults(topics: string[], options: BatchLastOptio
   const eligible = batchLastFallbackRotation.select(misses, topics);
 
   if (eligible.length > 0) {
-    await Promise.all(eligible.map(async ({ topic, idx }) => {
+    await mapHistoryRequests(eligible, historyRequestConcurrency, async ({ topic, idx }) => {
       try {
-        const fallback = await tryQuestDbLastRowFallback(topic);
+        // A live packet or another request may have filled a miss while this
+        // bounded batch waited. Avoid unnecessary recovery SQL in that case.
+        const fallback = lastValueMap.has(topic) ? null : await tryQuestDbLastRowFallback(topic);
         const concurrent = lastValueMap.get(topic);
         if (!fallback && !concurrent) return;
         const selected = fallback ? preserveConcurrentCacheValue(concurrent, fallback.entry) : { entry: concurrent!, inserted: false };
@@ -1973,7 +1975,7 @@ async function resolveBatchLastResults(topics: string[], options: BatchLastOptio
         try { results[idx] = concurrent ? buildBatchLastResult(topic, concurrent, "cache", null, Date.now(), options) : failedBatchLastResult(topic, error); }
         catch (conflict) { results[idx] = failedBatchLastResult(topic, conflict); }
       }
-    }));
+    }, signal);
   }
 
   return results;
@@ -1985,6 +1987,7 @@ async function handleBatchLast(
   res: any,
   options: BatchLastOptions,
   accessRules: string[],
+  signal?: AbortSignal,
 ): Promise<void> {
   if (entitySelectors.length && options.transform === "delta") {
     throw new HttpError(400, "entitySelectors do not support transform=delta until cross-binding boundary calculation is enabled.");
@@ -2025,7 +2028,7 @@ async function handleBatchLast(
   const entityTopics = Array.from(new Set(
     entityPlan?.selectors.flatMap((selector) => selector.intervals.map((interval) => interval.topic)) ?? [],
   ));
-  const allResults = await resolveBatchLastResults([...topics, ...entityTopics], options);
+  const allResults = await resolveBatchLastResults([...topics, ...entityTopics], options, signal);
   const topicResults = allResults.slice(0, topics.length);
   const entityTopicResults = new Map(
     allResults.slice(topics.length).map((result) => [result.topic, result]),

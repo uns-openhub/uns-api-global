@@ -78,7 +78,7 @@ try {
   client=connect(`mqtt://127.0.0.1:${mqttPort}`);await once(client,'connect');
   pulse=setInterval(()=>client.publish(topics[0],JSON.stringify({version:'2.0.0',message:{data:{time:new Date().toISOString(),value:99,uom:'C'}}}),{qos:1}),30);
   const source=await launch('source',databases.source,controller,mqttPort);
-  await waitFor(async()=>queries.source>=4&&(await call('source','/api/catchall/diagnostics/queries')).status===200,'active source with held initial seed',45000);
+  await waitFor(async()=>queries.source>=1&&(await call('source','/api/catchall/diagnostics/queries')).status===200,'active source with held initial seed',45000);
   const started=Date.now();
   const target=await launch('target',databases.target,controller,mqttPort);
   await waitFor(()=>logs.source.includes('Received handover request'),'source ownership release',30000);

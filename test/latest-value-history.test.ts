@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { QueryWorkloadError } from "../src/query-diagnostics.js";
 import {
   buildLatestHistorySql,
   selectArchivedLatest,
@@ -311,6 +312,52 @@ test("lookup error cache is bounded and does not expose raw dependency errors", 
     (error) =>
       error instanceof LatestLookupError && !error.message.includes("private"),
   );
+});
+
+test("seed admission failures do not become a negative per-topic cache entry", async () => {
+  for (const code of ["queue-full", "queue-timeout"] as const) {
+    const c = new LatestLookupCoordinator<number>();
+    let calls = 0;
+    await assert.rejects(
+      c.run("enterprise/recovery", async () => {
+        calls++;
+        throw new QueryWorkloadError(code);
+      }),
+      LatestLookupError,
+    );
+    assert.equal(c.failureCount, 0);
+    assert.equal(
+      await c.run("enterprise/recovery", async () => {
+        calls++;
+        return 17;
+      }),
+      17,
+    );
+    assert.equal(
+      calls,
+      2,
+      "a new caller can attempt recovery; no automatic retry loop",
+    );
+  }
+});
+
+test("dependency cooldown still throttles repeated latest-value recovery", async () => {
+  const c = new LatestLookupCoordinator<number>();
+  let calls = 0;
+  const load = async () => {
+    calls++;
+    throw new QueryWorkloadError("cooldown");
+  };
+  await assert.rejects(
+    c.run("enterprise/unavailable", load),
+    LatestLookupError,
+  );
+  await assert.rejects(
+    c.run("enterprise/unavailable", load),
+    LatestLookupError,
+  );
+  assert.equal(calls, 1);
+  assert.equal(c.failureCount, 1);
 });
 test("hanging lookup is aborted and returns bounded recoverable failure", async () => {
   let signal!: AbortSignal;

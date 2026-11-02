@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
+import { LatestLookupCoordinator } from "../src/latest-value-history.js";
 import {
   QueryDiagnostics,
   QueryWorkloadError,
@@ -30,6 +31,252 @@ const value = (v = 1) => ({
   rows: 1,
   responseBytes: 20,
   httpStatus: 200,
+});
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+test("history overtakes queued cache recovery without extra slots; FIFO within each workload", async () => {
+  const { diagnostics } = fixture({ maxConcurrent: 1, maxQueued: 8 });
+  const hold = deferred(),
+    started = deferred();
+  const order: string[] = [];
+  const occupying = diagnostics.runBackground("cache-seed", () =>
+    diagnostics.query("db", "SELECT 0", "latest-fallback", async () => {
+      started.resolve();
+      await hold.promise;
+      order.push("running-seed");
+      return value();
+    }),
+  );
+  await started.promise;
+  const request = (id: string, operation: string) =>
+    diagnostics.runRequest(id, operation, () =>
+      diagnostics.query("db", `SELECT '${id}'`, "schema", async () => {
+        order.push(id);
+        return value();
+      }),
+    );
+  const background = diagnostics.runBackground("cache-seed", () =>
+    diagnostics.query("db", "SELECT 'seed'", "schema", async () => {
+      order.push("seed");
+      return value();
+    }),
+  );
+  const lastA = request("last-a", "batch-last"),
+    lastB = request("last-b", "batch-last");
+  const range = request("range", "batch-range"),
+    explore = request("explore", "history");
+  assert.deepEqual(diagnostics.snapshot()["queuedByWorkload"], {
+    interactive: 2,
+    "latest-recovery": 2,
+    background: 1,
+  });
+  assert.equal(diagnostics.snapshot()["active"], 1);
+  hold.resolve();
+  await Promise.all([occupying, background, lastA, lastB, range, explore]);
+  assert.deepEqual(order, [
+    "running-seed",
+    "range",
+    "explore",
+    "last-a",
+    "last-b",
+    "seed",
+  ]);
+  assert.equal(diagnostics.snapshot()["queued"], 0);
+  assert.equal(diagnostics.snapshot()["active"], 0);
+});
+
+test("interactive history cannot bypass a full aggregate waiting bound", async () => {
+  const { diagnostics } = fixture({ maxConcurrent: 1, maxQueued: 1 });
+  const hold = deferred(),
+    started = deferred();
+  const owner = diagnostics.query("db", "SELECT 1", "history", async () => {
+    started.resolve();
+    await hold.promise;
+    return value();
+  });
+  await started.promise;
+  const background = diagnostics.runBackground("cache-seed", () =>
+    diagnostics.query("db", "SELECT 2", "latest-fallback", async () => value()),
+  );
+  await assert.rejects(
+    diagnostics.runRequest("read", "history", () =>
+      diagnostics.query("db", "SELECT 3", "history", async () => value()),
+    ),
+    (e: unknown) => e instanceof QueryWorkloadError && e.code === "queue-full",
+  );
+  hold.resolve();
+  await Promise.all([owner, background]);
+});
+
+test("a long history batch leaves bounded turns for waiting latest-value recovery", async () => {
+  const { diagnostics } = fixture({ maxConcurrent: 1, maxQueued: 8 });
+  const hold = deferred(),
+    started = deferred(),
+    order: string[] = [];
+  const owner = diagnostics.query("db", "SELECT 0", "history", async () => {
+    started.resolve();
+    await hold.promise;
+    return value();
+  });
+  await started.promise;
+  const latest = diagnostics.runRequest("last", "batch-last", () =>
+    diagnostics.query("db", "SELECT 'latest'", "schema", async () => {
+      order.push("latest");
+      return value();
+    }),
+  );
+  const reads = Array.from({ length: 5 }, (_, i) =>
+    diagnostics.runRequest(String(i), "batch-range", () =>
+      diagnostics.query("db", `SELECT ${i + 1}`, "history", async () => {
+        order.push(String(i));
+        return value();
+      }),
+    ),
+  );
+  hold.resolve();
+  await Promise.all([owner, latest, ...reads]);
+  assert.deepEqual(order, ["0", "1", "latest", "2", "3", "4"]);
+});
+
+test("joining pending background SQL promotes it without another execution or queue entry", async () => {
+  const { diagnostics } = fixture({ maxConcurrent: 1, maxQueued: 4 });
+  const hold = deferred(),
+    started = deferred(),
+    order: string[] = [];
+  const owner = diagnostics.query("db", "SELECT 0", "history", async () => {
+    started.resolve();
+    await hold.promise;
+    return value();
+  });
+  await started.promise;
+  const seed = diagnostics.runBackground("cache-seed", () =>
+    diagnostics.query("db", "SELECT 1", "schema", async () => {
+      order.push("shared");
+      return value();
+    }),
+  );
+  const latest = diagnostics.runRequest("last", "batch-last", () =>
+    diagnostics.query("db", "SELECT 2", "schema", async () => {
+      order.push("latest");
+      return value();
+    }),
+  );
+  const joined = diagnostics.runRequest("history", "history", () =>
+    diagnostics.query("db", "SELECT 1", "schema", async () =>
+      assert.fail("must coalesce"),
+    ),
+  );
+  assert.equal(diagnostics.snapshot()["queued"], 2);
+  assert.equal(diagnostics.snapshot()["coalescedWaiters"], 1);
+  hold.resolve();
+  await Promise.all([owner, seed, latest, joined]);
+  assert.deepEqual(order, ["shared", "latest"]);
+});
+
+test("joining a startup lookup promotes queued and subsequent SQL above the coordinator", async () => {
+  const { diagnostics, events } = fixture({ maxConcurrent: 1, maxQueued: 4 });
+  const hold = deferred(),
+    started = deferred();
+  const owner = diagnostics.query("db", "SELECT 0", "history", async () => {
+    started.resolve();
+    await hold.promise;
+    return value();
+  });
+  await started.promise;
+  const lookups = new LatestLookupCoordinator({
+    runLookup: (id, load) => diagnostics.runRecovery(id, load),
+    onJoin: (id) => diagnostics.joinRecovery(id),
+  });
+  let loads = 0;
+  const lookupStarted = deferred();
+  const seed = diagnostics.runBackground("cache-seed", () =>
+    lookups.run("enterprise/shared", async () => {
+      loads++;
+      lookupStarted.resolve();
+      await diagnostics.query(
+        "db",
+        "SHOW COLUMNS FROM uns_data",
+        "schema",
+        async () => value(),
+      );
+      return diagnostics.query("db", "SELECT 1", "latest-fallback", async () =>
+        value(),
+      );
+    }),
+  );
+  await lookupStarted.promise;
+  const joined = diagnostics.runRequest("latest", "batch-last", () =>
+    lookups.run("enterprise/shared", async () =>
+      assert.fail("shared lookup must not repeat"),
+    ),
+  );
+  assert.deepEqual(diagnostics.snapshot()["queuedByWorkload"], {
+    interactive: 0,
+    "latest-recovery": 1,
+    background: 0,
+  });
+  hold.resolve();
+  await Promise.all([owner, seed, joined]);
+  assert.equal(loads, 1);
+  const startedSql = events.filter(
+    (e) => e["event"] === "query.started" && e["lookupId"],
+  );
+  assert.equal(startedSql.length, 2);
+  assert.ok(startedSql.every((e) => e["workload"] === "latest-recovery"));
+});
+
+test("priority never extends queue deadlines and cancelled history is not executed", async () => {
+  const { diagnostics } = fixture({
+    maxConcurrent: 1,
+    maxQueued: 3,
+    queueTimeoutMs: 15,
+  });
+  const hold = deferred(),
+    started = deferred(),
+    abort = new AbortController();
+  const owner = diagnostics.runBackground("cache-seed", () =>
+    diagnostics.query("db", "SELECT 0", "latest-fallback", async () => {
+      started.resolve();
+      await hold.promise;
+      return value();
+    }),
+  );
+  await started.promise;
+  const cancelled = diagnostics.runRequest("cancel", "history", () =>
+    diagnostics.query(
+      "db",
+      "SELECT 1",
+      "history",
+      async () => assert.fail("cancelled read"),
+      abort.signal,
+    ),
+  );
+  const expired = diagnostics.runRequest("timeout", "history", () =>
+    diagnostics.query("db", "SELECT 2", "history", async () =>
+      assert.fail("expired read"),
+    ),
+  );
+  const cancellation = assert.rejects(
+    cancelled,
+    (e: unknown) => e instanceof QueryWorkloadError && e.code === "cancelled",
+  );
+  abort.abort();
+  await cancellation;
+  await assert.rejects(
+    expired,
+    (e: unknown) =>
+      e instanceof QueryWorkloadError && e.code === "queue-timeout",
+  );
+  hold.resolve();
+  await owner;
+  assert.equal(diagnostics.snapshot()["active"], 0);
+  assert.equal(diagnostics.snapshot()["queued"], 0);
 });
 
 test("fingerprints remove literals/comments while identifying latest/schema and target tables", () => {
