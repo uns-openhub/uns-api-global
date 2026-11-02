@@ -453,10 +453,11 @@ export function captureSessionPredicate(value: unknown, columns: Set<string>): s
   return `${quoteIdentifier("sessionId")} = ${escapeLiteral(id)}`;
 }
 
-export function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: TemporalStrategy, schema: TableSchema): string {
+/** fullTopic is authoritative when present; older rows retain their structured-path fallback. */
+export function buildPathPredicates(parsed: ParsedPath, columns: Set<string>): string[] {
   const parts: string[] = [];
   const addIfPresent = (column: string, value: string | undefined) => {
-    if (!value || !schema.columns.has(column)) return;
+    if (!value || !columns.has(column)) return;
     parts.push(`${quoteIdentifier(column)} = ${escapeLiteral(value)}`);
   };
   addIfPresent("topic", parsed.topic);
@@ -464,7 +465,11 @@ export function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: Tempo
   addIfPresent("objectType", parsed.objectType);
   addIfPresent("objectId", parsed.objectId);
   addIfPresent("attribute", parsed.attribute);
-  if (!parts.length && parsed.fullPath && schema.columns.has("topic")) {
+  if (parsed.fullPath && columns.has("fullTopic")) {
+    const exact = `${quoteIdentifier("fullTopic")} = ${escapeLiteral(parsed.fullPath)}`;
+    return [parts.length ? `(${exact} OR (${quoteIdentifier("fullTopic")} IS NULL AND ${parts.join(" AND ")}))` : exact];
+  }
+  if (!parts.length && parsed.fullPath && columns.has("topic")) {
     parts.push(`${quoteIdentifier("topic")} = ${escapeLiteral(parsed.fullPath)}`);
   }
   if (!parts.length && parsed.fullPath) {
@@ -473,6 +478,11 @@ export function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: Tempo
       "Table schema does not contain expected UNS path columns (topic/asset/objectType/objectId/attribute).",
     );
   }
+  return parts;
+}
+
+export function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: TemporalStrategy, schema: TableSchema): string {
+  const parts = buildPathPredicates(parsed, schema.columns);
   const sessionPredicate = captureSessionPredicate(parsed.captureSessionId, schema.columns);
   if (sessionPredicate) parts.push(sessionPredicate);
   if (range.from) {
@@ -595,7 +605,11 @@ export function buildEntitySourceSql(
   if (!relativeParts.length) {
     throw new HttpError(400, "Identity-aware table schema cannot distinguish the requested relative attribute path.");
   }
-  const legacyPathWhere = buildWhere(parsed, {}, temporal, schema);
+  // This branch is used only for rows without fullTopic; the exact-path branch
+  // is composed below so the fallback must remain a structured tuple.
+  const legacyColumns = new Set(schema.columns);
+  legacyColumns.delete("fullTopic");
+  const legacyPathWhere = buildWhere(parsed, {}, temporal, {...schema, columns: legacyColumns});
   // A stable ID can be present at two paths during a verified handover.
   // Scope resolved rows to this interval's concrete source as well; otherwise
   // overlapping intervals read each other's rows and sampled sums double count.
