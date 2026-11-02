@@ -69,6 +69,7 @@ import { createPublicKey, randomUUID } from "node:crypto";
 import { request, gql } from "graphql-request";
 import {
   buildBoundaryCounterDeltaResponse,
+  buildPathPredicates,
   HttpError as CatchallParameterError,
   captureSessionPredicate,
   parseCaptureSessionId,
@@ -2989,26 +2990,7 @@ function resolveUnitColumn(schema: TableSchema, metricColumn: string | null = nu
 }
 
 function buildWhere(parsed: ParsedPath, range: TimeRange, temporal: TemporalStrategy, columns: Set<string>): string {
-  const parts: string[] = [];
-  const addIfPresent = (column: string, value: string | undefined) => {
-    if (!value || !columns.has(column)) return;
-    parts.push(`${quoteIdentifier(column)} = ${escapeLiteral(value)}`);
-  };
-  addIfPresent("topic", parsed.topic);
-  addIfPresent("asset", parsed.asset);
-  addIfPresent("objectType", parsed.objectType);
-  addIfPresent("objectId", parsed.objectId);
-  addIfPresent("attribute", parsed.attribute);
-  // Fallback if nothing else matched and table has plain topic column only
-  if (!parts.length && parsed.fullPath && columns.has("topic")) {
-    parts.push(`${quoteIdentifier("topic")} = ${escapeLiteral(parsed.fullPath)}`);
-  }
-  if (!parts.length && parsed.fullPath) {
-    throw new HttpError(
-      400,
-      "Table schema does not contain expected UNS path columns (topic/asset/objectType/objectId/attribute).",
-    );
-  }
+  const parts = buildPathPredicates(parsed, columns);
   const sessionPredicate = captureSessionPredicate(parsed.captureSessionId, columns);
   if (sessionPredicate) parts.push(sessionPredicate);
   if (range.from) {

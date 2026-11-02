@@ -71,6 +71,7 @@ function timestampOrder(value: unknown): bigint {
 }
 
 const tableMetadata = new Set([
+  "fullTopic",
   "topic",
   "attribute",
   "asset",
@@ -144,6 +145,14 @@ function payload(
   const string = at("stringValue");
   const value = at("value");
   const kind = at("valueType");
+  if ((kind === "string" || kind === "number") && columns.includes("value") &&
+      value === null && number == null && string == null) {
+    return {
+      values: { value: null },
+      uom: typeof at("uom") === "string" ? at("uom") as string : null,
+      packetShape: "data",
+    };
+  }
   let scalar: unknown;
   if (kind === "string") scalar = typeof string === "string" ? string : value;
   else if (typeof number === "number" && Number.isFinite(number))
