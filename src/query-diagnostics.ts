@@ -8,9 +8,18 @@ type Caller = {
   id: string;
   name?: string;
 };
+type Workload = "interactive" | "latest-recovery" | "background";
+const priority: Record<Workload, number> = {
+  interactive: 0,
+  "latest-recovery": 1,
+  background: 2,
+};
+type Admission = { workload: Workload };
+type Recovery = Admission & { lookupId: string };
 type Context = {
   requestId: string;
   operation: string;
+  workload: Workload;
   caller: Caller;
   startedAt: number;
   queries: number;
@@ -99,22 +108,25 @@ export class QueryWorkloadError extends Error {
 
 export class QueryDiagnostics {
   private readonly storage = new AsyncLocalStorage<Context>();
-  private readonly recovery = new AsyncLocalStorage<string>();
+  private readonly recovery = new AsyncLocalStorage<Recovery>();
+  private readonly recoveries = new Map<string, Recovery>();
   private readonly cancellationKeys = new WeakMap<AbortSignal, string>();
   private readonly salt = randomBytes(32);
   private readonly inFlight = new Map<
     string,
-    { queryId: string; result: Promise<unknown> }
+    { queryId: string; result: Promise<unknown>; admission: Admission }
   >();
   private readonly activeQueries = new Map<string, DiagnosticEvent>();
   private readonly recent: DiagnosticEvent[] = [];
   private readonly queue: Array<{
+    admission: Admission;
     resolve: () => void;
     reject: (error: Error) => void;
     timer: NodeJS.Timeout;
     cleanup: () => void;
   }> = [];
   private active = 0;
+  private interactiveStreak = 0;
   private coalescedWaiters = 0;
   private cooldownUntil = 0;
   private total = {
@@ -161,6 +173,8 @@ export class QueryDiagnostics {
       {
         requestId,
         operation,
+        workload:
+          operation === "batch-last" ? "latest-recovery" : "interactive",
         caller: { kind: "unverified", id: "unavailable" },
         startedAt: performance.now(),
         queries: 0,
@@ -178,6 +192,7 @@ export class QueryDiagnostics {
     return this.runRequest(randomUUID(), operation, async () => {
       const context = this.storage.getStore()!;
       context.caller = { kind: "runtime", id: "uns-api-global" };
+      context.workload = "background";
       return run();
     });
   }
@@ -209,7 +224,12 @@ export class QueryDiagnostics {
     });
   }
   runRecovery<T>(lookupId: string, load: () => Promise<T>): Promise<T> {
-    return this.recovery.run(lookupId, async () => {
+    const recovery: Recovery = {
+      lookupId,
+      workload: this.storage.getStore()?.workload ?? "background",
+    };
+    this.recoveries.set(lookupId, recovery);
+    return this.recovery.run(recovery, async () => {
       const context = this.storage.getStore();
       this.emit({
         event: "lookup.started",
@@ -225,6 +245,7 @@ export class QueryDiagnostics {
         outcome = result === null ? "miss" : "ok";
         return result;
       } finally {
+        this.recoveries.delete(lookupId);
         this.emit({
           event: "lookup.completed",
           lookupId,
@@ -239,6 +260,17 @@ export class QueryDiagnostics {
   joinRecovery(lookupId: string): void {
     this.total.lookupCoalesced++;
     const context = this.storage.getStore();
+    const recovery = this.recoveries.get(lookupId);
+    if (
+      recovery &&
+      context &&
+      priority[context.workload] < priority[recovery.workload]
+    ) {
+      // Seed/lazy recovery shares a promise above the SQL coalescing layer.
+      // Promote both its queued SQL and subsequent schema/data reads when a
+      // real caller joins; do not cancel or duplicate the shared lookup.
+      recovery.workload = context.workload;
+    }
     if (context) context.coalesced++;
     this.emit({
       event: "lookup.joined",
@@ -254,6 +286,13 @@ export class QueryDiagnostics {
       database: this.options.databaseLabel,
       active: this.active,
       queued: this.queue.length,
+      queuedByWorkload: Object.fromEntries(
+        Object.keys(priority).map((workload) => [
+          workload,
+          this.queue.filter((entry) => entry.admission.workload === workload)
+            .length,
+        ]),
+      ),
       coalescedWaiters: this.coalescedWaiters,
       cooldownRemainingMs: Math.max(0, this.cooldownUntil - performance.now()),
       limits: {
@@ -270,7 +309,7 @@ export class QueryDiagnostics {
       recent: this.recent.map((record) => ({ ...record })),
     };
   }
-  private acquire(signal?: AbortSignal): Promise<void> {
+  private acquire(admission: Admission, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted)
       return Promise.reject(new QueryWorkloadError("cancelled"));
     if (this.active < this.options.maxConcurrent) {
@@ -281,6 +320,7 @@ export class QueryDiagnostics {
       return Promise.reject(new QueryWorkloadError("queue-full"));
     return new Promise((resolve, reject) => {
       const entry = {
+        admission,
         resolve,
         reject,
         cleanup: () => signal?.removeEventListener("abort", abort),
@@ -303,12 +343,36 @@ export class QueryDiagnostics {
     });
   }
   private release(): void {
-    const next = this.queue.shift();
+    // Do not let cache recovery fan-out put every interactive read behind it.
+    // FIFO within a class. After two interactive admissions allow one waiting
+    // latest-value recovery so a long batch cannot starve ordinary cache misses.
+    // Startup warming uses idle capacity only. Running SQL is never preempted;
+    // every class retains the aggregate queue bound, deadline and SQL cap.
+    let selected = 0;
+    for (let i = 1; i < this.queue.length; i++) {
+      if (
+        priority[this.queue[i]!.admission.workload] <
+        priority[this.queue[selected]!.admission.workload]
+      )
+        selected = i;
+    }
+    const latest = this.queue.findIndex(
+      (entry) => entry.admission.workload === "latest-recovery",
+    );
+    if (latest >= 0 && this.interactiveStreak >= 2) selected = latest;
+    const next = this.queue.splice(selected, 1)[0];
     if (next) {
+      this.interactiveStreak =
+        next.admission.workload === "interactive"
+          ? Math.min(2, this.interactiveStreak + 1)
+          : 0;
       clearTimeout(next.timer);
       next.cleanup();
       next.resolve();
-    } else this.active--;
+    } else {
+      this.active--;
+      this.interactiveStreak = 0;
+    }
   }
   async query<T>(
     databaseKey: string,
@@ -324,12 +388,17 @@ export class QueryDiagnostics {
     signal?: AbortSignal,
   ): Promise<T> {
     const context = this.storage.getStore();
+    const admission: Admission = this.recovery.getStore() ?? {
+      workload:
+        context?.workload ??
+        (purpose === "latest-fallback" ? "latest-recovery" : "interactive"),
+    };
     const identity = {
       requestId: context?.requestId ?? randomUUID(),
       operation: context?.operation ?? "background",
       caller: context?.caller ?? { kind: "runtime", id: "uns-api-global" },
       ...(this.recovery.getStore()
-        ? { lookupId: this.recovery.getStore() }
+        ? { lookupId: this.recovery.getStore()!.lookupId }
         : {}),
     };
     const info = describeSql(sql);
@@ -367,6 +436,10 @@ export class QueryDiagnostics {
         });
         throw new QueryWorkloadError("queue-full");
       }
+      // A foreground caller joining identical pending SQL must not inherit
+      // a background owner's low priority. Never duplicate the database read.
+      if (priority[admission.workload] < priority[existing.admission.workload])
+        existing.admission.workload = admission.workload;
       this.coalescedWaiters++;
       this.total.coalesced++;
       if (context) context.coalesced++;
@@ -397,7 +470,7 @@ export class QueryDiagnostics {
       try {
         if (performance.now() < this.cooldownUntil)
           throw new QueryWorkloadError("cooldown");
-        await this.acquire(signal);
+        await this.acquire(admission, signal);
         if (signal?.aborted) {
           this.release();
           throw new QueryWorkloadError("cancelled");
@@ -423,7 +496,14 @@ export class QueryDiagnostics {
         throw error;
       }
       const startedAt = performance.now();
-      const record = { ...identity, ...info, purpose, queryId, startedAt };
+      const record = {
+        ...identity,
+        ...info,
+        purpose,
+        queryId,
+        workload: admission.workload,
+        startedAt,
+      };
       this.activeQueries.set(queryId, record);
       this.total.executed++;
       if (context) context.queries++;
@@ -433,6 +513,7 @@ export class QueryDiagnostics {
         ...info,
         purpose,
         queryId,
+        workload: admission.workload,
         active: this.active,
         queued: this.queue.length,
         queueMs: Math.round(startedAt - submittedAt),
@@ -507,7 +588,7 @@ export class QueryDiagnostics {
       }
     };
     const result = run();
-    this.inFlight.set(key, { queryId, result });
+    this.inFlight.set(key, { queryId, result, admission });
     try {
       return await result;
     } finally {

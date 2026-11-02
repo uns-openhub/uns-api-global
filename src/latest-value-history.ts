@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { QueryWorkloadError } from "./query-diagnostics.js";
 import { HistoryReadError } from "./history-source-diagnostics.js";
 import {
   buildDataColumnList,
@@ -358,10 +359,21 @@ export class LatestLookupCoordinator<T> {
             : new LatestLookupError(
                 "Latest-value recovery could not read all required sources. Retry when the service is available.",
               );
-        this.remember(topic, {
-          at: (this.options.now ?? Date.now)(),
-          error: safe,
-        });
+        // A queue admission rejection says nothing about this topic's data.
+        // In particular a disposable seed must not poison the next real read
+        // for the full per-topic failure cooldown. Return the current 503;
+        // subsequent callers still pass all global queue/cooldown safeguards.
+        if (
+          !(
+            error instanceof QueryWorkloadError &&
+            (error.code === "queue-full" || error.code === "queue-timeout")
+          )
+        ) {
+          this.remember(topic, {
+            at: (this.options.now ?? Date.now)(),
+            error: safe,
+          });
+        }
         throw safe;
       } finally {
         if (timer) clearTimeout(timer);

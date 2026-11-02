@@ -9,7 +9,7 @@ function deferred<T>() {
 }
 
 test('release stops a large initial fill, waits for admitted reads and rejects late cache writes', async () => {
-  const pending = Array.from({ length: 4 }, () => deferred<number>());
+  const pending = [deferred<number>()];
   const calls: string[] = [], cache = new Map<string, number>();
   const seed = new BackgroundCacheSeed({
     hasValue: topic => cache.has(topic),
@@ -18,7 +18,7 @@ test('release stops a large initial fill, waits for admitted reads and rejects l
     onError: () => assert.fail('No lookup should fail'),
   });
   const run = seed.start(Array.from({ length: 20_000 }, (_, i) => 'enterprise/point/' + i));
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 1, 'startup recovery has no parallel SQL fan-out');
   seed.pause();
   let settled = false;
   void run.then(() => { settled = true; });
@@ -28,7 +28,7 @@ test('release stops a large initial fill, waits for admitted reads and rejects l
   cache.set(calls[0]!, 99);
   pending.forEach((value, i) => value.resolve(i));
   assert.deepEqual(await run, { inserted: 0, interrupted: true });
-  assert.equal(calls.length, 4, 'remaining 19,996 topics never reach SQL');
+  assert.equal(calls.length, 1, 'remaining 19,999 topics never reach SQL');
   assert.deepEqual([...cache], [[calls[0], 99]]);
 });
 
