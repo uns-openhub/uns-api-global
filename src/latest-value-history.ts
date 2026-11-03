@@ -285,6 +285,7 @@ export class LatestLookupCoordinator<T> {
       maxFailures?: number;
       maxPending?: number;
       maxWaiters?: number;
+      canLoad?: (topic: string) => boolean;
       runLookup?: (
         lookupId: string,
         load: () => Promise<T | null>,
@@ -300,6 +301,9 @@ export class LatestLookupCoordinator<T> {
     topic: string,
     load: (signal: AbortSignal) => Promise<T | null>,
   ): Promise<T | null> {
+    // A cache-only source must not lease recovery/SQL work, including during
+    // startup seeding. The normal live cache remains independent of this gate.
+    if (this.options.canLoad?.(topic) === false) return null;
     const pending = this.pending.get(topic);
     if (pending) {
       if (this.waiters >= (this.options.maxWaiters ?? 64)) {

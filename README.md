@@ -138,6 +138,20 @@ Project-specific configuration is defined in
 - `catchAll` controls the public paths and OpenAPI labels.
 - `lastValueCache` controls MQTT-backed current-value caching.
 
+More specific `dataSources` entries must precede broader matching patterns.
+Set `history: false` and keep `cache: true` to serve live MQTT values while
+disabling SQL history and latest-value recovery for that namespace, including
+startup cache seeding. A missing live value remains a cache miss; it does not
+start a database query. For example, a temporary source restriction can precede
+the ordinary site rule:
+
+```json
+[
+  { "topic": "enterprise/site/maintenance/#", "history": false, "cache": true },
+  { "topic": "enterprise/site/#", "history": true, "cache": true }
+]
+```
+
 Controller topic discovery shares one active refresh, with a five-second transport
 deadline. Timeout or discovery failure keeps the previous subscriptions; a late
 response cannot replace them. A still-pending credential/transport operation holds

@@ -1298,6 +1298,7 @@ type LastValueEntry = {
 const lastValueMap = new Map<string, LastValueEntry>();
 const entityLastValueMap = new EntityLastValueCache<LastValueEntry>();
 const latestLookupCoordinator = new LatestLookupCoordinator<{ entry: LastValueEntry; sql: string }>({
+  canLoad: topic => isHistoryAllowed(dataSources, topic),
   timeoutMs: Math.min(questdb.statementTimeoutMs, 5_000),
   runLookup: (lookupId, load) => queryDiagnostics.runRecovery(lookupId, load),
   onJoin: lookupId => queryDiagnostics.joinRecovery(lookupId),
