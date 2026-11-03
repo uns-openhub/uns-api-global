@@ -283,7 +283,7 @@ export interface ProjectAppConfig {
         topic: string;
         /** QuestDB table name prefix for history queries (optional — falls back to controller mapping resolution) */
         tablePrefix?: string | undefined;
-        /** Enable QuestDB history queries for topics matching this pattern */
+        /** Enable QuestDB history and latest-value recovery for topics matching this pattern. With history disabled, cache-enabled topics still receive live MQTT values. */
         history?: boolean;
         /** Enable MQTT last-value cache for topics matching this pattern */
         cache?: boolean;

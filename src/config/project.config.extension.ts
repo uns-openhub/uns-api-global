@@ -18,7 +18,7 @@ const dataSourceSchema = z.object({
     .boolean()
     .default(true)
     .describe(
-      "Enable QuestDB history queries for topics matching this pattern",
+      "Enable QuestDB history and latest-value recovery for topics matching this pattern. With history disabled, cache-enabled topics still receive live MQTT values.",
     ),
   cache: z
     .boolean()
