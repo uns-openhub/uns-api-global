@@ -1,6 +1,6 @@
 import type { TableSchema } from './catchall-helpers.js';
 import { detectEntityStorageSchema } from './entity-query-planner.js';
-import type { HistoryDiagnostic } from './history-source-diagnostics.js';
+import { HistoryReadError, type HistoryDiagnostic } from './history-source-diagnostics.js';
 import type { QuestDbMappingEntry } from './questdb-mapping-cache.js';
 
 export const HISTORY_SOURCE_COLUMN = '__historySourceTable';
@@ -121,9 +121,38 @@ export function assertHistoryTransform(source: HistoryTableSource, transform: st
   }
 }
 
-export function historySourceMetadata(tables: string[], mappings: QuestDbMappingEntry[]) {
+/** Retry only on a confirmed missing table whose matching mappings are all retired. */
+export async function readAvailableHistory<T>(
+  selection: { tables: string[]; mappings: QuestDbMappingEntry[]; allowMissingRetained: boolean; signal?: AbortSignal | undefined },
+  read: (tables: string[], missingTables: string[]) => Promise<T>,
+): Promise<T> {
+  let tables = selection.tables;
+  const missingTables: string[] = [];
+  for (;;) {
+    selection.signal?.throwIfAborted();
+    try {
+      return await read(tables, missingTables);
+    } catch (error) {
+      if (!selection.allowMissingRetained || tables.length <= 1 ||
+          !(error instanceof HistoryReadError) || error.diagnostic.code !== 'HISTORY_TABLE_MISSING') {
+        throw error;
+      }
+      const [missing] = error.diagnostic.tables;
+      const mapped = selection.mappings.filter(mapping => mapping.tableName === missing);
+      if (!missing || !tables.includes(missing) || !mapped.length ||
+          mapped.some(mapping => !mapping.historyId || !mapping.retiredAt)) {
+        throw error;
+      }
+      tables = tables.filter(table => table !== missing);
+      missingTables.push(missing);
+    }
+  }
+}
+
+export function historySourceMetadata(tables: string[], mappings: QuestDbMappingEntry[], missingTables: string[] = []) {
   return {
     mode: tables.length > 1 ? 'union' : 'single', tables,
+    ...(missingTables.length ? { missingTables: [...missingTables], complete: false as const } : {}),
     overlapPolicy: 'preserve-observations',
     equalTimeOrder: tables.length > 1 ? 'table-name' : null,
     provenance: mappings.filter(mapping => tables.includes(mapping.tableName ?? '')).map(mapping => ({

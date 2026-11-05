@@ -18,10 +18,10 @@ export async function readHistory<T>(tables: string[], phase: 'schema' | 'query'
     const safeTables = tables.filter(t => /^[a-zA-Z0-9_-]+$/.test(t));
     // Attribute only a literal table named by QuestDB, and only within this request.
     const missing = error.upstreamMessage?.match(/^table does not exist \[table=([a-zA-Z0-9_-]+)\]$/i)?.[1] ?? error.upstreamMessage?.match(/^table does not exist\s*[:=]\s*["'`]?([a-zA-Z0-9_-]+)["'`]?\s*(?:$|[\]\n])/i)?.[1];
-    if (missing && safeTables.includes(missing)) {
+    if (error.kind === 'response' && (error.upstreamStatus === 400 || error.upstreamStatus === 404) && missing && safeTables.includes(missing)) {
       throw new HistoryReadError(409, `History source '${missing}' is unavailable.`, {
         code: 'HISTORY_TABLE_MISSING', scope: 'source', phase, tables: [missing],
-        action: 'Restore this table and retry, or explicitly select another registered source. Automatic history requires every selected source.',
+        action: 'Restore this table and retry, or explicitly select another registered source. This request requires the selected source.',
       });
     }
     const denied = error.upstreamStatus === 401 || error.upstreamStatus === 403;
