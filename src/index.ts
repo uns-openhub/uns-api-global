@@ -15,7 +15,7 @@ import { QueryDiagnostics, QueryWorkloadError } from "./query-diagnostics.js";
 import { queryQuestDbHttp, QuestDbQueryError } from "./questdb-http.js";
 import { HistoryReadError, readHistory } from "./history-source-diagnostics.js";
 import { buildLatestHistorySql, selectArchivedLatest, preserveConcurrentCacheValue, LatestLookupCoordinator, LatestLookupError } from "./latest-value-history.js";
-import { HISTORY_SOURCE_COLUMN, HistorySourceError, historyTableRelation, combineHistorySchemas, validateHistoryMappings, assertHistoryTransform, historySourceMetadata, type HistoryTableSource } from "./history-table-source.js";
+import { HISTORY_SOURCE_COLUMN, HistorySourceError, historyTableRelation, combineHistorySchemas, validateHistoryMappings, assertHistoryTransform, historySourceMetadata, readAvailableHistory, type HistoryTableSource } from "./history-table-source.js";
 import { QuestDbMappingCache, QUESTDB_HISTORY_MAPPINGS_QUERY, type QuestDbMappingEntry } from "./questdb-mapping-cache.js";
 import {
   AuthClient,
@@ -1077,9 +1077,8 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
     const mappings = await resolveHistoryFromController(topic, {
       controllerGraphqlUrl, tokenProvider: controllerTokenProvider,
     });
-    const tables = tableFromQuery || tableFromDataSource ? [tableFromQuery || tableFromDataSource!] : validateHistoryMappings(mappings);
-    const table = tables[0];
-    if (!table) {
+    const candidateTables = tableFromQuery || tableFromDataSource ? [tableFromQuery || tableFromDataSource!] : validateHistoryMappings(mappings);
+    if (!candidateTables.length) {
       throw new HttpError(
         400,
         "Missing or invalid query param: table (and no matching QuestDB mapping found). Provide ?table= or configure mappings in controller.",
@@ -1121,148 +1120,154 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
       rawExportCancellation = cancelRawExportOnDisconnect(res);
     }
     const parsedPath = { ...parseUnsPath(topic), captureSessionId: parseCaptureSessionId(query?.["sessionId"]) };
-    const { source, schema: tableSchema } = combineHistorySchemas(tables, await mapHistoryRequests(tables, 1, name => readHistory([name], "schema", () => getTableSchema(questdb, name, rawExportCancellation?.signal)), rawExportCancellation?.signal), mappings);
-    assertHistoryTransform(source, transform);
-    const tableColumns = tableSchema.columns;
-    const temporal = resolveTemporalStrategy(tableColumns, exportRange ? "timestamp" : timeField);
-    const dedupeApplied = canApplyDedupe(dedupeRequested, tableColumns);
-    let sampling: HistorySamplingInfo;
-    let sql: string;
-    if (summaryOnly) {
-      sampling = { mode: "summary" };
-      sql = buildSummarySql(source, parsedPath, range, temporal, tableColumns);
-    } else if (sampledRequested) {
-      const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
-      const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
-      const bucketMs = requestedBucketMs ?? deriveBucketMs(range, requestedMaxPoints!);
-      const bucketAggregate: AggregateMode = transform === "delta" ? "sum" : aggregate;
-      sampling = {
-        mode: "bucketed",
-        requestedMaxPoints,
-        bucketMs,
-        aggregate: bucketAggregate,
-        transform,
-        ...(transform === "delta" ? { counterResetPolicy } : {}),
-        metricColumn,
-        unitColumn,
-        ...(transform === "delta" ? { boundaryMode: "interpolated" as const } : {}),
-      };
-      if (transform === "delta") {
-        sql = buildSourceSql(
-          source,
-          parsedPath,
-          counterBoundarySourceRange(range, bucketMs),
-          dedupeRequested,
-          tableColumns,
-          temporal,
-          [metricColumn, ...(unitColumn ? [unitColumn] : [])],
-        );
-      } else {
-        const sourceSql = buildSourceSql(
-          source,
-          parsedPath,
-          range,
-          dedupeRequested,
-          tableColumns,
-          temporal,
-          [metricColumn, ...(unitColumn ? [unitColumn] : [])],
-        );
-        sql = buildBucketSql(sourceSql, temporal, metricColumn, unitColumn, aggregate, bucketMs, requestedMetricColumn);
-      }
-    } else {
-      if (transform === "delta") {
+    await readAvailableHistory({
+      tables: candidateTables, mappings,
+      allowMissingRetained: !tableFromQuery && !tableFromDataSource && !exportRange && transform !== "delta",
+      signal: rawExportCancellation?.signal,
+    }, async (tables, missingTables) => {
+      const { source, schema: tableSchema } = combineHistorySchemas(tables, await mapHistoryRequests(tables, 1, name => readHistory([name], "schema", () => getTableSchema(questdb, name, rawExportCancellation?.signal)), rawExportCancellation?.signal), mappings);
+      assertHistoryTransform(source, transform);
+      const tableColumns = tableSchema.columns;
+      const temporal = resolveTemporalStrategy(tableColumns, exportRange ? "timestamp" : timeField);
+      const dedupeApplied = canApplyDedupe(dedupeRequested, tableColumns);
+      let sampling: HistorySamplingInfo;
+      let sql: string;
+      if (summaryOnly) {
+        sampling = { mode: "summary" };
+        sql = buildSummarySql(source, parsedPath, range, temporal, tableColumns);
+      } else if (sampledRequested) {
         const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
         const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
-        const sourceSql = buildSourceSql(
-          source,
-          parsedPath,
-          range,
-          dedupeRequested,
-          tableColumns,
-          temporal,
-          [metricColumn, ...(unitColumn ? [unitColumn] : [])],
-        );
-        const deltaSourceSql = buildCounterDeltaSourceSql(
-          sourceSql,
-          temporal,
+        const bucketMs = requestedBucketMs ?? deriveBucketMs(range, requestedMaxPoints!);
+        const bucketAggregate: AggregateMode = transform === "delta" ? "sum" : aggregate;
+        sampling = {
+          mode: "bucketed",
+          requestedMaxPoints,
+          bucketMs,
+          aggregate: bucketAggregate,
+          transform,
+          ...(transform === "delta" ? { counterResetPolicy } : {}),
           metricColumn,
           unitColumn,
-          counterResetPolicy,
-          requestedMetricColumn,
-        );
-        sampling = { mode: "raw", transform, counterResetPolicy, metricColumn, unitColumn };
-        sql = buildCounterDeltaRawSql(deltaSourceSql, limit);
-      } else {
-        sampling = { mode: "raw", transform };
-        sql = buildDataSql(source, parsedPath, range, exportRange ? limit + 1 : limit, dedupeRequested, tableColumns, temporal);
-      }
-    }
-
-    const rawResult = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, rawExportCancellation?.signal));
-    const result = sampling.mode === "bucketed" && sampling.transform === "delta"
-      ? buildBoundaryCounterDeltaResponse(
-          rawResult,
-          sql,
-          range,
-          temporal,
-          sampling.metricColumn,
-          sampling.unitColumn,
-          sampling.bucketMs,
-          sampling.counterResetPolicy ?? DEFAULT_COUNTER_RESET_POLICY,
-          requestedMetricColumn,
-        )
-      : rawResult;
-    const scanRowCount = extractScanRowCount(result.raw);
-    if (scanRowCount !== null && scanRowCount > questdb.maxScanRows) {
-      throw new HttpError(
-        413,
-        `Query scan cost exceeded maxScanRows (${questdb.maxScanRows}). Narrow path/time-range or reduce requested scope.`,
-      );
-    }
-
-    const exportPage = exportRange ? completeRawExportPage(result, limit) : null;
-    const stats = {
-      ...(exportRange ? { exportWindow: "half-open" } : {}),
-      table: tables.length === 1 ? table : null,
-      history: historySourceMetadata(tables, mappings),
-      limit,
-      from: range.from,
-      to: range.to,
-      summaryOnly,
-      transform,
-      counterResetPolicy: transform === "delta" ? counterResetPolicy : undefined,
-      timeFieldRequested: timeField,
-      timeFieldResolved: temporal.mode,
-      timeFromColumn: temporal.fromColumn,
-      timeToColumn: temporal.toColumn,
-      dedupeRequested,
-      dedupeApplied,
-      note: range.note,
-      rowCount: exportPage ? exportPage.data.length : result.data?.length ?? 0,
-      scanRowCount,
-      sampling: sampling.mode === "bucketed"
-        ? { ...sampling, returnedPoints: result.data?.length ?? 0 }
-        : sampling,
-    };
-
-    const payload = summaryOnly
-      ? {
-          data: result.data,
-          stats: { ...stats, raw: result.raw },
-        }
-      : {
-          data: exportPage ? exportPage.data : result.data,
-          stats: { ...stats, raw: result.raw, truncated: exportPage ? exportPage.truncated : sampling.mode === "raw" && (result.data?.length ?? 0) >= limit },
+          ...(transform === "delta" ? { boundaryMode: "interpolated" as const } : {}),
         };
-    const payloadBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
-    if (payloadBytes > questdb.maxResponseBytes) {
-      throw new HttpError(
-        413,
-        `Response exceeds maxResponseBytes (${questdb.maxResponseBytes}). Reduce limit or narrow the time-range.`,
-      );
-    }
+        if (transform === "delta") {
+          sql = buildSourceSql(
+            source,
+            parsedPath,
+            counterBoundarySourceRange(range, bucketMs),
+            dedupeRequested,
+            tableColumns,
+            temporal,
+            [metricColumn, ...(unitColumn ? [unitColumn] : [])],
+          );
+        } else {
+          const sourceSql = buildSourceSql(
+            source,
+            parsedPath,
+            range,
+            dedupeRequested,
+            tableColumns,
+            temporal,
+            [metricColumn, ...(unitColumn ? [unitColumn] : [])],
+          );
+          sql = buildBucketSql(sourceSql, temporal, metricColumn, unitColumn, aggregate, bucketMs, requestedMetricColumn);
+        }
+      } else {
+        if (transform === "delta") {
+          const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
+          const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
+          const sourceSql = buildSourceSql(
+            source,
+            parsedPath,
+            range,
+            dedupeRequested,
+            tableColumns,
+            temporal,
+            [metricColumn, ...(unitColumn ? [unitColumn] : [])],
+          );
+          const deltaSourceSql = buildCounterDeltaSourceSql(
+            sourceSql,
+            temporal,
+            metricColumn,
+            unitColumn,
+            counterResetPolicy,
+            requestedMetricColumn,
+          );
+          sampling = { mode: "raw", transform, counterResetPolicy, metricColumn, unitColumn };
+          sql = buildCounterDeltaRawSql(deltaSourceSql, limit);
+        } else {
+          sampling = { mode: "raw", transform };
+          sql = buildDataSql(source, parsedPath, range, exportRange ? limit + 1 : limit, dedupeRequested, tableColumns, temporal);
+        }
+      }
 
-    res.status(200).json(payload);
+      const rawResult = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, rawExportCancellation?.signal));
+      const result = sampling.mode === "bucketed" && sampling.transform === "delta"
+        ? buildBoundaryCounterDeltaResponse(
+            rawResult,
+            sql,
+            range,
+            temporal,
+            sampling.metricColumn,
+            sampling.unitColumn,
+            sampling.bucketMs,
+            sampling.counterResetPolicy ?? DEFAULT_COUNTER_RESET_POLICY,
+            requestedMetricColumn,
+          )
+        : rawResult;
+      const scanRowCount = extractScanRowCount(result.raw);
+      if (scanRowCount !== null && scanRowCount > questdb.maxScanRows) {
+        throw new HttpError(
+          413,
+          `Query scan cost exceeded maxScanRows (${questdb.maxScanRows}). Narrow path/time-range or reduce requested scope.`,
+        );
+      }
+
+      const exportPage = exportRange ? completeRawExportPage(result, limit) : null;
+      const stats = {
+        ...(exportRange ? { exportWindow: "half-open" } : {}),
+        table: tables.length === 1 ? tables[0] : null,
+        history: historySourceMetadata(tables, mappings, missingTables),
+        limit,
+        from: range.from,
+        to: range.to,
+        summaryOnly,
+        transform,
+        counterResetPolicy: transform === "delta" ? counterResetPolicy : undefined,
+        timeFieldRequested: timeField,
+        timeFieldResolved: temporal.mode,
+        timeFromColumn: temporal.fromColumn,
+        timeToColumn: temporal.toColumn,
+        dedupeRequested,
+        dedupeApplied,
+        note: range.note,
+        rowCount: exportPage ? exportPage.data.length : result.data?.length ?? 0,
+        scanRowCount,
+        sampling: sampling.mode === "bucketed"
+          ? { ...sampling, returnedPoints: result.data?.length ?? 0 }
+          : sampling,
+      };
+
+      const payload = summaryOnly
+        ? {
+            data: result.data,
+            stats: { ...stats, raw: result.raw },
+          }
+        : {
+            data: exportPage ? exportPage.data : result.data,
+            stats: { ...stats, raw: result.raw, truncated: exportPage ? exportPage.truncated : sampling.mode === "raw" && (result.data?.length ?? 0) >= limit },
+          };
+      const payloadBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+      if (payloadBytes > questdb.maxResponseBytes) {
+        throw new HttpError(
+          413,
+          `Response exceeds maxResponseBytes (${questdb.maxResponseBytes}). Reduce limit or narrow the time-range.`,
+        );
+      }
+
+      res.status(200).json(payload);
+    });
   } catch (error) {
     if (rawExportCancellation?.signal.aborted || res.destroyed) return;
     if (error instanceof AuthorizationStatusError || error instanceof HttpError || error instanceof CatchallParameterError || error instanceof HistorySourceError || error instanceof HistoryReadError || error instanceof QueryWorkloadError || error instanceof QuestDbQueryError) {
@@ -1330,7 +1335,7 @@ function buildCounterCacheState(
   if (absoluteValue === null) return undefined;
 
   const previousEntry = lastValueMap.get(topic);
-  const previousEntryValue = previousEntry && (previousEntry.history?.tables.length ?? 0) <= 1 ? toNumber(previousEntry.values["value"]) : null;
+  const previousEntryValue = previousEntry && (previousEntry.history?.tables.length ?? 0) <= 1 && !previousEntry.history?.missingTables?.length ? toNumber(previousEntry.values["value"]) : null;
   const currentMs = timestampMs(timestamp);
   const previousMs = timestampMs(previousEntry?.timestamp);
   const hasLaterTimestamp = currentMs === null || previousMs === null || currentMs > previousMs;
@@ -1853,7 +1858,7 @@ function buildBatchLastResult(
   now: number,
   options: BatchLastOptions,
 ): BatchLastResult {
-  if (options.transform === "delta" && (entry.history?.tables.length ?? 0) > 1) {
+  if (options.transform === "delta" && ((entry.history?.tables.length ?? 0) > 1 || entry.history?.missingTables?.length)) {
     throw new HistorySourceError("Counter continuity across publishers is unknown. Use absolute latest values.");
   }
   const counter = buildBatchLastCounterResult(entry, options.counterResetPolicy);
@@ -1888,30 +1893,34 @@ async function tryQuestDbLastRowFallback(topic: string): Promise<{ entry: LastVa
   return latestLookupCoordinator.run(topic, async signal => {
     const override = resolveTablePrefix(dataSources, topic);
     const mappings = await resolveHistoryFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider });
-    const tables = override ? [override] : validateHistoryMappings(mappings);
-    if (!tables.length) return null;
-    const { source, schema } = combineHistorySchemas(tables, await mapHistoryRequests(tables, 1, table => readHistory([table], "schema", () => getTableSchema(questdb, table, signal)), signal), mappings);
-    const temporal = resolveTemporalStrategy(schema.columns, 'auto');
-    const sql = buildLatestHistorySql(source, topic, schema, temporal);
-    const result = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, signal, "latest-fallback"));
-    const scanRows = extractScanRowCount(result.raw);
-    if (scanRows !== null && scanRows > questdb.maxScanRows) throw new LatestLookupError("Latest-value recovery exceeds maxScanRows.", 413);
-    if (Buffer.byteLength(JSON.stringify(result), 'utf8') > questdb.maxResponseBytes) throw new LatestLookupError('Latest-value response exceeds the configured byte limit.', 413);
-    const columns = Array.isArray(result.raw['columns']) ? (result.raw['columns'] as Array<{ name: string }>).map(column => column.name) : [];
-    const suffix = mappings[0]?.suffix?.replace(/^_+/, "");
-    const packetShape = suffix === "data" || suffix === "table" ? suffix : undefined;
-    const selected = selectArchivedLatest(columns, result.data as unknown[][], temporal, packetShape);
-    if (!selected) return null;
-    const selectedTables = selected.selectedTables.length ? selected.selectedTables : tables;
-    return {
-      entry: {
-        packetShape: selected.packetShape,
-        values: selected.values, uom: selected.uom, timestamp: selected.timestamp,
-        receivedAt: selected.receivedAt, dataGroup: null,
-        counter: tables.length === 1 && selected.packetShape === 'data' ? buildSeedCounterState(selected.values['value']) : undefined,
-        history: { ...historySourceMetadata(tables, mappings), selectedTables, latestTiePolicy: 'same-value-or-conflict' },
-      }, sql,
-    };
+    const candidateTables = override ? [override] : validateHistoryMappings(mappings);
+    if (!candidateTables.length) return null;
+    return readAvailableHistory({
+      tables: candidateTables, mappings, allowMissingRetained: !override, signal,
+    }, async (tables, missingTables) => {
+      const { source, schema } = combineHistorySchemas(tables, await mapHistoryRequests(tables, 1, table => readHistory([table], "schema", () => getTableSchema(questdb, table, signal)), signal), mappings);
+      const temporal = resolveTemporalStrategy(schema.columns, 'auto');
+      const sql = buildLatestHistorySql(source, topic, schema, temporal);
+      const result = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, signal, "latest-fallback"));
+      const scanRows = extractScanRowCount(result.raw);
+      if (scanRows !== null && scanRows > questdb.maxScanRows) throw new LatestLookupError("Latest-value recovery exceeds maxScanRows.", 413);
+      if (Buffer.byteLength(JSON.stringify(result), 'utf8') > questdb.maxResponseBytes) throw new LatestLookupError('Latest-value response exceeds the configured byte limit.', 413);
+      const columns = Array.isArray(result.raw['columns']) ? (result.raw['columns'] as Array<{ name: string }>).map(column => column.name) : [];
+      const suffix = mappings[0]?.suffix?.replace(/^_+/, "");
+      const packetShape = suffix === "data" || suffix === "table" ? suffix : undefined;
+      const selected = selectArchivedLatest(columns, result.data as unknown[][], temporal, packetShape);
+      if (!selected) return null;
+      const selectedTables = selected.selectedTables.length ? selected.selectedTables : tables;
+      return {
+        entry: {
+          packetShape: selected.packetShape,
+          values: selected.values, uom: selected.uom, timestamp: selected.timestamp,
+          receivedAt: selected.receivedAt, dataGroup: null,
+          counter: tables.length === 1 && !missingTables.length && selected.packetShape === 'data' ? buildSeedCounterState(selected.values['value']) : undefined,
+          history: { ...historySourceMetadata(tables, mappings, missingTables), selectedTables, latestTiePolicy: 'same-value-or-conflict' },
+        }, sql,
+      };
+    });
   });
 }
 
@@ -2222,9 +2231,8 @@ async function handleBatchRange(
       try {
         const tableFromDataSource = resolveTablePrefix(dataSources, topic);
         const mappings = await resolveHistoryFromController(topic, { controllerGraphqlUrl, tokenProvider: controllerTokenProvider });
-        const tables = tableFromDataSource ? [tableFromDataSource] : validateHistoryMappings(mappings);
-        const table = tables[0];
-        if (!table) {
+        const candidateTables = tableFromDataSource ? [tableFromDataSource] : validateHistoryMappings(mappings);
+        if (!candidateTables.length) {
           return {
             ...queryRequest,
             topic,
@@ -2237,176 +2245,180 @@ async function handleBatchRange(
         }
 
         const parsedPath = { ...parseUnsPath(topic), captureSessionId };
-        const { source, schema: tableSchema } = combineHistorySchemas(tables, await mapHistoryRequests(tables, 1, name => readHistory([name], "schema", () => getTableSchema(questdb, name, signal)), signal), mappings);
-        assertHistoryTransform(source, transform);
-        const tableColumns = tableSchema.columns;
-        const entityStorage = detectEntityStorageSchema(tableColumns);
-        if (queryRequest.entitySelectorIndex !== null && entityStorage.mode === "partial") {
-          throw new Error(
-            `QuestDB table '${table}' has a partial stable identity schema; missing ${entityStorage.missingColumns.join(", ")}.`,
-          );
-        }
-        const temporal = resolveTemporalStrategy(tableColumns, timeField);
-        let sampling: HistorySamplingInfo;
-        let sql: string;
-        if (summaryOnly) {
-          sampling = { mode: "summary" };
-          sql = buildSummarySql(source, parsedPath, range, temporal, tableColumns);
-        } else if (sampledRequested) {
-          const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
-          const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
-          const bucketRange = queryRequest.crossBindingSample ? requestedRange : range;
-          const bucketMs = requestedBucketMs ?? deriveBucketMs(bucketRange, requestedMaxPoints!);
-          const bucketAggregate: AggregateMode = transform === "delta" ? "sum" : aggregate;
-          sampling = {
-            mode: "bucketed",
-            requestedMaxPoints,
-            bucketMs,
-            aggregate: bucketAggregate,
-            transform,
-            ...(transform === "delta" ? { counterResetPolicy } : {}),
-            metricColumn,
-            unitColumn,
-            ...(transform === "delta" ? { boundaryMode: "interpolated" as const } : {}),
-          };
-          if (transform === "delta") {
-            sql = buildSourceSql(
-              source,
-              parsedPath,
-              counterBoundarySourceRange(range, bucketMs),
-              dedupeRequested,
-              tableColumns,
-              temporal,
-              [metricColumn, ...(unitColumn ? [unitColumn] : [])],
+        return await readAvailableHistory({
+          tables: candidateTables, mappings, allowMissingRetained: !tableFromDataSource && transform !== "delta", signal,
+        }, async (tables, missingTables) => {
+          const { source, schema: tableSchema } = combineHistorySchemas(tables, await mapHistoryRequests(tables, 1, name => readHistory([name], "schema", () => getTableSchema(questdb, name, signal)), signal), mappings);
+          assertHistoryTransform(source, transform);
+          const tableColumns = tableSchema.columns;
+          const entityStorage = detectEntityStorageSchema(tableColumns);
+          if (queryRequest.entitySelectorIndex !== null && entityStorage.mode === "partial") {
+            throw new Error(
+              `QuestDB table '${tables[0]}' has a partial stable identity schema; missing ${entityStorage.missingColumns.join(", ")}.`,
             );
-          } else {
-            const entitySelector = queryRequest.entitySelectorIndex === null
-              ? null
-              : entityPlan?.selectors[queryRequest.entitySelectorIndex] ?? null;
-            const sourceSql = entityStorage.mode === "identity-aware" && entitySelector
-              ? buildEntitySourceSql(
-                  source,
-                  entitySelector.stableEntityId,
-                  parsedPath,
-                  range,
-                  dedupeRequested,
-                  tableSchema,
-                  temporal,
-                  [metricColumn, ...(unitColumn ? [unitColumn] : [])],
-                )
-              : buildSourceSql(
-                  source,
-                  parsedPath,
-                  range,
-                  dedupeRequested,
-                  tableColumns,
-                  temporal,
-                  [metricColumn, ...(unitColumn ? [unitColumn] : [])],
-                );
-            sql = queryRequest.crossBindingSample
-              ? buildEntityBucketPartialSql(sourceSql, temporal, metricColumn, unitColumn, bucketMs)
-              : buildBucketSql(sourceSql, temporal, metricColumn, unitColumn, aggregate, bucketMs, requestedMetricColumn);
           }
-        } else {
-          if (transform === "delta") {
+          const temporal = resolveTemporalStrategy(tableColumns, timeField);
+          let sampling: HistorySamplingInfo;
+          let sql: string;
+          if (summaryOnly) {
+            sampling = { mode: "summary" };
+            sql = buildSummarySql(source, parsedPath, range, temporal, tableColumns);
+          } else if (sampledRequested) {
             const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
             const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
-            const sourceSql = buildSourceSql(
-              source,
-              parsedPath,
-              range,
-              dedupeRequested,
-              tableColumns,
-              temporal,
-              [metricColumn, ...(unitColumn ? [unitColumn] : [])],
-            );
-            const deltaSourceSql = buildCounterDeltaSourceSql(
-              sourceSql,
-              temporal,
+            const bucketRange = queryRequest.crossBindingSample ? requestedRange : range;
+            const bucketMs = requestedBucketMs ?? deriveBucketMs(bucketRange, requestedMaxPoints!);
+            const bucketAggregate: AggregateMode = transform === "delta" ? "sum" : aggregate;
+            sampling = {
+              mode: "bucketed",
+              requestedMaxPoints,
+              bucketMs,
+              aggregate: bucketAggregate,
+              transform,
+              ...(transform === "delta" ? { counterResetPolicy } : {}),
               metricColumn,
               unitColumn,
-              counterResetPolicy,
-              requestedMetricColumn,
-            );
-            sampling = { mode: "raw", transform, counterResetPolicy, metricColumn, unitColumn };
-            sql = buildCounterDeltaRawSql(deltaSourceSql, limit);
+              ...(transform === "delta" ? { boundaryMode: "interpolated" as const } : {}),
+            };
+            if (transform === "delta") {
+              sql = buildSourceSql(
+                source,
+                parsedPath,
+                counterBoundarySourceRange(range, bucketMs),
+                dedupeRequested,
+                tableColumns,
+                temporal,
+                [metricColumn, ...(unitColumn ? [unitColumn] : [])],
+              );
+            } else {
+              const entitySelector = queryRequest.entitySelectorIndex === null
+                ? null
+                : entityPlan?.selectors[queryRequest.entitySelectorIndex] ?? null;
+              const sourceSql = entityStorage.mode === "identity-aware" && entitySelector
+                ? buildEntitySourceSql(
+                    source,
+                    entitySelector.stableEntityId,
+                    parsedPath,
+                    range,
+                    dedupeRequested,
+                    tableSchema,
+                    temporal,
+                    [metricColumn, ...(unitColumn ? [unitColumn] : [])],
+                  )
+                : buildSourceSql(
+                    source,
+                    parsedPath,
+                    range,
+                    dedupeRequested,
+                    tableColumns,
+                    temporal,
+                    [metricColumn, ...(unitColumn ? [unitColumn] : [])],
+                  );
+              sql = queryRequest.crossBindingSample
+                ? buildEntityBucketPartialSql(sourceSql, temporal, metricColumn, unitColumn, bucketMs)
+                : buildBucketSql(sourceSql, temporal, metricColumn, unitColumn, aggregate, bucketMs, requestedMetricColumn);
+            }
           } else {
-            sampling = { mode: "raw", transform };
-            const entitySelector = queryRequest.entitySelectorIndex === null
-              ? null
-              : entityPlan?.selectors[queryRequest.entitySelectorIndex] ?? null;
-            sql = entityStorage.mode === "identity-aware" && entitySelector
-              ? buildEntityDataSql(
-                  source,
-                  entitySelector.stableEntityId,
-                  parsedPath,
-                  range,
-                  limit,
-                  dedupeRequested,
-                  tableSchema,
-                  temporal,
-                )
-              : buildDataSql(source, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
+            if (transform === "delta") {
+              const metricColumn = resolveMetricColumn(tableSchema, parsedPath, requestedMetricColumn);
+              const unitColumn = resolveUnitColumn(tableSchema, metricColumn);
+              const sourceSql = buildSourceSql(
+                source,
+                parsedPath,
+                range,
+                dedupeRequested,
+                tableColumns,
+                temporal,
+                [metricColumn, ...(unitColumn ? [unitColumn] : [])],
+              );
+              const deltaSourceSql = buildCounterDeltaSourceSql(
+                sourceSql,
+                temporal,
+                metricColumn,
+                unitColumn,
+                counterResetPolicy,
+                requestedMetricColumn,
+              );
+              sampling = { mode: "raw", transform, counterResetPolicy, metricColumn, unitColumn };
+              sql = buildCounterDeltaRawSql(deltaSourceSql, limit);
+            } else {
+              sampling = { mode: "raw", transform };
+              const entitySelector = queryRequest.entitySelectorIndex === null
+                ? null
+                : entityPlan?.selectors[queryRequest.entitySelectorIndex] ?? null;
+              sql = entityStorage.mode === "identity-aware" && entitySelector
+                ? buildEntityDataSql(
+                    source,
+                    entitySelector.stableEntityId,
+                    parsedPath,
+                    range,
+                    limit,
+                    dedupeRequested,
+                    tableSchema,
+                    temporal,
+                  )
+                : buildDataSql(source, parsedPath, range, limit, dedupeRequested, tableColumns, temporal);
+            }
           }
-        }
 
-        const rawResult = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, signal));
-        const result = sampling.mode === "bucketed" && sampling.transform === "delta"
-          ? buildBoundaryCounterDeltaResponse(
-              rawResult,
-              sql,
-              range,
-              temporal,
-              sampling.metricColumn,
-              sampling.unitColumn,
-              sampling.bucketMs,
-              sampling.counterResetPolicy ?? DEFAULT_COUNTER_RESET_POLICY,
-              requestedMetricColumn,
-            )
-          : rawResult;
-        const scanRowCount = extractScanRowCount(result.raw);
-        if (scanRowCount !== null && scanRowCount > questdb.maxScanRows) {
-          throw new HttpError(
-            413,
-            `Query scan cost exceeded maxScanRows (${questdb.maxScanRows}). Narrow path/time-range or reduce requested scope.`,
-          );
-        }
+          const rawResult = await readHistory(tables, "query", () => queryQuestDb(questdb, sql, signal));
+          const result = sampling.mode === "bucketed" && sampling.transform === "delta"
+            ? buildBoundaryCounterDeltaResponse(
+                rawResult,
+                sql,
+                range,
+                temporal,
+                sampling.metricColumn,
+                sampling.unitColumn,
+                sampling.bucketMs,
+                sampling.counterResetPolicy ?? DEFAULT_COUNTER_RESET_POLICY,
+                requestedMetricColumn,
+              )
+            : rawResult;
+          const scanRowCount = extractScanRowCount(result.raw);
+          if (scanRowCount !== null && scanRowCount > questdb.maxScanRows) {
+            throw new HttpError(
+              413,
+              `Query scan cost exceeded maxScanRows (${questdb.maxScanRows}). Narrow path/time-range or reduce requested scope.`,
+            );
+          }
 
-        return {
-          ...queryRequest,
-          topic,
-          error: null,
-          data: result.data,
-          columns: Array.isArray(result.raw["columns"])
-            ? (result.raw["columns"] as Array<{ name?: unknown }>)
-                .map((column) => typeof column?.name === "string" ? column.name : "")
-                .filter(Boolean)
-            : sampling.mode === "raw" ? buildDataColumnList(tableColumns) : [],
-          sql,
-          stats: {
-            table: tables.length === 1 ? table : null,
-            history: historySourceMetadata(tables, mappings),
-            limit,
-            from: range.from,
-            to: range.to,
-            summaryOnly,
-            transform,
-            counterResetPolicy: transform === "delta" ? counterResetPolicy : undefined,
-            rowCount: result.data?.length ?? 0,
-            scanRowCount,
-            sampling: sampling.mode === "bucketed"
-              ? { ...sampling, returnedPoints: result.data?.length ?? 0 }
-              : sampling,
-            entityStorage,
-            truncated: sampling.mode === "raw" && (result.data?.length ?? 0) >= limit,
-            // Keep the QuestDB column names so batch clients can map row arrays.
-            raw: {
-              columns: Array.isArray(result.raw["columns"])
-                ? result.raw["columns"]
-                : [],
+          return {
+            ...queryRequest,
+            topic,
+            error: null,
+            data: result.data,
+            columns: Array.isArray(result.raw["columns"])
+              ? (result.raw["columns"] as Array<{ name?: unknown }>)
+                  .map((column) => typeof column?.name === "string" ? column.name : "")
+                  .filter(Boolean)
+              : sampling.mode === "raw" ? buildDataColumnList(tableColumns) : [],
+            sql,
+            stats: {
+              table: tables.length === 1 ? tables[0] : null,
+              history: historySourceMetadata(tables, mappings, missingTables),
+              limit,
+              from: range.from,
+              to: range.to,
+              summaryOnly,
+              transform,
+              counterResetPolicy: transform === "delta" ? counterResetPolicy : undefined,
+              rowCount: result.data?.length ?? 0,
+              scanRowCount,
+              sampling: sampling.mode === "bucketed"
+                ? { ...sampling, returnedPoints: result.data?.length ?? 0 }
+                : sampling,
+              entityStorage,
+              truncated: sampling.mode === "raw" && (result.data?.length ?? 0) >= limit,
+              // Keep the QuestDB column names so batch clients can map row arrays.
+              raw: {
+                columns: Array.isArray(result.raw["columns"])
+                  ? result.raw["columns"]
+                  : [],
+              },
             },
-          },
-        };
+          };
+        });
       } catch (err) {
         const publicError = err instanceof HttpError || err instanceof CatchallParameterError || err instanceof HistorySourceError || err instanceof HistoryReadError || err instanceof QueryWorkloadError || err instanceof QuestDbQueryError;
         const message = publicError ? err.message : "History query failed.";
@@ -2469,6 +2481,7 @@ async function handleBatchRange(
         toExclusive: segment.range.toExclusive === true,
         error: segment.error,
         sql: segment.sql,
+        ...(segment.stats?.history.missingTables ? { history: segment.stats.history } : {}),
         rowCount: Array.isArray(segment.data) ? segment.data.length : 0,
       })),
     };
