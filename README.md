@@ -96,8 +96,12 @@ as users may reuse a positive status until that cache expires. A revoked user ca
 therefore remain authorized until that expiry; JWT expiry still applies immediately.
 Machine tokens, service tokens, catalog history broker tokens and tokens whose
 principal type is unknown are checked on **every request**, without a positive cache
-or cross-request coalescing. Older Controllers that do not return `principalType`
-remain compatible, but all their tokens require a status request each time.
+or cross-request coalescing. Their successful status must also contain
+`configuredAccessAuthority: 2`, proving that the Controller enforces the configured
+access contract; otherwise access fails closed with HTTP 503. An ordinary user
+confirmed by `principalType: "user"` does not need that capability. Older
+Controllers that provide neither the marker nor a principal type cannot safely
+classify callers, so these calls also fail closed. Upgrade the Controller first.
 
 Checks have a 1500 ms timeout, at most 16 concurrent calls, no waiting queue, 1024
 cached user token digests and a one-second failure cooldown. Concurrent requests

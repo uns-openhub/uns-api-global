@@ -8,7 +8,7 @@ const secret='only-a-local-test-secret';
 const sign=(claims:Record<string,unknown>)=>jwt.sign(claims,secret,{algorithm:'HS256',expiresIn:60});
 const verify=async(token:string)=>jwt.verify(token,secret,{algorithms:['HS256']}) as Record<string,unknown>;
 const auth={jwtSecret:secret};
-const fetchResult=(principalType='user')=>Response.json({active:true,protocolVersion:1,principalType});
+const fetchResult=(principalType='user')=>Response.json({active:true,protocolVersion:1,principalType,configuredAccessAuthority:2});
 
 test('validates the real bearer signature before invoking Controller status',async()=>{
   let calls=0;const status=new AuthorizationStatus({controllerRest:'http://localhost/api',fetch:async()=>{calls++;return fetchResult();}});
@@ -31,6 +31,16 @@ test('never caches a verified service bearer after its status changes',async()=>
   const token=sign({sub:'machine',machineIdentityId:'machine',serviceToken:true,scopes:['read:uns'],accessRules:['plant/#']});
   await authorizeBearer(token,verify,status,auth);active=false;
   await assert.rejects(authorizeBearer(token,verify,status,auth),{status:403});assert.equal(calls,2);
+});
+test('does not authorize a signed service or broker bearer from an old Controller',async()=>{
+  let calls=0;const status=new AuthorizationStatus({controllerRest:'http://localhost/api',fetch:async()=>{
+    calls++;return Response.json({active:true,protocolVersion:1,principalType:'user'});
+  }});
+  const service=sign({sub:'machine',machineIdentityId:'machine',serviceToken:true});
+  const broker=sign({sub:'machine',serviceToken:true,catalogPublication:{operation:'summary'}});
+  await assert.rejects(authorizeBearer(service,verify,status,auth),{status:503});
+  await assert.rejects(authorizeBearer(broker,verify,status,auth),{status:503});
+  assert.equal(calls,2);
 });
 test('never caches the short-lived catalog broker bearer, even if its subject is a user',async()=>{
   let allowed=true,calls=0;

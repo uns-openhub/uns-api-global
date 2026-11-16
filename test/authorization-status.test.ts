@@ -8,7 +8,7 @@ const standaloneUser={...user,standaloneHmac:true};
 const machine={claims:{sub:'machine',machineIdentityId:'machine',serviceToken:true},standaloneHmac:false};
 const legacyService={claims:{sub:'user',serviceToken:true},standaloneHmac:false};
 const broker={claims:{sub:'machine',machineIdentityId:'machine',serviceToken:true,catalogPublication:{operation:'summary'}},standaloneHmac:false};
-const active = (principalType:unknown='user') => Response.json({active:true,protocolVersion:1,principalType});
+const active = (principalType:unknown='user') => Response.json({active:true,protocolVersion:1,principalType,configuredAccessAuthority:2});
 function fixture(handler: (...args: Parameters<typeof fetch>) => ReturnType<typeof fetch> = async () => active()) {
   let now=10000,calls=0;
   const status=new AuthorizationStatus({controllerRest:'http://localhost:3200/api/',now:()=>now,fetch:async (...args)=>{calls++;return handler(...args);}});
@@ -55,9 +55,32 @@ for(const [name,caller] of [['machine',machine],['legacy service',legacyService]
     await f.status.check('token',caller);allowed=false;
     await assert.rejects(f.status.check('token',caller),{status:403});assert.equal(f.calls(),2);
   });
-test('an older Controller without principalType never enables positive caching',async()=>{
-  const f=fixture(async()=>Response.json({active:true,protocolVersion:1}));
+test('unknown principals with configured authority are checked every time',async()=>{
+  const f=fixture(async()=>Response.json({active:true,protocolVersion:1,configuredAccessAuthority:2}));
   await f.status.check('user',user);await f.status.check('user',user);assert.equal(f.calls(),2);
+  assert.equal(f.status.snapshot().cacheEntries,0);
+});
+for(const [name,caller] of [['machine',machine],['legacy service',legacyService],['catalog broker',broker]] as const)
+  test(`an older Controller without configured authority cannot approve ${name}`,async()=>{
+    // Even a Controller returning principalType user cannot override a service hint.
+    for(const principalType of ['user','machine',undefined]) {
+      const f=fixture(async()=>Response.json({active:true,protocolVersion:1,principalType}));
+      await assert.rejects(f.status.check('token',caller),{status:503});
+      assert.equal(f.status.snapshot().cacheEntries,0);
+    }
+  });
+for(const marker of [null,0,1,3,'2',true,{},[]])
+  test(`configured authority requires numeric version 2, rejecting ${JSON.stringify(marker)}`,async()=>{
+    const f=fixture(async()=>Response.json({active:true,protocolVersion:1,principalType:'machine',configuredAccessAuthority:marker}));
+    await assert.rejects(f.status.check('machine',machine),{status:503});
+  });
+test('preserves confirmed user status without the configured authority capability',async()=>{
+  const f=fixture(async()=>Response.json({active:true,protocolVersion:1,principalType:'user'}));
+  await f.status.check('user',user);await f.status.check('user',user);assert.equal(f.calls(),1);
+});
+test('an old ambiguous response cannot authorize an unclassified bearer',async()=>{
+  const f=fixture(async()=>Response.json({active:true,protocolVersion:1}));
+  await assert.rejects(f.status.check('unknown',user),{status:503});
   assert.equal(f.status.snapshot().cacheEntries,0);
 });
 test('unrecognized principalType never enables positive caching',async()=>{

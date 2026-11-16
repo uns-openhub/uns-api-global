@@ -23,13 +23,14 @@ export function hasMachineAuthorizationHint(claims: Record<string, unknown> | un
 }
 type VerifiedCaller = { claims: Record<string, unknown>; standaloneHmac: boolean };
 type Principal = "user" | "machine" | "unknown";
+type StatusProof = { principal: Principal; configuredAccessAuthority: unknown };
 
 /** Bounded self-token checks, only after local signature/expiry verification.
  * Machine, broker, legacy-service and unidentified tokens are checked on every
  * request; only a Controller-confirmed non-service user can reuse a result. */
 export class AuthorizationStatus {
   private readonly users = new Map<string, { until: number }>();
-  private readonly userPending = new Map<string, Promise<Principal>>();
+  private readonly userPending = new Map<string, Promise<StatusProof>>();
   private readonly now: () => number;
   private readonly fetcher: typeof fetch;
   private readonly endpoint: string | null;
@@ -69,10 +70,11 @@ export class AuthorizationStatus {
     const inFlight = !machineHint ? this.userPending.get(key) : undefined;
     if (inFlight) {
       this.counters.coalesced++;
-      const principal = await inFlight;
+      const proof = await inFlight;
+      this.requireConfiguredAuthority(proof, machineHint);
       // A Controller may have changed classification since the last result.
       // Never let a coalesced result authorize a machine/unknown follower.
-      if (principal === "user") {
+      if (proof.principal === "user") {
         const refreshed=this.users.get(key);
         if (refreshed && refreshed.until > this.now()) return;
         throw new AuthorizationStatusError(503);
@@ -84,8 +86,9 @@ export class AuthorizationStatus {
     // probe into another shared result while the other followers are released.
     if (!machineHint && !inFlight) this.userPending.set(key, work);
     try {
-      const principal = await work;
-      if (!machineHint && principal === "user") {
+      const proof = await work;
+      this.requireConfiguredAuthority(proof, machineHint);
+      if (!machineHint && proof.principal === "user") {
         if (started + (this.options.cacheMs ?? 5000) <= this.now()) throw new AuthorizationStatusError(503);
         this.rememberUser(key, started);
       } else this.users.delete(key);
@@ -93,7 +96,15 @@ export class AuthorizationStatus {
       if (this.userPending.get(key) === work) this.userPending.delete(key);
     }
   }
-  private async request(token: string): Promise<Principal> {
+  private requireConfiguredAuthority(proof: StatusProof, machineHint: boolean): void {
+    // A successful status from an older Controller cannot prove that a
+    // configured service grant or broker delegation is still current.
+    if ((machineHint || proof.principal !== "user") && proof.configuredAccessAuthority !== 2) {
+      this.counters.unavailable++;
+      throw new AuthorizationStatusError(503);
+    }
+  }
+  private async request(token: string): Promise<StatusProof> {
     if (!this.endpoint || this.now() < this.cooldownUntil || this.activeChecks >= 16) {
       this.counters.unavailable++;
       throw new AuthorizationStatusError(503);
@@ -115,7 +126,7 @@ export class AuthorizationStatus {
       throw new AuthorizationStatusError(503);
     } finally {if(timer)clearTimeout(timer);controller.abort();}
   }
-  private async probe(token: string, signal: AbortSignal): Promise<Principal> {
+  private async probe(token: string, signal: AbortSignal): Promise<StatusProof> {
     const response = await this.fetcher(this.endpoint!, { method: "POST", redirect: "error",
       headers: { authorization: `Bearer ${token}`, accept: "application/json" }, signal });
     if (response.status === 401 || response.status === 403) {
@@ -135,9 +146,10 @@ export class AuthorizationStatus {
         size += part.value.byteLength;if (size > 4096) throw new AuthorizationStatusError(503);
         chunks.push(part.value);
       }
-      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { active?: unknown; protocolVersion?: unknown; principalType?: unknown };
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { active?: unknown; protocolVersion?: unknown; principalType?: unknown; configuredAccessAuthority?: unknown };
       if (body.active !== true || body.protocolVersion !== 1) throw new AuthorizationStatusError(503);
-      return body.principalType === "user" ? "user" : body.principalType === "machine" ? "machine" : "unknown";
+      return { principal: body.principalType === "user" ? "user" : body.principalType === "machine" ? "machine" : "unknown",
+        configuredAccessAuthority: body.configuredAccessAuthority };
     } finally {await reader.cancel().catch(()=>{});reader.releaseLock();}
   }
   private rememberUser(key:string,started:number) {
