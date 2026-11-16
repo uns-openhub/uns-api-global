@@ -157,9 +157,9 @@ export interface ProjectAppConfig {
         project?: string | undefined;
     } | undefined;
     authorization?: {
-        /** Controller status validation is required by default; offline mode has no immediate identity revocation guarantee */
+        /** Offline validation accepts unmarked standalone HMAC tokens; Controller/JWKS and service-marked tokens require current status */
         mode?: "controller" | "offline";
-        /** Maximum age of a caller authorization status in milliseconds; expired status is never reused on error */
+        /** Maximum age of Controller-confirmed user status; machine, service and unknown tokens are never cached */
         statusCacheMs?: number;
     };
     questdb: {

@@ -116,6 +116,19 @@ export function isQueryDiagnosticsRequest(rawPath: string, apiBasePath: string):
     (base.startsWith("/api/") && path === `${base.slice(4)}/diagnostics/queries`);
 }
 
+/** Match exact runtime inspection endpoints through the same router and
+ * Controller rebases as diagnostics, without classifying UNS topic suffixes. */
+export function runtimeInspectionKind(rawPath: string, apiBasePath: string): "triggers" | "captures" | null {
+  const path = normalizeRequestPath(rawPath);
+  const base = normalizeBasePath(apiBasePath);
+  for (const kind of ["triggers", "captures"] as const) {
+    const suffix = `/${kind}/runtime`;
+    if (path === suffix || path === `/api${suffix}` || path === normalizeRequestPath(`${base}${suffix}`) ||
+      (base.startsWith("/api/") && path === normalizeRequestPath(`${base.slice(4)}${suffix}`))) return kind;
+  }
+  return null;
+}
+
 export function normalizeTopicPath(rawPath: string, basePath: string): string {
   const stripLeading = (value: string) => value.replace(/^\/+/, "");
   const base = stripLeading(basePath);

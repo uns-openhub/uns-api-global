@@ -12,13 +12,30 @@ export interface AuthorizationStatusOptions {
   fetch?: typeof fetch;
   now?: () => number;
 }
-/** Bounded self-token checks, only after local signature/expiry verification. */
+/** These are hints only. Their absence never proves a user identity; the
+ * Controller must positively identify a user before a response may be cached.
+ * Call this only with claims from a verified signature and expiry. */
+export function hasMachineAuthorizationHint(claims: Record<string, unknown> | undefined): boolean {
+  if (!claims) return true;
+  return ["serviceToken", "machineIdentityId", "machineIdentityName", "identityType", "workloadIdentityType", "tokenVersion",
+    "catalogPublication", "catalogLaunch", "configuredService", "configuredServiceLaunch", "configuredAccess", "runtimeRouteDeployment",
+    "unsOperatorDelegation"]
+    .some(key => Object.hasOwn(claims, key));
+}
+type VerifiedCaller = { claims: Record<string, unknown>; standaloneHmac: boolean };
+type Principal = "user" | "machine" | "unknown";
+type StatusProof = { principal: Principal; configuredAccessAuthority: unknown };
+
+/** Bounded self-token checks, only after local signature/expiry verification.
+ * Machine, broker, legacy-service and unidentified tokens are checked on every
+ * request; only a Controller-confirmed non-service user can reuse a result. */
 export class AuthorizationStatus {
-  private readonly cache = new Map<string, { status: 200 | 401 | 403; until: number }>();
-  private readonly pending = new Map<string, Promise<void>>();
+  private readonly users = new Map<string, { until: number }>();
+  private readonly userPending = new Map<string, Promise<StatusProof>>();
   private readonly now: () => number;
   private readonly fetcher: typeof fetch;
   private readonly endpoint: string | null;
+  private activeChecks = 0;
   private cooldownUntil = 0;
   private counters = { cacheHits: 0, checks: 0, coalesced: 0, denied: 0, unavailable: 0 };
   constructor(private readonly options: AuthorizationStatusOptions) {
@@ -26,73 +43,126 @@ export class AuthorizationStatus {
     this.fetcher = options.fetch ?? fetch;
     const base = options.controllerRest?.replace(/\/+$/, "");
     this.endpoint = base ? `${base}/auth/token-status` : null;
-    if (this.endpoint && !/^https?:$/.test(new URL(this.endpoint).protocol)) throw Error("Unsupported authorization status URL");
+    if (this.endpoint) {
+      try {
+        const url = new URL(this.endpoint);
+        if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash) throw Error();
+      } catch { throw Error("Unsupported authorization status URL"); }
+    }
     if (!Number.isFinite(options.cacheMs ?? 5000) || (options.cacheMs ?? 5000) < 250 || (options.cacheMs ?? 5000) > 30000) throw Error("Invalid authorization status cache duration");
   }
   snapshot() {
     return { mode: this.options.mode ?? "controller", cacheMs: this.options.cacheMs ?? 5000,
-      maxConcurrent: 4, maxCacheEntries: 1024, requestTimeoutMs: 1500,
-      cacheEntries: this.cache.size, activeChecks: this.pending.size, ...this.counters };
+      maxConcurrent: 16, maxCacheEntries: 1024, requestTimeoutMs: 1500,
+      cacheEntries: this.users.size, activeChecks: this.activeChecks, ...this.counters };
   }
-  async check(token: string): Promise<void> {
-    if (this.options.mode === "offline") return;
+  async check(token: string, caller?: VerifiedCaller): Promise<void> {
+    if (typeof token !== "string" || !token || token.length > 16377 || /[\s\u0000-\u001f\u007f]/.test(token))
+      throw new AuthorizationStatusError(401);
+    const machineHint = hasMachineAuthorizationHint(caller?.claims);
+    // Standalone HMAC users cannot be verified by the Controller. This explicit
+    // legacy mode never bypasses status for Controller/JWKS or machine tokens.
+    if (this.options.mode === "offline" && caller?.standaloneHmac === true && !machineHint) return;
     const key = createHash("sha256").update(token).digest("hex");
-    const cached = this.cache.get(key);
-    if (cached && cached.until > this.now()) {
-      this.counters.cacheHits++;
-      if (cached.status !== 200) { this.counters.denied++; throw new AuthorizationStatusError(cached.status); }
-      return;
+    const cached = !machineHint ? this.users.get(key) : undefined;
+    if (cached && cached.until > this.now()) { this.counters.cacheHits++; return; }
+    // Requests without machine hints may share the first probe, but may use
+    // its result only after the Controller positively identifies a user.
+    const inFlight = !machineHint ? this.userPending.get(key) : undefined;
+    if (inFlight) {
+      this.counters.coalesced++;
+      const proof = await inFlight;
+      this.requireConfiguredAuthority(proof, machineHint);
+      // A Controller may have changed classification since the last result.
+      // Never let a coalesced result authorize a machine/unknown follower.
+      if (proof.principal === "user") {
+        const refreshed=this.users.get(key);
+        if (refreshed && refreshed.until > this.now()) return;
+        throw new AuthorizationStatusError(503);
+      }
     }
-    if (cached) this.cache.delete(key);
-    const inFlight = this.pending.get(key);
-    if (inFlight) { this.counters.coalesced++; return inFlight; }
-    if (!this.endpoint || this.now() < this.cooldownUntil || this.pending.size >= 4) {
+    const started = this.now();
+    const work = this.request(token);
+    // A machine/unknown follower must perform its own probe; do not turn that
+    // probe into another shared result while the other followers are released.
+    if (!machineHint && !inFlight) this.userPending.set(key, work);
+    try {
+      const proof = await work;
+      this.requireConfiguredAuthority(proof, machineHint);
+      if (!machineHint && proof.principal === "user") {
+        if (started + (this.options.cacheMs ?? 5000) <= this.now()) throw new AuthorizationStatusError(503);
+        this.rememberUser(key, started);
+      } else this.users.delete(key);
+    } finally {
+      if (this.userPending.get(key) === work) this.userPending.delete(key);
+    }
+  }
+  private requireConfiguredAuthority(proof: StatusProof, machineHint: boolean): void {
+    // A successful status from an older Controller cannot prove that a
+    // configured service grant or broker delegation is still current.
+    if ((machineHint || proof.principal !== "user") && proof.configuredAccessAuthority !== 2) {
       this.counters.unavailable++;
       throw new AuthorizationStatusError(503);
     }
-    const task = this.probe(key, token).finally(() => { this.pending.delete(key); });
-    this.pending.set(key, task);
-    return task;
   }
-  private async probe(key: string, token: string): Promise<void> {
-    const started = this.now();
-    this.counters.checks++;
+  private async request(token: string): Promise<StatusProof> {
+    if (!this.endpoint || this.now() < this.cooldownUntil || this.activeChecks >= 16) {
+      this.counters.unavailable++;
+      throw new AuthorizationStatusError(503);
+    }
+    this.counters.checks++;this.activeChecks++;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Count timed-out network work until it really settles: an implementation
+    // that ignores abort cannot create an unbounded number of abandoned calls.
+    const work = this.probe(token, controller.signal).finally(()=>{this.activeChecks--;});
     try {
-      const response = await this.fetcher(this.endpoint!, { method: "POST", redirect: "error",
-        headers: { authorization: `Bearer ${token}`, accept: "application/json" }, signal: AbortSignal.timeout(1500) });
-      if (response.status === 401 || response.status === 403) {
-        await response.body?.cancel().catch(() => {});
-        this.remember(key, response.status, started);
-        this.counters.denied++;
-        throw new AuthorizationStatusError(response.status);
-      }
-      if (response.status !== 200 || !response.headers.get("content-type")?.includes("application/json")) {
-        await response.body?.cancel().catch(() => {});
-        throw new AuthorizationStatusError(503);
-      }
-      const reader = response.body?.getReader();
-      if (!reader) throw new AuthorizationStatusError(503);
-      const chunks: Uint8Array[] = []; let size = 0;
-      try {
-        for (;;) {
-          const part = await reader.read(); if (part.done) break;
-          size += part.value.byteLength;
-          if (size > 4096) throw new AuthorizationStatusError(503);
-          chunks.push(part.value);
-        }
-      } finally { await reader.cancel().catch(() => {}); }
-      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { active?: unknown; protocolVersion?: unknown };
-      if (body.active !== true || body.protocolVersion !== 1 || started + (this.options.cacheMs ?? 5000) <= this.now()) throw new AuthorizationStatusError(503);
-      this.remember(key, 200, started);
+      return await Promise.race([work,new Promise<never>((_,reject)=>{
+        timer=setTimeout(()=>{controller.abort();reject(new AuthorizationStatusError(503));},1500);
+      })]);
     } catch (error) {
-      if (error instanceof AuthorizationStatusError && error.status !== 503) throw error;
+      if (error instanceof AuthorizationStatusError && error.status !== 503) {this.counters.denied++;throw error;}
       this.counters.unavailable++;
       this.cooldownUntil = this.now() + 1000;
       throw new AuthorizationStatusError(503);
+    } finally {if(timer)clearTimeout(timer);controller.abort();}
+  }
+  private async probe(token: string, signal: AbortSignal): Promise<StatusProof> {
+    const response = await this.fetcher(this.endpoint!, { method: "POST", redirect: "error",
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" }, signal });
+    if (response.status === 401 || response.status === 403) {
+      await response.body?.cancel().catch(() => {});
+      throw new AuthorizationStatusError(response.status);
     }
+    if (response.status !== 200 || !/^application\/json(?:\s*;|$)/i.test(response.headers.get("content-type") ?? "") ||
+      Number(response.headers.get("content-length") ?? 0) > 4096 || !response.body) {
+      await response.body?.cancel().catch(() => {});
+      throw new AuthorizationStatusError(503);
+    }
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];let size = 0;
+    try {
+      for (;;) {
+        const part = await reader.read();if (part.done) break;
+        size += part.value.byteLength;if (size > 4096) throw new AuthorizationStatusError(503);
+        chunks.push(part.value);
+      }
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { active?: unknown; protocolVersion?: unknown; principalType?: unknown; configuredAccessAuthority?: unknown };
+      if (body.active !== true || body.protocolVersion !== 1) throw new AuthorizationStatusError(503);
+      return { principal: body.principalType === "user" ? "user" : body.principalType === "machine" ? "machine" : "unknown",
+        configuredAccessAuthority: body.configuredAccessAuthority };
+    } finally {await reader.cancel().catch(()=>{});reader.releaseLock();}
   }
-  private remember(key: string, status: 200 | 401 | 403, started: number) {
-    if (this.cache.size >= 1024) this.cache.delete(this.cache.keys().next().value!);
-    this.cache.set(key, { status, until: started + (this.options.cacheMs ?? 5000) });
+  private rememberUser(key:string,started:number) {
+    if (this.users.size >= 1024 && !this.users.has(key)) this.users.delete(this.users.keys().next().value!);
+    this.users.set(key,{until:started+(this.options.cacheMs??5000)});
   }
+}
+
+/** Read the same controller REST setting used for other Controller calls. */
+export function authorizationStatusForConfig(
+  config: {uns?: {rest?: unknown} | undefined},
+  options: Omit<AuthorizationStatusOptions,"controllerRest">,
+): AuthorizationStatus {
+  return new AuthorizationStatus({...options,controllerRest:typeof config.uns?.rest === 'string' ? config.uns.rest : null});
 }
