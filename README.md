@@ -91,17 +91,27 @@ status with `POST <uns.rest>/auth/token-status`. This contract requires controll
 closed with HTTP 503. Roll out the controller before this API candidate.
 
 `authorization.mode` defaults to `controller`, with `statusCacheMs: 5000` (allowed
-250–30000 ms). A cached positive status can remain usable until its expiry after a
-revocation; JWT expiry still applies immediately. Concurrent requests using the
-same token share one status check. Checks have a 1500 ms timeout, at most four
-concurrent calls, no waiting queue, 1024 cached token digests and a one-second
-failure cooldown. Expired positive status is never reused on authority errors.
-Revoked/deleted/inactive principals or changed machine token versions are denied.
-The endpoint returns only self-status; it cannot inspect another identity.
+250–30000 ms). Only ordinary bearer tokens that the Controller explicitly confirms
+as users may reuse a positive status until that cache expires. A revoked user can
+therefore remain authorized until that expiry; JWT expiry still applies immediately.
+Machine tokens, service tokens, catalog history broker tokens and tokens whose
+principal type is unknown are checked on **every request**, without a positive cache
+or cross-request coalescing. Older Controllers that do not return `principalType`
+remain compatible, but all their tokens require a status request each time.
 
-Explicit `authorization.mode: "offline"` supports standalone JWT validation and
-emits a startup warning. It cannot enforce identity revocation before JWT expiry.
-There is no automatic offline fallback on timeout, 404, bad JSON or database error.
+Checks have a 1500 ms timeout, at most 16 concurrent calls, no waiting queue, 1024
+cached user token digests and a one-second failure cooldown. Concurrent requests
+for a token without service hints can share a check only when the Controller
+confirms `user`; otherwise every follower checks its own status. Expired status is never
+reused after authority failure. Revoked/deleted/inactive principals or changed
+machine token versions are denied. The endpoint checks only the bearer itself.
+
+Explicit `authorization.mode: "offline"` preserves standalone HMAC JWT validation
+and emits a startup warning. An unmarked HMAC token is treated as a user; offline
+mode cannot independently distinguish or revoke such identities before JWT expiry.
+Tokens bearing service hints and all Controller/JWKS tokens still require live
+Controller status, including in offline mode. There is no automatic offline
+fallback on timeout, 404, bad JSON or database error.
 The administrator diagnostics response includes non-secret authorization counters
 and limits, without tokens or cache digests. These checks do not control MQTT
 shutdown or the independent microservice lifecycle.

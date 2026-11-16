@@ -7,7 +7,8 @@ import { BudgetedFallbackRotation } from "./budgeted-fallback-rotation.js";
 import { ControllerServiceRegistration } from './controller-service-registration.js';
 import { parseBindingConsistency } from "./catchall-helpers.js";
 import { RouteOwnerRegistration, routeRegistrationEnvironment } from "./route-owner-registration.js";
-import { AuthorizationStatus, AuthorizationStatusError } from "./authorization-status.js";
+import { authorizationStatusForConfig, AuthorizationStatusError } from "./authorization-status.js";
+import { authorizeBearer } from "./authorize-bearer.js";
 import { resolveQueryDeploymentBudget } from "./query-deployment-budget.js";
 import * as apiRequestLogging from "@uns-kit/api/request-log.js";
 import { requireSafeRequestLogging } from "./query-diagnostics-prerequisites.js";
@@ -184,8 +185,8 @@ const apiBasePath = normalizeBasePath(catchAll.apiBasePath ?? "/api/catchall");
 const catchAllSwaggerPath = catchAll.swaggerPath ?? "/uns-api-global/general-api/catchall-swagger.json";
 const controllerGraphqlUrl = typeof config.uns?.graphql === "string" ? config.uns.graphql.replace(/\/+$/, "") : null;
 const controllerRestUrl = typeof config.uns?.rest === "string" ? config.uns.rest.replace(/\/+$/, "") : null;
-const authorizationStatus = new AuthorizationStatus({ controllerRest: controllerRestUrl, mode: authorizationConfig.mode, cacheMs: authorizationConfig.statusCacheMs });
-if (authorizationConfig.mode === "offline") logger.warn("Authorization status checks are explicitly disabled; offline JWT mode does not enforce immediate identity revocation.");
+const authorizationStatus = authorizationStatusForConfig(config,{mode:authorizationConfig.mode,cacheMs:authorizationConfig.statusCacheMs});
+if (authorizationConfig.mode === "offline") logger.warn("Standalone HMAC users use offline JWT validation; Controller and service tokens still require live authorization status.");
 let legacyAuthClient: Promise<AuthClient | null> | undefined;
 const legacyAuthFallback: AccessTokenProvider = {
   async getAccessToken(): Promise<string | undefined> {
@@ -1002,9 +1003,8 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
 
     const bearer = extractBearerToken(req?.headers?.["authorization"]);
     if (!bearer) throw new HttpError(401, "Missing Authorization header");
-    const authenticatedClaims = await verifyTokenClaims(bearer, catchAllAuth);
+    const authenticatedClaims = await authorizeBearer(bearer,token=>verifyTokenClaims(token,catchAllAuth),authorizationStatus,catchAllAuth);
     queryDiagnostics.authenticate(authenticatedClaims);
-    await authorizationStatus.check(bearer);
     verifiedRequestClaims.set(req, authenticatedClaims);
 
     // Stage 4b — admin-only runtime inspection endpoint.  Returns
@@ -3351,9 +3351,8 @@ async function resolveCatchAllAccessRules(
 
   let claims = verifiedRequestClaims.get(req);
   if (!claims) {
-    claims = await verifyTokenClaims(token, authCfg);
+    claims = await authorizeBearer(token,value=>verifyTokenClaims(value,authCfg),authorizationStatus,authCfg);
     queryDiagnostics.authenticate(claims);
-    await authorizationStatus.check(token);
     verifiedRequestClaims.set(req, claims);
   }
   queryDiagnostics.authenticate(claims);

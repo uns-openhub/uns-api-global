@@ -40,8 +40,8 @@ const questDbUrlSchema = secretValueSchema.refine(
 
 export const projectExtrasSchema = z.object({
   authorization: z.object({
-    mode: z.enum(["controller", "offline"]).default("controller").describe("Controller status validation is required by default; offline mode has no immediate identity revocation guarantee"),
-    statusCacheMs: z.number().int().min(250).max(30000).default(5000).describe("Maximum age of a caller authorization status in milliseconds; expired status is never reused on error"),
+    mode: z.enum(["controller", "offline"]).default("controller").describe("Offline validation accepts unmarked standalone HMAC tokens; Controller/JWKS and service-marked tokens require current status"),
+    statusCacheMs: z.number().int().min(250).max(30000).default(5000).describe("Maximum age of Controller-confirmed user status; machine, service and unknown tokens are never cached"),
   }).default({ mode: "controller", statusCacheMs: 5000 }),
   questdb: z.object({
     queryDiagnostics: z

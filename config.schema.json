@@ -1979,7 +1979,7 @@
           "properties": {
             "mode": {
               "default": "controller",
-              "description": "Controller status validation is required by default; offline mode has no immediate identity revocation guarantee",
+              "description": "Offline validation accepts unmarked standalone HMAC tokens; Controller/JWKS and service-marked tokens require current status",
               "type": "string",
               "enum": [
                 "controller",
@@ -1988,7 +1988,7 @@
             },
             "statusCacheMs": {
               "default": 5000,
-              "description": "Maximum age of a caller authorization status in milliseconds; expired status is never reused on error",
+              "description": "Maximum age of Controller-confirmed user status; machine, service and unknown tokens are never cached",
               "type": "integer",
               "minimum": 250,
               "maximum": 30000
