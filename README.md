@@ -86,9 +86,11 @@ described below. The controller status endpoint accepts controller-verifiable JW
 
 Catch-all data reads, batch reads and protected runtime/diagnostic endpoints first
 verify JWT signature and expiry on every request. They then check the caller's own
-status with `POST <uns.rest>/auth/token-status`. This contract requires controller
-**2.1.145 or newer**; upgrading the API alone against an older controller fails
-closed with HTTP 503. Roll out the controller before this API candidate.
+status with `POST <uns.rest>/auth/token-status`. This endpoint was introduced in
+Controller **2.1.145**, but configured service access additionally requires a
+Controller that advertises the authority capability described below. API calls
+fail closed with HTTP 503 if the required capability is missing. Roll out and
+verify the compatible Controller before this API candidate.
 
 `authorization.mode` defaults to `controller`, with `statusCacheMs: 5000` (allowed
 250–30000 ms). Only ordinary bearer tokens that the Controller explicitly confirms
@@ -102,6 +104,10 @@ access contract; otherwise access fails closed with HTTP 503. An ordinary user
 confirmed by `principalType: "user"` does not need that capability. Older
 Controllers that provide neither the marker nor a principal type cannot safely
 classify callers, so these calls also fail closed. Upgrade the Controller first.
+
+Trigger and capture runtime inspection returns unfiltered operational values and
+therefore requires an administrator's user token. Service and machine tokens are
+not authorized to inspect those endpoints, even when they have UNS read access.
 
 Checks have a 1500 ms timeout, at most 16 concurrent calls, no waiting queue, 1024
 cached user token digests and a one-second failure cooldown. Concurrent requests

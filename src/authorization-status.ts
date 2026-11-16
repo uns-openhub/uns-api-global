@@ -18,7 +18,8 @@ export interface AuthorizationStatusOptions {
 export function hasMachineAuthorizationHint(claims: Record<string, unknown> | undefined): boolean {
   if (!claims) return true;
   return ["serviceToken", "machineIdentityId", "machineIdentityName", "identityType", "workloadIdentityType", "tokenVersion",
-    "catalogPublication", "catalogLaunch", "configuredServiceLaunch", "configuredAccess", "runtimeRouteDeployment"]
+    "catalogPublication", "catalogLaunch", "configuredService", "configuredServiceLaunch", "configuredAccess", "runtimeRouteDeployment",
+    "unsOperatorDelegation"]
     .some(key => Object.hasOwn(claims, key));
 }
 type VerifiedCaller = { claims: Record<string, unknown>; standaloneHmac: boolean };

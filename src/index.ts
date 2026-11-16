@@ -8,7 +8,7 @@ import { ControllerServiceRegistration } from './controller-service-registration
 import { parseBindingConsistency } from "./catchall-helpers.js";
 import { RouteOwnerRegistration, routeRegistrationEnvironment } from "./route-owner-registration.js";
 import { authorizationStatusForConfig, AuthorizationStatusError } from "./authorization-status.js";
-import { authorizeBearer } from "./authorize-bearer.js";
+import { authorizeBearer, canInspectRuntime } from "./authorize-bearer.js";
 import { resolveQueryDeploymentBudget } from "./query-deployment-budget.js";
 import * as apiRequestLogging from "@uns-kit/api/request-log.js";
 import { requireSafeRequestLogging } from "./query-diagnostics-prerequisites.js";
@@ -81,6 +81,7 @@ import {
   counterBoundarySourceRange,
   isTopicAllowedByAccessRules,
   isQueryDiagnosticsRequest,
+  runtimeInspectionKind,
   resolvePointTimeColumn as resolvePointTimeColumnFromSchema,
   resolveTemporalStrategy as resolveTemporalStrategyFromSchema,
 } from "./catchall-helpers.js";
@@ -968,10 +969,11 @@ apiInput.event.on("apiGetEvent", async (event: UnsEvents["apiGetEvent"]) => {
   res.setHeader("x-request-id", requestId);
 
   const pathForDiagnostics = normalizeRequestPath(req.path ?? "");
+  const runtimeInspection = runtimeInspectionKind(pathForDiagnostics, apiBasePath);
   const operation = isBatchRequest(req) ? (resolveBatchMode(req, req.body) === "range" ? "batch-range" : "batch-last")
     : isQueryDiagnosticsRequest(pathForDiagnostics, apiBasePath) ? "query-diagnostics"
-    : pathForDiagnostics.endsWith("/triggers/runtime") ? "trigger-runtime"
-    : pathForDiagnostics.endsWith("/captures/runtime") ? "capture-runtime"
+    : runtimeInspection === "triggers" ? "trigger-runtime"
+    : runtimeInspection === "captures" ? "capture-runtime"
     : isSwaggerDefinitionRequest(pathForDiagnostics, catchAll.swaggerPath) ? "swagger" : "history";
   const handle = () => queryDiagnostics.runRequest(requestId, operation, () => handleApiRequest(event, requestId));
   // This service's GET/HEAD handlers and POST batch endpoints only read data.
@@ -1007,24 +1009,11 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
     queryDiagnostics.authenticate(authenticatedClaims);
     verifiedRequestClaims.set(req, authenticatedClaims);
 
-    // Stage 4b — admin-only runtime inspection endpoint.  Returns
-    // per-trigger live state (lastSeenValue, lastFiredAt, fireCount,
-    // suppression metrics) so the controller's UI can render an
-    // "Armed / Awaiting first value" pill + drill-in detail.
-    // Auth is the same JWT guard the catchall uses.
-    //
-    // The express api-proxy mounts its router under apiBasePath
-    // (e.g. /api/catchall), so req.path can arrive as any of:
-    //   - "/api/triggers/runtime"          (direct hit, no mount strip)
-    //   - "/triggers/runtime"              (mount stripped the prefix)
-    //   - "/api/catchall/triggers/runtime" (full original path)
-    // We match all three so callers don't have to know which
-    // shape they'll get.
-    const isRuntimeEndpoint =
-      requestPath === "/api/triggers/runtime" ||
-      requestPath === "/triggers/runtime" ||
-      requestPath === "/api/catchall/triggers/runtime";
-    if (isRuntimeEndpoint) {
+    // Runtime inspection includes unfiltered values and is admin-only, for
+    // direct, mounted and Controller-rebased paths alike.
+    const runtimeInspection = runtimeInspectionKind(requestPath, apiBasePath);
+    if (runtimeInspection && !canInspectRuntime(authenticatedClaims)) throw new HttpError(403, "Administrator role required");
+    if (runtimeInspection === "triggers") {
       if (!triggerService) {
         res.status(503).json({ error: "Trigger service not yet started" });
         return;
@@ -1036,11 +1025,7 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
       return;
     }
 
-    const isCaptureRuntimeEndpoint =
-      requestPath === "/api/captures/runtime" ||
-      requestPath === "/captures/runtime" ||
-      requestPath === `${apiBasePath}/captures/runtime`;
-    if (isCaptureRuntimeEndpoint) {
+    if (runtimeInspection === "captures") {
       if (!captureService) {
         res.status(503).json({ error: "Capture service not yet started" });
         return;
@@ -1055,7 +1040,7 @@ async function handleApiRequest(event: UnsEvents["apiGetEvent"], requestId: stri
     const isQueryDiagnostics = isQueryDiagnosticsRequest(requestPath, apiBasePath);
     if (isQueryDiagnostics) {
       const claims = authenticatedClaims;
-      if (!Array.isArray(claims["roles"]) || !claims["roles"].includes("admin")) throw new HttpError(403, "Administrator role required");
+      if (!canInspectRuntime(claims)) throw new HttpError(403, "Administrator role required");
       res.status(200).json({ ...queryDiagnostics.snapshot(), authorization: authorizationStatus.snapshot() });
       return;
     }

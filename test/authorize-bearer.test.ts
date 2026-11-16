@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import jwt from 'jsonwebtoken';
-import { authorizeBearer } from '../src/authorize-bearer.js';
+import { authorizeBearer, canInspectRuntime } from '../src/authorize-bearer.js';
 import { AuthorizationStatus, authorizationStatusForConfig } from '../src/authorization-status.js';
+import { runtimeInspectionKind } from '../src/catchall-helpers.js';
 
 const secret='only-a-local-test-secret';
 const sign=(claims:Record<string,unknown>)=>jwt.sign(claims,secret,{algorithm:'HS256',expiresIn:60});
@@ -24,6 +25,64 @@ test('keeps the existing standalone HMAC user mode without allowing a machine by
   const user=sign({sub:'user',roles:['user']}),machine=sign({sub:'machine',machineIdentityId:'machine',serviceToken:true});
   await authorizeBearer(user,verify,status,auth);assert.equal(calls,0);
   await authorizeBearer(machine,verify,status,auth);assert.equal(calls,1);
+});
+test('does not treat a configured-service claim as an offline standalone user',async()=>{
+  let calls=0;
+  const status=new AuthorizationStatus({mode:'offline',controllerRest:'http://localhost/api',fetch:async()=>{
+    calls++;return new Response(null,{status:403});
+  }});
+  const token=sign({sub:'legacy',configuredService:{protocol:2,operationId:'old'}});
+  await assert.rejects(authorizeBearer(token,verify,status,auth),{status:403});
+  assert.equal(calls,1);
+});
+test('does not treat an operator delegation claim as an offline standalone user',async()=>{
+  let calls=0;
+  const status=new AuthorizationStatus({mode:'offline',controllerRest:'http://localhost/api',fetch:async()=>{
+    calls++;return new Response(null,{status:403});
+  }});
+  const token=sign({sub:'legacy',unsOperatorDelegation:{protocol:1}});
+  await assert.rejects(authorizeBearer(token,verify,status,auth),{status:403});
+  assert.equal(calls,1);
+});
+test('limits unfiltered runtime inspection to an active administrator, excluding machine tokens',async()=>{
+  const status=new AuthorizationStatus({controllerRest:'http://localhost/api',fetch:async()=>fetchResult('user')});
+  const read=async(claims:Record<string,unknown>)=>canInspectRuntime(await authorizeBearer(sign(claims),verify,status,auth));
+  assert.equal(await read({sub:'admin',roles:['admin'],accessRules:['#']}),true);
+  assert.equal(await read({sub:'reader',roles:['user'],scopes:['read:uns'],accessRules:['#']}),false);
+  assert.equal(await read({sub:'machine',machineIdentityId:'id',serviceToken:true,roles:['admin'],scopes:['read:uns'],accessRules:['#']}),false);
+  assert.equal(await read({sub:'broker',catalogPublication:{operation:'summary'},roles:['admin']}),false);
+  assert.equal(await read({sub:'machine',configuredService:{protocol:2},roles:['admin']}),false);
+  assert.equal(await read({sub:'delegate',unsOperatorDelegation:{protocol:1},roles:['admin']}),false);
+});
+test('matches each runtime inspection endpoint under direct, mounted and controller-rebased paths',()=>{
+  for (const kind of ['triggers','captures'] as const) {
+    for (const path of [`/${kind}/runtime`,`/api/${kind}/runtime`,`/api/catchall/${kind}/runtime`,
+      `/catchall/${kind}/runtime`,`api//catchall//${kind}/runtime/`]) {
+      assert.equal(runtimeInspectionKind(path,'/api/catchall'),kind,path);
+    }
+    for (const path of [`/api/custom/${kind}/runtime`,`/custom/${kind}/runtime`])
+      assert.equal(runtimeInspectionKind(path,'/api/custom/'),kind,path);
+    assert.equal(runtimeInspectionKind(`/custom/${kind}/runtime`,'/custom'),kind);
+    for (const path of [`/site/${kind}/runtime`,`/api/catchall/site/${kind}/runtime`,
+      `/api/catchall/${kind}/runtime/extra`,`/catchall/${kind}/runtime-other`])
+      assert.equal(runtimeInspectionKind(path,'/api/catchall'),null,path);
+  }
+});
+test('all rebased runtime endpoints preserve administrator, reader and service authorization',async()=>{
+  const status=new AuthorizationStatus({controllerRest:'http://localhost/api',fetch:async()=>fetchResult('user')});
+  const callers=await Promise.all([
+    {claims:{sub:'admin',roles:['admin']},allowed:true},
+    {claims:{sub:'reader',roles:['user'],scopes:['read:uns'],accessRules:['#']},allowed:false},
+    {claims:{sub:'service',roles:['admin'],machineIdentityId:'id',serviceToken:true,scopes:['read:uns'],accessRules:['#']},allowed:false},
+  ].map(async ({claims,allowed})=>({claims:await authorizeBearer(sign(claims),verify,status,auth),allowed})));
+  for (const kind of ['triggers','captures'] as const) {
+    for (const path of [`/${kind}/runtime`,`/api/${kind}/runtime`,`/api/catchall/${kind}/runtime`,`/catchall/${kind}/runtime`]) {
+      for (const {claims,allowed} of callers) {
+        assert.equal(runtimeInspectionKind(path,'/api/catchall'),kind,path);
+        assert.equal(canInspectRuntime(claims),allowed,`${path} ${String(claims.sub)}`);
+      }
+    }
+  }
 });
 test('never caches a verified service bearer after its status changes',async()=>{
   let active=true,calls=0;
